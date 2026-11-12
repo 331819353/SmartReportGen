@@ -165,32 +165,38 @@ status: {measure: tgt_rate, direction: up, good: 1.0, warn: 0.95, labels: {posit
 - 用户明确确认过的升降色（如“红涨绿跌”）优先：在模板 theme 中覆盖 `color-trend-up` / `color-trend-down`。
 
 ### 主题（theme）
-报告的视觉全部来自**设计令牌**（通用规则由管理员配置；业务场景样式取报告创建人本人配置的）。生效优先级：**业务场景规则 ≥ 通用规则 ≥ 内置默认**（同一项以业务场景规则为准，其次通用规则，都没设置时用内置默认）；
-模板 `theme` 只用于用户明确确认过的个别覆盖。
-因此**模板通常不需要写 theme**；只有确有理由（例如用户确认过的升降色、场景规则允许的版式选项）时才覆盖个别令牌：
+报告的视觉来自样式项（CSS 变量）。生效顺序：**智能体决定（模板 `theme`）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式（仅颜色）**。
+
+- 后三者合并为一份指定样式，由 `get_style_rules` 的 `specified` 返回（`theme` 视觉样式 + `items` 生成要求），是对你的**约束**：
+  `specified.theme` 在渲染时自动生效，模板中无需重复；`specified.items` 落实到报告结构与写法。
+- 你可以有自己的判断：在模板 `theme` 中设置的项**按你的设置展示**，包括覆盖指定样式（校验/渲染会提示覆盖了哪些项）。
+  默认遵守约束，只在确有理由时覆盖（如用户明确要求、报告内容需要），并在最终回复中说明。
+- 没有指定的样式项由你自由决定，也可以不设置。
 
 ```yaml
-theme:
-  color-trend-up: "#F0585B"     # 用户确认：红涨
-  color-trend-down: "#16A866"   #           绿跌
-  header_style: plain           # banner（主题蓝面板 + 反白文字）/ plain（白色卡片）
+theme:                          # 示例：智能体的决定
+  rre-page-font-title: {size: 26, weight: 700}
+  rre-card-pad: 16
+  kpi_align: center
+  filter_align: center
+  table_zebra: true
 ```
 
-令牌按**报告页面的组成部分**分为 12 类（与管理台「报告样式」中的分类一致）：
+样式项按**报告页面的组成部分**分为 12 类（与管理台「报告样式」中的分类一致）。对齐项取值 `left` / `center`（数值列为 `right` / `center`）；控件、按钮、标签内的文字始终垂直居中：
 
 | 类型 | 令牌 |
 |---|---|
 | 主题 | `color-brand` `color-bg-page` `color-text-primary` `color-text-secondary` `color-text-inverse` `font-family` |
 | 排版 | `rre-page-font-title`（报告大标题）`rre-page-font-section`（章节标题）、卡片内八个文字角色 `rre-card-font-{title,unit,hero,affix,read,label,table,prose}`（值为 `{size, weight}`，12~72px）、`rre-prose-line-height`（1.2~2.4） |
 | 页面布局 | `max_width` `rre-page-pad` `rre-section-gap` `rre-card-gap` `toc` `rre-toc-width` |
-| 报告头部 | `header_style`（banner / plain）`color-header-start` `color-header-end`（留空 = 由主题色派生）`rre-header-pad` `rre-radius-panel` |
-| 筛选栏 | `filter_sticky` `rre-control-height` `rre-radius-control` `rre-radius-pill` |
-| 章节与结论 | `rre-summary-tint` `rre-summary-border-tint`（主题色占比 0~40%） |
-| 卡片 | `color-bg-card` `color-border-card` `rre-card-border-width` `radius-card` `shadow-card` `rre-card-pad` `rre-card-title-line` `rre-card-head-gap` `rre-radius-chip` |
-| 指标卡 | `rre-card-fact-line` `rre-card-fact-gap` `rre-radius-tile` `rre-status-bar` |
+| 报告头部 | `header_style`（banner / plain）`color-header-start` `color-header-end`（留空 = 由主题色派生）`rre-header-pad` `rre-radius-panel` `header_align` |
+| 筛选栏 | `filter_sticky` `rre-control-height` `rre-radius-control` `rre-radius-pill` `filter_align`（筛选值对齐） |
+| 章节与结论 | `rre-summary-tint` `rre-summary-border-tint`（主题色占比 0~40%）`section_align` |
+| 卡片 | `color-bg-card` `color-border-card` `rre-card-border-width` `radius-card` `shadow-card` `rre-card-pad` `rre-card-title-line` `rre-card-head-gap` `rre-radius-chip` `card_title_align` |
+| 指标卡 | `rre-card-fact-line` `rre-card-fact-gap` `rre-radius-tile` `rre-status-bar` `kpi_align` |
 | 数据配色 | `chart-palette-categorical` `chart-palette-sequential` `chart-palette-diverging`、`color-status-{positive,warning,negative}`（蓝·不判 = `color-brand`）、`color-trend-up` `color-trend-down` |
 | 图表 | `rre-card-bar-max` `rre-data-radius` `rre-chart-line-width` `chart_grid`（dashed / solid / none）`rre-card-legend-gap` `rre-card-axis-gap` `rre-card-axis-title-gap` |
-| 表格 | `rre-card-row-height` `color-table-head-bg`（留空 = 卡片底色）`table_zebra` |
+| 表格 | `rre-card-row-height` `color-table-head-bg`（留空 = 卡片底色）`table_zebra` `table_text_align` `table_num_align` |
 | 高级 | `custom_css` |
 
 图表着色规则（运行时自动执行）：多系列按分类色板顺序取色；单系列柱图有正有负时用发散色阶两端；热力图用顺序色阶；

@@ -38,11 +38,20 @@ def _scenario_of(tpl: Template, dataset_id: int | None) -> str | None:
 
 
 def resolve_theme(tpl: Template, dataset_id: int | None = None, owner: str | None = None) -> tuple[dict, list[str]]:
-    """内置默认 → 通用规则 → 报告创建人（owner）本人的业务场景规则 → 模板 theme 覆盖。"""
+    """生效顺序：智能体决定（模板 theme）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。
+    规则合并出的指定样式是约束，智能体可以按自己的判断在模板中覆盖。返回 (渲染用完整取值, 提示)。"""
     rules = repo.style_rules_for(_scenario_of(tpl, dataset_id), owner=owner)
-    theme, _ = design.resolve(*[r["theme"] for r in rules["general_rules"] + rules["scenario_rules"]])
-    theme, warns = design.resolve(theme, tpl.theme)
-    return theme, warns
+    specified = rules["specified"]["theme"]
+    agent, warns = design.resolve(tpl.theme)
+    sources = rules["specified"]["theme_sources"]
+    keys = {design.canonical_key(k) for k in tpl.theme or {}}
+    chosen = {k: agent[k] for k in keys if k in agent}
+    overridden = sorted(k for k in chosen if k in specified and chosen[k] != specified[k])
+    if overridden:
+        warns.append("提示：模板 theme 覆盖了指定样式 " + "、".join(f"{k}（原为{sources.get(k, '')}）" for k in overridden)
+                     + "，按智能体的决定展示；请确认这是有意为之")
+    theme = {**specified, **chosen}
+    return design.full(theme), warns
 
 
 # ------------------------------------------------------------ 数据

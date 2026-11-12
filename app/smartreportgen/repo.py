@@ -243,7 +243,7 @@ def search_datasets(query: str, top_k: int = 5, dataset_ids: list[int] | None = 
 
 
 # ============================ 样式规则 ============================
-# 生效顺序：业务场景规则 ≥ 通用规则 ≥ 内置默认（同一层级内按 priority 升序，后者覆盖前者）
+# 生效顺序：业务场景规则 ≥ 通用规则 ≥ 内置样式（同一层级内按 priority 升序，后者覆盖前者）
 SR_COLS = ("id, name, scope, business_scenario, content, items, theme, priority, enabled, created_at, updated_at, "
            "created_by, (SELECT e.name FROM permission.employee e WHERE e.emp_no = created_by) AS creator_name, "
            "(embedding IS NOT NULL) AS vectorized")
@@ -256,7 +256,7 @@ def _clean_theme(theme: dict) -> dict:
     if not isinstance(theme, dict):
         raise Invalid("theme 必须是对象")
     resolved, warns = design.resolve(theme)
-    bad = [w for w in warns if "不是已知令牌" not in w]
+    bad = [w for w in warns if "不是已知" not in w]
     if bad:
         raise Invalid("；".join(bad))
     keys = {design.LEGACY_ALIASES.get(str(k).lstrip("-"), str(k).lstrip("-")) for k in theme}
@@ -345,7 +345,7 @@ def delete_rule(rule_id: int) -> None:
 
 def _rule_layers(business_scenario: str | None, exclude_id: int | None = None, draft: dict | None = None,
                  owner: str | None = None) -> tuple[list[dict], list[tuple[str, str, dict]]]:
-    """按 内置默认 → 通用规则 → 业务场景规则 的顺序返回生效规则与主题层（可排除正在编辑的规则并放入草稿）。
+    """按 内置样式 → 通用规则 → 业务场景规则 的顺序返回生效规则与主题层（可排除正在编辑的规则并放入草稿）。
     业务场景规则只取 owner（报告创建人）本人配置的；owner 为空时只有通用规则。"""
     rows = db.fetchall(
         f"SELECT {SR_COLS} FROM style_rule.style_rule WHERE enabled AND "
@@ -372,7 +372,7 @@ def effective_style(business_scenario: str | None, exclude_id: int | None = None
 
 
 def style_rules_for(business_scenario: str | None, query: str | None = None, owner: str | None = None) -> dict:
-    """通用规则 + owner 本人的业务场景规则（生效顺序：业务场景 ≥ 通用 ≥ 内置默认）。给出 query 时附带相关度排序。"""
+    """通用规则 + owner 本人的业务场景规则（生效顺序：业务场景 ≥ 通用 ≥ 内置样式）。给出 query 时附带相关度排序。"""
     from . import design
 
     rows, layers = _rule_layers(business_scenario, owner=owner)
@@ -385,7 +385,7 @@ def style_rules_for(business_scenario: str | None, query: str | None = None, own
                      params={"sc": business_scenario})
         warnings = res["warnings"]
         relevance = {h["id"]: h for h in res["hits"]}
-    merged_theme, sources = design.resolve_with_sources(layers)
+    theme, sources = design.resolve_with_sources(layers)
     cat_label = {c["key"]: c["label"] for c in design.ITEM_CATEGORIES}
     for r in rows:
         r["items"] = [{**it, "category_label": cat_label.get(it["category"], "其他")} for it in r.get("items") or []]
@@ -393,12 +393,15 @@ def style_rules_for(business_scenario: str | None, query: str | None = None, own
             r["relevance"] = relevance[r["id"]]
     return {
         "business_scenario": business_scenario,
+        "precedence": design.PRECEDENCE,
+        # 指定样式：内置样式 + 通用规则 + 业务场景规则 按优先级合并后的唯一结果，作为对智能体的约束
+        "specified": {
+            "theme": theme,
+            "theme_sources": {k: design.source_text(sources[k]) for k in theme},
+            "items": design.merge_items(rows),
+        },
         "general_rules": [r for r in rows if r["scope"] == "general"],
         "scenario_rules": [r for r in rows if r["scope"] == "scenario"],
-        "merged_theme": merged_theme,
-        "overridden_by": {k: v for k, v in sources.items() if v["level"] != "default"},
-        "precedence": design.PRECEDENCE,
-        "merge_order": "内置默认 → 通用规则 → 业务场景规则（后者覆盖前者；规则条目冲突时以业务场景规则为准）",
         "warnings": warnings,
     }
 

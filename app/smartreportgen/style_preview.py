@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 
-from . import repo
+from . import design, repo
 from .renderer import build_html
 from .template_parser import parse_template
 
@@ -137,6 +137,6 @@ def render_preview(business_scenario: str | None, exclude_id: int | None = None,
     tpl, errors, _ = parse_template(md)
     if errors:
         raise RuntimeError("示例模板错误：" + "；".join(errors))
-    theme = repo.effective_style(business_scenario, exclude_id, draft, owner)["theme"]
+    theme = design.full(repo.effective_style(business_scenario, exclude_id, draft, owner)["theme"])
     data = {"s": {"columns": COLUMNS, "rows": _rows()}}
     return build_html(tpl, data, theme, dt.datetime.now().strftime("%Y-%m-%d %H:%M"))

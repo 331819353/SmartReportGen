@@ -692,7 +692,7 @@ const Reports = {
 };
 
 // ------------------------------------------------------------ 样式规则（面向业务人员的可视化编辑）
-const LEVEL_LABEL = { default: '内置默认', general: '通用规则', scenario: '业务场景规则' };
+const LEVEL_LABEL = { builtin: '内置样式', default: '内置样式', general: '通用规则', scenario: '业务场景规则', unset: '未设置' };
 const isColor = v => typeof v === 'string' && /^#[0-9a-f]{3,8}$/i.test(v);
 function showVal(t, v) {
   if (v == null) return '—';
@@ -754,10 +754,12 @@ const TokenGroups = {
       <div class="tok-group-head"><b>{{g.label}}</b><span class="muted small">{{g.desc}}</span>
         <span class="spacer"></span><span class="badge blue" v-if="ownCount(g)">本规则调整 {{ownCount(g)}} 项</span></div>
       <div v-for="t in g.tokens" class="tok-row" :class="{own: own && t.key in own}">
-        <div class="tok-label"><b>{{t.label}}</b><span v-if="t.desc && t.type!=='color_auto'">{{t.desc}}</span></div>
-        <TokenControl :t="t" :value="effective[t.key]" :readonly="readonly" @set="v => $emit('set', t.key, v)"/>
+        <div class="tok-label"><b>{{t.label}} <span v-if="t.builtin" class="badge tiny">内置</span></b><span v-if="t.desc && t.type!=='color_auto'">{{t.desc}}</span></div>
+        <TokenControl v-if="effective[t.key] !== undefined && effective[t.key] !== null" :t="t" :value="effective[t.key]" :readonly="readonly" @set="v => $emit('set', t.key, v)"/>
+        <div v-else class="tok-ctl tok-unset"><span class="muted small">未设置 · 由智能体在生成报告时决定</span>
+          <button v-if="!readonly" type="button" class="btn sm" @click="$emit('set', t.key, initial(t))">设置此项</button></div>
         <div class="tok-src">
-          <template v-if="own && t.key in own"><span class="badge blue">本规则设置</span><button v-if="!readonly" class="link small" @click="$emit('reset', t.key)">恢复继承</button></template>
+          <template v-if="own && t.key in own"><span class="badge blue">本规则设置</span><button v-if="!readonly" class="link small" @click="$emit('reset', t.key)">{{t.builtin || inheritedSet(t.key) ? '恢复继承' : '取消设置'}}</button></template>
           <span v-else class="src" :class="sources[t.key] && sources[t.key].level">{{srcText(t.key)}}</span>
         </div>
       </div>
@@ -768,8 +770,21 @@ const TokenGroups = {
     const groups = computed(() => props.meta.groups.filter(g => props.showAdvanced || g.key !== 'advanced'));
     const cur = ref(props.meta.groups[0].key);
     const ownCount = g => props.own ? g.tokens.filter(t => t.key in props.own).length : 0;
-    const srcText = k => { const s = props.sources && props.sources[k]; if (!s) return '内置默认'; return s.level === 'default' ? '内置默认' : (props.own ? '继承：' : '') + `${LEVEL_LABEL[s.level]}「${s.rule}」`; };
-    return { groups, cur, ownCount, srcText };
+    const srcText = k => {
+      const s = props.sources && props.sources[k];
+      if (!s || s.level === 'unset') return '未设置';
+      if (s.level === 'builtin' || s.level === 'default') return '内置样式';
+      return (props.own ? '继承：' : '') + `${LEVEL_LABEL[s.level]}「${s.rule}」`;
+    };
+    // 继承链上（内置样式或其他规则）是否已有设置：决定“恢复继承”还是“取消设置”
+    const inheritedSet = k => { const s = props.sources && props.sources[k]; return !!s && s.level !== 'unset'; };
+    // “设置此项”的初始值：编辑器建议值（不是内置样式）
+    const initial = t => {
+      const v = props.meta.suggested ? props.meta.suggested[t.key] : undefined;
+      if (v !== undefined && v !== '') return JSON.parse(JSON.stringify(v));
+      return t.type === 'color_auto' ? '#2168F3' : t.type === 'bool' ? true : t.options ? t.options[0].value : '';
+    };
+    return { groups, cur, ownCount, srcText, inheritedSet, initial };
   }
 };
 const Styles = {
@@ -815,9 +830,10 @@ const Styles = {
       <div v-if="viewError" class="msg err" role="alert">{{viewError}} <button class="link" @click="openView(viewSc)">重试</button></div>
       <div v-else-if="viewLoading" class="collection-state" role="status">正在加载生效样式…</div>
       <div v-else class="style-editor"><div class="pane-left">
-        <div class="card card-pad" v-if="viewRules.length"><h3>生效的规则条目</h3>
-          <div v-for="r in viewRules" style="margin-bottom:10px"><div class="small muted">{{r.scope==='general'?'通用规则':'业务场景规则'}}「{{r.name}}」</div>
-            <ul class="rule-items"><li v-for="it in r.items"><span class="cat">{{catLabel(it.category)}}</span>{{it.text}}</li></ul></div></div>
+        <div class="card card-pad"><h3>生成要求（合并后）</h3>
+          <p class="small muted" style="margin:0 0 8px">业务场景规则 ≥ 通用规则 合并为一份，作为约束交给智能体；同类要求中排在前面的优先。智能体可按自己的判断调整，没有涉及的方面由智能体自由决定。</p>
+          <ul class="rule-items" v-if="viewRules.length"><li v-for="it in viewRules"><span class="cat">{{it.category_label}}</span>{{it.text}} <span class="src" :class="it.level">{{it.source}}</span></li></ul>
+          <p v-else class="muted small">没有指定的生成要求：全部由智能体自由决定。</p></div>
         <div class="card card-pad" style="margin-top:12px" v-if="eff"><h3>视觉样式</h3><TokenGroups :meta="meta" :effective="eff.theme" :sources="eff.sources" :readonly="true"/></div>
       </div>
       <div class="pane-right"><div class="preview-box"><div class="preview-bar">示例报告预览</div><iframe title="示例报告预览" :srcdoc="previewHtml"></iframe></div></div></div>
@@ -856,7 +872,7 @@ const Styles = {
             </div>
           </fieldset>
           <div v-show="tab==='theme'">
-            <p class="small muted" style="margin:0 0 10px">按报告页面的组成部分分类（主题、排版、页面布局、头部、筛选栏、章节与结论、卡片、指标卡、数据配色、图表、表格）。只改需要调整的项；没改的项沿用上一级（{{form.scope==='scenario' ? '通用规则与内置默认' : '内置默认'}}），并标明来源。</p>
+            <p class="small muted" style="margin:0 0 10px">按报告页面的组成部分分类（主题、排版、页面布局、头部、筛选栏、章节与结论、卡片、指标卡、数据配色、图表、表格）。只改需要调整的项；没改的项沿用上一级（{{form.scope==='scenario' ? '通用规则与内置样式' : '内置样式'}}）。内置样式只有颜色（标“内置”）；其余项都没有设置时，由智能体在生成报告时自行决定。</p>
             <label class="check small" style="margin-bottom:8px"><input type="checkbox" v-model="advanced"> 显示高级选项</label>
             <TokenGroups v-if="inherited" :meta="meta" :effective="effective" :sources="inherited.sources" :own="form.theme" :readonly="form.readonly" :show-advanced="advanced" @set="setTok" @reset="resetTok"/>
           </div>
@@ -898,7 +914,7 @@ const Styles = {
     const canEdit = r => (admin.value && (r.scope === 'general' || !!meNo())) || (r.scope === 'scenario' && !!meNo() && r.created_by === meNo());
     const ownerText = r => r.created_by ? `${r.creator_name || r.created_by}的样式` : '无归属';
     const grouped = computed(() => {
-      const g = [{ title: '通用规则', sub: admin.value ? '对所有报告生效' : '管理员配置，对所有报告生效（只读）', empty: '暂无通用规则，使用内置默认样式',
+      const g = [{ title: '通用规则', sub: admin.value ? '对所有报告生效' : '管理员配置，对所有报告生效（只读）', empty: '暂无通用规则：颜色使用内置样式，其余样式由智能体决定',
         rules: list.value.filter(r => r.scope === 'general') }];
       const scs = Array.from(new Set(scenarios.value.concat(list.value.filter(r => r.scope === 'scenario').map(r => r.business_scenario))));
       scs.forEach(sc => g.push({ title: '业务场景：' + sc, sub: admin.value ? '各人的个人样式，只对其本人的报告生效' : '我的样式，只对我生成的报告生效，优先于通用规则',
@@ -1005,7 +1021,7 @@ const Styles = {
           api('/api/style-rules/preview', { method: 'POST', body: { scenario: sc || null } })]);
         if (request !== viewRequest) return;
         eff.value = e;
-        viewRules.value = [...rs.general_rules, ...rs.scenario_rules];
+        viewRules.value = rs.specified.items;
         previewHtml.value = html;
       } catch (e) { if (request === viewRequest) viewError.value = e.message; }
       finally { if (request === viewRequest) viewLoading.value = false; }

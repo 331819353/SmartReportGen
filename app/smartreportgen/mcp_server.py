@@ -51,7 +51,7 @@ INSTRUCTIONS = """SmartReportGen 智能报告 MCP（需令牌认证：员工令�
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取你有权限的数据表；
 2) describe_table / run_query 了解字段与数据分布（只能访问已授权的表），确定分析目标；先调用 get_template_spec 了解模板语法；
 3) 设计章节（按维度视角平铺）、每节汇总结论、子结论与支撑图表、全局筛选；
-4) get_style_rules(业务场景) 获取通用+场景私有样式规则（设计令牌），渲染时自动生效，模板 theme 只写必要覆盖；
+4) get_style_rules(业务场景) 获取样式约束 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，最终以你的判断为准；
 5) validate_report_template 校验直至无错误 → save_report_template 存储模板 → render_report_html 生成并存储 HTML。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
@@ -251,21 +251,31 @@ def get_template_spec() -> str:
 # ============================== d. 样式规则 ==============================
 @mcp.tool()
 def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> dict:
-    """检索样式规则：管理员配置的通用规则 + 你本人为该业务场景配置的样式（只对你自己的报告生效）。
-    生效顺序：业务场景规则 ≥ 通用规则 ≥ 内置默认（冲突时以业务场景规则为准）。
-    返回每条规则的结构化条目 items（类别：版式结构/图表选择/必备筛选/好坏判定/涨跌颜色/数字格式/文案要求）、
-    合并后的设计令牌 merged_theme 及被规则覆盖的令牌来源 overridden_by。
-    渲染时会自动应用这些样式，模板 theme 中只需写确有必要的覆盖（例如用户确认过的升降色）。"""
+    """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置样式（仅颜色）合并为一份 specified，
+    作为约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为生成要求（类别：版式结构/图表选择/
+    必备筛选/好坏判定/涨跌颜色/数字格式/文案要求/其他，各类别内优先级高的排在前面）。
+    最终生效顺序：你的决定（模板 theme 与模板写法）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式——默认遵守约束，确有理由时可按自己的判断调整。"""
     try:
         p = _principal(ctx)
         res = repo.style_rules_for(business_scenario, query or None, owner=p.emp_no)
     except _EXPECTED as e:
         return _err(e)
-    for r in res["general_rules"] + res["scenario_rules"]:
-        r.pop("theme", None)  # 令牌已合并到 merged_theme，避免重复返回
-        if r.get("items"):
-            r.pop("content", None)  # content 由 items 生成，返回结构化条目即可
-    return _ok({"ok": True, **res})
+    rules = [{"id": r["id"], "name": r["name"], "scope": r["scope"],
+              **({"relevance": r["relevance"]} if r.get("relevance") else {})}
+             for r in res["general_rules"] + res["scenario_rules"]]
+    return _ok({
+        "ok": True,
+        "business_scenario": res["business_scenario"],
+        "precedence": res["precedence"],
+        "specified": res["specified"],
+        "rules": rules,
+        "note": ("specified 是检索出的样式约束（业务场景规则 ≥ 通用规则 ≥ 内置样式 合并的结果）：theme 在渲染时自动生效，"
+                 "模板中无需重复；items 是生成要求，各类别内排在前面的优先，请落实到报告结构、图表、筛选、健康度、升降色、"
+                 "数字格式与文案。最终以你的决定为准（智能体决定 ≥ 业务场景 ≥ 通用 ≥ 内置）：默认遵守约束，"
+                 "确有理由时（如用户明确要求、报告内容需要）可在模板 theme 中覆盖或不采纳某条要求，并在最终回复中说明。"
+                 "未指定的视觉样式与生成要求由你自由决定（可用样式项见 get_template_spec「主题」）。"),
+        "warnings": res["warnings"],
+    })
 
 
 # ============================== e/f. 模板与报告 ==============================

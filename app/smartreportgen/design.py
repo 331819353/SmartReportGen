@@ -1,8 +1,10 @@
-"""设计令牌（通用视觉规范）。报告页面只从令牌取值，派生色用 color-mix 从令牌混出。
+"""样式令牌。令牌键名即 CSS 变量名（去掉前缀 --）。
 
-令牌键名即 CSS 变量名（去掉前缀 --）。生效优先级：业务场景规则 ≥ 通用规则 ≥ 内置默认（本模块）。
-令牌按报告页面的组成部分分为 12 类（TOKEN_GROUPS）：主题、排版、页面布局、报告头部、筛选栏、章节与结论、
-卡片、指标卡、数据配色、图表、表格、高级。
+- 内置样式（BUILTIN_TOKENS）只有企业规范中的颜色：页面与卡片、文字、健康度、升降色、图表色板。
+- 其余样式项（字号、间距、圆角、对齐等）没有内置值。只有内置样式与规则中设置过的项会提供给智能体。
+- 展示取值：智能体在模板 theme 中配置了的项按其配置；未配置的项按 业务场景规则 ≥ 通用规则 ≥ 内置样式。
+- _BASE 仅是渲染兜底（智能体也没有决定时避免页面错乱），不属于内置样式，也不会提供给智能体。
+样式项按报告页面的组成部分分为 12 类（TOKEN_GROUPS）。
 """
 from __future__ import annotations
 
@@ -73,11 +75,24 @@ LAYOUT_OPTIONS = {  # 非 CSS 变量的页面选项
     "filter_sticky": True,      # 滚动时筛选栏吸顶
     "chart_grid": "dashed",     # 图表网格线：dashed / solid / none
     "table_zebra": False,       # 表格斑马纹
+    # 对齐（水平）；控件、按钮、标签内的文字始终垂直居中
+    "header_align": "left",     # 报告头部文字
+    "filter_align": "left",     # 筛选控件中的显示值
+    "section_align": "left",    # 章节标题与本节结论
+    "card_title_align": "left", # 卡片标题
+    "kpi_align": "left",        # 指标卡主数值与辅助数值
+    "table_text_align": "left", # 表格文字列
+    "table_num_align": "right", # 表格数值列
     "custom_css": "",
 }
 
-DEFAULT_TOKENS: dict[str, Any] = {**COLOR_TOKENS, **AUTO_COLOR_TOKENS, **PALETTE_TOKENS, **FONT_TOKENS, **SIZE_TOKENS,
-                                  **{k: v[0] for k, v in NUMBER_TOKENS.items()}, **PERCENT_TOKENS, **OTHER_TOKENS}
+# 内置样式：只有企业规范中的颜色
+BUILTIN_TOKENS: dict[str, Any] = {**COLOR_TOKENS, **PALETTE_TOKENS}
+DEFAULT_TOKENS = BUILTIN_TOKENS  # 兼容旧名称
+# 非内置样式项的渲染兜底（不是内置样式，不提供给智能体）
+_BASE: dict[str, Any] = {**AUTO_COLOR_TOKENS, **FONT_TOKENS, **SIZE_TOKENS, **{k: v[0] for k, v in NUMBER_TOKENS.items()},
+                         **PERCENT_TOKENS, **OTHER_TOKENS, **LAYOUT_OPTIONS}
+KNOWN_KEYS = set(BUILTIN_TOKENS) | set(_BASE)
 
 # 旧版主题键 → 令牌
 LEGACY_ALIASES = {
@@ -87,16 +102,24 @@ LEGACY_ALIASES = {
     "down_color": "color-trend-down", "font_family": "font-family", "radius": "radius-card", "gap": "rre-card-gap",
     "shadow": "shadow-card", "header_text": "color-text-inverse",
 }
-CHOICES = {"header_style": ("banner", "plain"), "chart_grid": ("dashed", "solid", "none")}
+CHOICES = {"header_style": ("banner", "plain"), "chart_grid": ("dashed", "solid", "none"),
+           "header_align": ("left", "center"), "filter_align": ("left", "center"), "section_align": ("left", "center"),
+           "card_title_align": ("left", "center"), "kpi_align": ("left", "center"),
+           "table_text_align": ("left", "center"), "table_num_align": ("right", "center")}
 BOOLS = ("toc", "filter_sticky", "table_zebra")
 
 _SAFE = re.compile(r"^[#\w\s,.'\"()%+\-/]*$")
 _COLOR = re.compile(r"^(#[0-9a-fA-F]{3,8}|rgba?\([\d\s.,%]+\)|hsla?\([\d\s.,%deg]+\)|[a-zA-Z]+)$")
 
 
+def canonical_key(k: Any) -> str:
+    k = str(k).lstrip("-")
+    return LEGACY_ALIASES.get(k, k)
+
+
 def resolve(*layers: dict | None) -> tuple[dict, list[str]]:
-    """按顺序叠加主题层，返回 (令牌+页面选项, 告警)。"""
-    out: dict[str, Any] = {**DEFAULT_TOKENS, **LAYOUT_OPTIONS}
+    """内置样式 + 按顺序叠加的样式层，返回 (已设置的样式项, 告警)。未设置的非内置项不在结果中。"""
+    out: dict[str, Any] = dict(BUILTIN_TOKENS)
     warns: list[str] = []
     for layer in layers:
         for k, v in (layer or {}).items():
@@ -104,8 +127,8 @@ def resolve(*layers: dict | None) -> tuple[dict, list[str]]:
             k = LEGACY_ALIASES.get(k, k)
             if k in ("header_bg", "summary_bg", "number_font", "chart_label_size"):
                 continue  # 旧版选项，已由令牌体系取代
-            if k not in out:
-                warns.append(f"theme.{k} 不是已知令牌，已忽略")
+            if k not in KNOWN_KEYS:
+                warns.append(f"theme.{k} 不是已知样式项，已忽略")
                 continue
             ok, val, msg = _validate(k, v)
             if ok:
@@ -169,7 +192,16 @@ def _validate(k: str, v: Any) -> tuple[bool, Any, str]:
     return False, None, "包含不安全字符"
 
 
+def full(values: dict) -> dict:
+    """渲染用的完整取值：未设置的非内置项使用兜底值。"""
+    return {**_BASE, **values}
+
+
+_JUSTIFY = {"left": "flex-start", "center": "center", "right": "flex-end"}
+
+
 def css_vars(t: dict) -> str:
+    t = full(t)
     parts = []
     for k in COLOR_TOKENS:
         parts.append(f"--{k}:{t[k]};")
@@ -190,18 +222,26 @@ def css_vars(t: dict) -> str:
     parts.append(f"--rf-header-bg:linear-gradient(120deg,{hs} 0%,{he} 100%);")
     parts.append(f"--rf-table-head-bg:{t['color-table-head-bg'] or 'var(--color-bg-card)'};")
     parts.append(f"--font-family:{t['font-family']};--shadow-card:{t['shadow-card']};--rf-max:{int(t['max_width'])}px;")
+    for k in ("header_align", "filter_align", "section_align", "card_title_align", "kpi_align", "table_text_align",
+              "table_num_align"):
+        name = k.replace("_align", "").replace("_", "-")
+        parts.append(f"--rf-{name}-align:{t[k]};--rf-{name}-justify:{_JUSTIFY[t[k]]};")
+    centered = lambda k: t[k] == "center"
+    parts.append(f"--rf-header-goal-margin:{'14px auto 0' if centered('header_align') else '14px 0 0'};"
+                 f"--rf-card-title-spacer:{0 if centered('card_title_align') else 1};"
+                 f"--rf-kpi-fact-justify:{'center' if centered('kpi_align') else 'space-between'};")
     return ":root{" + "".join(parts) + "}"
 
 
 def runtime_tokens(t: dict) -> dict:
-    """传给浏览器端运行时（ECharts 配置）使用的令牌。"""
-    out = {k: t[k] for k in DEFAULT_TOKENS}
-    out["chart_grid"] = t["chart_grid"]
-    return out
+    """传给浏览器端运行时（ECharts 配置）使用的令牌（已含兜底值）。"""
+    t = full(t)
+    return {k: t[k] for k in KNOWN_KEYS if k != "custom_css"}
 
 
 # ============================================================ 业务人员可读的元数据（样式规则编辑器使用）
-PRECEDENCE = "业务场景规则 ≥ 通用规则 ≥ 内置默认：同一项设置以业务场景规则为准，其次通用规则，都没有设置时用内置默认"
+PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式（仅颜色）：后三者合并为一份“指定样式”（视觉样式与生成要求），"
+              "同一项以优先级高者为准，作为约束交给智能体；智能体可以按自己的判断调整，没有指定的由智能体自由决定")
 
 # 按报告页面的组成部分分类；每个令牌只属于一类
 TOKEN_GROUPS: list[dict] = [
@@ -241,16 +281,20 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "color-header-end", "label": "横幅渐变结束色", "type": "color_auto", "desc": "留空则由主题色自动加深"},
         {"key": "rre-header-pad", "label": "头部内边距", "type": "px"},
         {"key": "rre-radius-panel", "label": "头部与结论框圆角", "type": "px"},
+        {"key": "header_align", "label": "头部文字对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "filter", "label": "筛选栏", "desc": "报告顶部的全局筛选与快捷场景按钮", "tokens": [
         {"key": "filter_sticky", "label": "滚动时吸顶", "type": "bool"},
         {"key": "rre-control-height", "label": "筛选控件高度", "type": "px"},
         {"key": "rre-radius-control", "label": "筛选控件圆角", "type": "px", "desc": "999 为胶囊形"},
         {"key": "rre-radius-pill", "label": "按钮圆角", "type": "px", "desc": "快捷场景、重置按钮"},
+        {"key": "filter_align", "label": "筛选值对齐", "type": "choice", "desc": "下拉框、多选框中显示的值；文字始终垂直居中",
+         "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "section", "label": "章节与结论", "desc": "每节开头的“本节结论”框", "tokens": [
         {"key": "rre-summary-tint", "label": "结论框底色深浅", "type": "percent", "desc": "主题色在底色中的比例，越大越深"},
         {"key": "rre-summary-border-tint", "label": "结论框边框深浅", "type": "percent"},
+        {"key": "section_align", "label": "章节标题与结论对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "card", "label": "卡片", "desc": "每个图表、指标外面的白色卡片", "tokens": [
         {"key": "color-bg-card", "label": "卡片底色", "type": "color"},
@@ -262,12 +306,14 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "rre-card-title-line", "label": "标题行高", "type": "px"},
         {"key": "rre-card-head-gap", "label": "标题到正文的间距", "type": "px"},
         {"key": "rre-radius-chip", "label": "单位与状态标签圆角", "type": "px"},
+        {"key": "card_title_align", "label": "卡片标题对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "kpi", "label": "指标卡", "desc": "主数值、辅助数值行与好坏判定色条", "tokens": [
         {"key": "rre-card-fact-line", "label": "辅助数值行高", "type": "px"},
         {"key": "rre-card-fact-gap", "label": "辅助数值行距", "type": "px"},
         {"key": "rre-radius-tile", "label": "辅助数值底块圆角", "type": "px"},
         {"key": "rre-status-bar", "label": "好坏判定色条粗细", "type": "px", "desc": "卡片顶部的绿 / 黄 / 红色条"},
+        {"key": "kpi_align", "label": "指标卡内容对齐", "type": "choice", "desc": "主数值与辅助数值", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "data", "label": "数据配色", "desc": "图形、好坏判定与涨跌的颜色", "tokens": [
         {"key": "chart-palette-categorical", "label": "分类配色", "type": "palette", "desc": "多个系列、多个类别时按顺序取色"},
@@ -293,6 +339,8 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "rre-card-row-height", "label": "行高", "type": "px"},
         {"key": "color-table-head-bg", "label": "表头底色", "type": "color_auto", "desc": "留空则与卡片底色一致"},
         {"key": "table_zebra", "label": "斑马纹（隔行底色）", "type": "bool"},
+        {"key": "table_text_align", "label": "文字列对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
+        {"key": "table_num_align", "label": "数值列对齐", "type": "choice", "options": [{"value": "right", "label": "右对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "advanced", "label": "高级", "desc": "仅供技术人员使用", "tokens": [
         {"key": "custom_css", "label": "自定义 CSS", "type": "code"},
@@ -318,6 +366,9 @@ ITEM_CATEGORIES: list[dict] = [
     {"key": "other", "label": "其他", "hint": "以上都不适用的要求", "examples": []},
 ]
 _CAT_LABEL = {c["key"]: c["label"] for c in ITEM_CATEGORIES}
+for _g in TOKEN_GROUPS:
+    for _t in _g["tokens"]:
+        _t["builtin"] = _t["key"] in BUILTIN_TOKENS
 
 
 def normalize_items(items) -> list[dict]:
@@ -330,6 +381,31 @@ def normalize_items(items) -> list[dict]:
         if text:
             out.append({"category": cat, "text": text[:500]})
     return out
+
+
+def merge_items(rules: list[dict]) -> list[dict]:
+    """把各条规则的条目合并为一份指定规则：按类别分组，组内业务场景规则在前、通用规则在后（冲突时以前者为准），
+    相同文字只保留优先级最高的一条。rules 需按 通用 → 场景 的顺序传入。"""
+    ordered = [r for r in rules if r.get("scope") == "scenario"][::-1] + [r for r in rules if r.get("scope") != "scenario"][::-1]
+    seen: set[tuple[str, str]] = set()
+    by_cat: dict[str, list[dict]] = {}
+    for r in ordered:
+        level = "scenario" if r.get("scope") == "scenario" else "general"
+        src = ("业务场景规则" if level == "scenario" else "通用规则") + f"「{r.get('name') or ''}」"
+        for it in r.get("items") or []:
+            key = (it["category"], re.sub(r"\s+", "", it["text"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            by_cat.setdefault(it["category"], []).append(
+                {"category": it["category"], "category_label": _CAT_LABEL.get(it["category"], "其他"),
+                 "text": it["text"], "level": level, "source": src})
+    return [it for c in ITEM_CATEGORIES for it in by_cat.get(c["key"], [])]
+
+
+def source_text(src: dict) -> str:
+    return {"builtin": "内置样式", "general": f"通用规则「{src.get('rule')}」",
+            "scenario": f"业务场景规则「{src.get('rule')}」"}.get(src.get("level"), "")
 
 
 def items_to_markdown(name: str, items: list[dict]) -> str:
@@ -361,9 +437,12 @@ def theme_diff(theme: dict, base: dict) -> dict:
 
 
 def resolve_with_sources(layers: list[tuple[str, str, dict]]) -> tuple[dict, dict]:
-    """layers: [(level, rule_name, theme)]，按 内置默认 → 通用 → 场景 顺序。返回 (生效值, 每项来源)。"""
+    """layers: [(level, rule_name, theme)]，按 通用 → 场景 顺序。返回 (已设置的样式项, 每项来源)；
+    来源 level：builtin（内置样式）/ general / scenario / unset（未设置，由智能体决定）。"""
     value, _ = resolve()
-    source = {k: {"level": "default", "rule": "内置默认"} for k in value}
+    source = {k: {"level": "builtin", "rule": "内置样式"} for k in value}
+    for k in _BASE:
+        source[k] = {"level": "unset", "rule": "未设置（由智能体决定）"}
     for level, rule_name, theme in layers:
         resolved, _ = resolve(theme)
         for k in (theme or {}):

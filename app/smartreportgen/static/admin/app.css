@@ -384,3 +384,12 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .type-nav button.on b{background:#fff}
 .tok-group-head{padding:12px 14px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 .tok-ctl input[type=range]{width:160px;accent-color:var(--primary)}
+
+/* 内置样式标记与未设置项 */
+.badge.tiny{height:16px;padding:0 6px;font-size:10px;font-weight:600;vertical-align:middle;background:var(--primary-weak);color:var(--primary)}
+.tok-unset{gap:10px}
+.tok-src .src.unset{color:var(--muted);font-style:italic}
+.tok-src .src.builtin{color:var(--text)}
+.rule-items .src{font-size:12px;color:var(--muted);margin-left:4px;white-space:nowrap}
+.rule-items .src.scenario{color:var(--primary)}
+.rule-items .src.general{color:var(--ok)}
