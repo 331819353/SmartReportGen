@@ -303,7 +303,7 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
 {css}
 {theme['custom_css']}</style>
 </head>
-<body>
+<body class="{' '.join(c for c, on in (('rf-zebra', theme['table_zebra']), ('rf-filter-static', not theme['filter_sticky'])) if on)}">
 <div class="rf-wrap"><header class="{header_cls}">
   <h1 class="rf-title">{html.escape(tpl.title)}</h1>
   {f'<p class="rf-subtitle">{sub}</p>' if sub else ''}

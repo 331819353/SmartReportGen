@@ -1,5 +1,5 @@
 /* SmartReportGen 管理台（Vue 3，无构建） */
-const { createApp, reactive, ref, computed, onMounted, watch, nextTick } = Vue;
+const { createApp, reactive, ref, computed, onMounted, onBeforeUnmount, watch, nextTick } = Vue;
 
 // ------------------------------------------------------------ 工具
 const toasts = reactive([]);
@@ -39,7 +39,30 @@ const pretty = v => JSON.stringify(v || {}, null, 2);
 
 const state = reactive({ page: location.hash.slice(1) || 'home', meta: null, needLogin: false, me: null, authCfg: null });
 window.addEventListener('hashchange', () => { state.page = location.hash.slice(1) || 'home'; });
-function go(p) { location.hash = p; }
+
+// 首页、模板和报告库复用同一个生成入口，生成后统一刷新可见报告。
+const reportDraft = ref(null);
+const reportRevision = ref(0);
+function startReport(template = null) { reportDraft.value = { template }; }
+
+function matches(kw, ...fields) {
+  const term = kw.trim().toLocaleLowerCase();
+  return !term || fields.some(value => String(value ?? '').toLocaleLowerCase().includes(term));
+}
+
+// 加载失败时保留上次结果，并在列表内提供重试入口。
+function useCollection(url, initial = []) {
+  const list = ref(initial), loading = ref(true), loadError = ref('');
+  async function load() {
+    loading.value = true;
+    loadError.value = '';
+    try { list.value = await api(url); }
+    catch (e) { loadError.value = e.message; }
+    finally { loading.value = false; }
+  }
+  onMounted(load);
+  return { list, loading, loadError, load };
+}
 
 const ICONS = {
   home: '<path d="M3 10.5 10 4l7 6.5V17a1 1 0 0 1-1 1h-4v-5H8v5H4a1 1 0 0 1-1-1z"/>',
@@ -49,17 +72,36 @@ const ICONS = {
   rep: '<rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 14v-3M10 14V7M13 14v-5"/>',
   key: '<circle cx="7" cy="12.5" r="3.5"/><path d="M9.5 10 16 3.5M13.5 6l2 2M11.8 7.7l1.5 1.5"/>',
   perm: '<rect x="4" y="9" width="12" height="8.5" rx="1.8"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9M10 12.5v2"/>',
-  sty: '<circle cx="10" cy="10" r="7"/><circle cx="7" cy="8" r="1.2"/><circle cx="11" cy="6.5" r="1.2"/><circle cx="13.5" cy="10" r="1.2"/><path d="M10 17a2 2 0 0 1 0-4h1.5"/>'
+  sty: '<circle cx="10" cy="10" r="7"/><circle cx="7" cy="8" r="1.2"/><circle cx="11" cy="6.5" r="1.2"/><circle cx="13.5" cy="10" r="1.2"/><path d="M10 17a2 2 0 0 1 0-4h1.5"/>',
+  plus: '<path d="M10 4v12M4 10h12"/>',
+  arrow: '<path d="M4 10h12m-5-5 5 5-5 5"/>',
+  search: '<circle cx="8.5" cy="8.5" r="4.5"/><path d="m12 12 4 4"/>',
+  menu: '<path d="M3 5h14M3 10h14M3 15h14"/>',
+  close: '<path d="m5 5 10 10M5 15 15 5"/>',
+  check: '<path d="m4 10 4 4 8-8"/>'
 };
-const icon = k => `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICONS[k]}</svg>`;
+const icon = k => `<svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICONS[k]}</svg>`;
 
 // ------------------------------------------------------------ 通用组件
 const Drawer = {
-  props: ['title', 'wide'], emits: ['close'],
-  template: `<div class="drawer-mask" @mousedown.self="$emit('close')"><div class="drawer" :class="{wide}">
-    <div class="drawer-head"><h2>{{title}}</h2><button class="x" @click="$emit('close')">×</button></div>
+  props: { title: String, wide: Boolean, compact: Boolean, busy: Boolean }, emits: ['close'],
+  template: `<dialog ref="dialog" class="drawer" :class="{wide, compact}" :aria-label="title" @cancel.prevent="close" @click.self="backdrop">
+    <div class="drawer-head"><h2>{{title}}</h2><button class="x" type="button" aria-label="关闭" :disabled="busy" @click="close" v-html="icon('close')"></button></div>
+    <div v-if="toasts.length" class="msgs dialog-feedback" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="msg" :class="t.kind">{{t.msg}}</div></div>
     <div class="drawer-body"><slot/></div>
-    <div class="drawer-foot" v-if="$slots.foot"><slot name="foot"/></div></div></div>`
+    <div class="drawer-foot" v-if="$slots.foot"><slot name="foot"/></div></dialog>`,
+  setup(props, { emit }) {
+    const dialog = ref(null);
+    // 原生弹窗管理焦点与背景交互，关闭后焦点回到触发按钮。
+    onMounted(() => dialog.value.showModal());
+    onBeforeUnmount(() => dialog.value.close());
+    function close() { if (!props.busy) emit('close'); }
+    function backdrop(e) {
+      const { left, right, top, bottom } = dialog.value.getBoundingClientRect();
+      if (e.clientX < left || e.clientX > right || e.clientY < top || e.clientY > bottom) close();
+    }
+    return { dialog, close, backdrop, icon, toasts };
+  }
 };
 const DataTable = {
   props: ['columns', 'rows', 'max'],
@@ -67,49 +109,132 @@ const DataTable = {
     <tbody><tr v-for="r in rows"><td v-for="v in r">{{v === null ? 'NULL' : v}}</td></tr></tbody></table></div>`
 };
 
-// ------------------------------------------------------------ 概览
+// ------------------------------------------------------------ 报告工作台
 const Home = {
-  template: `<div>
-    <div class="page-head"><div><h1>概览</h1><p>智能报告生成：MCP 工具 + Skill 编排，元数据存储于 PostgreSQL / pgvector</p></div></div>
-    <div class="grid g4" v-if="m">
-      <div class="card stat" v-for="s in statList" @click="go(s.page)" style="cursor:pointer"><div class="k">{{s.label}}</div><div class="v">{{m.stats[s.key]}}</div></div>
-    </div>
-    <div class="grid g2" style="margin-top:14px" v-if="m">
-      <div class="card card-pad">
-        <h3>MCP 接入</h3>
-        <dl class="kv"><dt>MCP 地址</dt><dd><code>{{m.mcp_url}}</code></dd><dt>传输方式</dt><dd>Streamable HTTP</dd>
-          <dt>鉴权</dt><dd>Bearer 令牌（JWT，含员工工号）· 按工号做表级权限控制</dd></dl>
-        <p class="small muted" style="margin:12px 0 6px">在「权限与令牌」中为员工签发令牌后，Claude Code 中注册：</p>
-        <pre class="block">claude mcp add --transport http smartreportgen {{m.mcp_url}} --header "Authorization: Bearer &lt;员工令牌&gt;"</pre>
+  template: `<div class="workbench">
+    <div class="page-head"><div><h1>报告工作台</h1><p>生成分析报告，查看已有结果，找到报告所需的数据。</p></div></div>
+    <section class="work-start" aria-labelledby="start-title">
+      <div class="start-main">
+        <span class="start-mark" v-html="icon('rep')"></span>
+        <h2 id="start-title">生成一份报告</h2>
+        <p>复用已有模板，按当前数据生成新的分析报告。</p>
+        <div class="actions">
+          <button class="btn start-btn" @click="startReport"><span class="ico" v-html="icon('plus')"></span>选择模板</button>
+          <a class="start-link" href="#templates">浏览报告模板 <span class="ico" v-html="icon('arrow')"></span></a>
+        </div>
       </div>
-      <div class="card card-pad">
-        <h3>检索与向量化</h3>
-        <dl class="kv"><dt>向量提供方</dt><dd>{{m.embedding.provider}}</dd><dt>模型</dt><dd>{{m.embedding.model}}</dd><dt>维度</dt><dd>{{m.embedding.dim}}</dd>
-          <dt>检索方式</dt><dd>pgvector 余弦相似度 + jieba 关键词（IDF 加权）→ RRF 融合</dd></dl>
-        <div class="msg warn" style="margin-top:12px" v-if="m.embedding.provider==='hash'">当前为离线哈希向量（无语义理解）。生产环境建议在 .env 配置 EMBEDDING_PROVIDER=openai 接入 bge-m3 等中文向量模型。</div>
+      <div class="start-side">
+        <h2>用 AI 提出分析需求</h2>
+        <p>在已接入的 Codex 或 Claude Code 中，描述要分析的主题、时间范围和关注指标。</p>
+        <details class="ai-help"><summary>查看示例和接入方式</summary>
+          <blockquote>分析近三个月各区域的销售额和毛利率，找出变化最大的区域。</blockquote>
+          <a v-if="hasMine" href="#mine">查看接入指引 <span class="ico" v-html="icon('arrow')"></span></a>
+          <span v-else class="small muted">接入信息请联系管理员获取。</span>
+        </details>
       </div>
-      <div class="card card-pad" style="grid-column:1/-1">
-        <h3>生成流程</h3>
-        <ol style="margin:0;padding-left:20px;line-height:2">
-          <li><b>解析需求</b> → <code>search_business_scenarios</code> 在有权限的业务场景中混合检索 → <code>get_dataset_tables</code> 获取有权限的数据表</li>
-          <li><b>探查数据</b> → <code>describe_table</code> / <code>run_query</code>，确定分析目标、章节（维度视角）、结论与支撑图表、自适应布局</li>
-          <li><b>全局筛选</b> → 设计多个级联筛选、预设场景与图表点击联动</li>
-          <li><b>样式</b> → <code>get_style_rules</code> 获取通用规则（设计令牌）与场景私有规则，渲染时自动生效</li>
-          <li><b>存储</b> → <code>validate_report_template</code> → <code>save_report_template</code> → <code>render_report_html</code> 生成并存储 HTML</li>
-        </ol>
-      </div>
+    </section>
+    <div class="work-grid">
+      <section class="card work-panel" aria-labelledby="recent-title" :aria-busy="loading">
+        <header class="panel-head"><div><h2 id="recent-title">最近生成</h2><p>{{admin ? '所有用户最近生成的报告' : '你最近生成的报告'}}</p></div>
+          <a class="panel-link" href="#reports">查看报告库 <span class="ico" v-html="icon('arrow')"></span></a></header>
+        <div v-if="loading && !list.length" class="collection-state" role="status">正在加载报告…</div>
+        <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button class="link" @click="load">重试</button></div>
+        <div v-else-if="!list.length" class="recent-empty">
+          <span class="empty-icon" v-html="icon('tpl')"></span>
+          <div><b>还没有报告</b><p>生成的报告会出现在这里，可随时查看或下载。</p></div>
+        </div>
+        <ul v-else class="recent-list">
+          <li v-for="r in list.slice(0,5)" :key="r.id">
+            <a :href="'/reports/'+r.id" target="_blank" rel="noopener">
+              <span class="resource-icon" v-html="icon('rep')"></span>
+              <span class="recent-info"><b>{{r.name}}</b><small>{{r.template_name || '报告'}}</small></span>
+              <time :datetime="r.created_at">{{fmtTime(r.created_at)}}</time>
+              <span class="ico" v-html="icon('arrow')"></span>
+            </a>
+          </li>
+        </ul>
+      </section>
+      <section class="card work-panel" aria-labelledby="resources-title">
+        <header class="panel-head"><div><h2 id="resources-title">报告资源</h2></div></header>
+        <div class="resource-list">
+          <a href="#datasets"><span class="resource-icon" v-html="icon('set')"></span>
+            <span><b>业务场景</b><small>查看可用数据及适用范围</small></span><span class="ico" v-html="icon('arrow')"></span></a>
+          <a href="#styles"><span class="resource-icon" v-html="icon('sty')"></span>
+            <span><b>报告样式</b><small>预览版式，设置场景偏好</small></span><span class="ico" v-html="icon('arrow')"></span></a>
+        </div>
+      </section>
     </div>
   </div>`,
   setup() {
-    const m = computed(() => state.meta);
-    const statList = [{ key: 'datasources', label: '数据源', page: 'datasources' }, { key: 'datasets', label: '数据集', page: 'datasets' },
-      { key: 'templates', label: '报告模板', page: 'templates' }, { key: 'reports', label: '报告', page: 'reports' }, { key: 'style_rules', label: '样式规则', page: 'styles' },
-      { key: 'employees', label: '已登记员工', page: 'perms' }].filter(x => isAdmin() || x.key !== 'employees');
-    onMounted(loadMeta);
-    return { m, statList, go };
+    const reports = useCollection('/api/reports');
+    watch(reportRevision, reports.load);
+    return { ...reports, startReport: () => startReport(), admin: computed(isAdmin), hasMine: computed(canVisitMine), fmtTime, icon };
   }
 };
+
 async function loadMeta() { state.meta = await api('/api/meta'); }
+
+// ------------------------------------------------------------ 从模板生成报告
+const GenerateReport = {
+  components: { Drawer },
+  props: ['template'],
+  emits: ['close'],
+  template: `<Drawer title="从模板生成报告" compact :busy="busy" @close="$emit('close')">
+    <div v-if="result" class="generation-result" role="status">
+      <span class="result-icon" v-html="icon('check')"></span><h3>报告已生成</h3>
+      <p>{{result.name}}</p>
+      <details v-if="result.warnings?.length" class="msg warn report-warnings">
+        <summary>查看 {{result.warnings.length}} 条生成提示</summary><ul><li v-for="(w,i) in result.warnings" :key="i">{{w}}</li></ul>
+      </details>
+    </div>
+    <form v-else id="generate-report-form" @submit.prevent="generate">
+      <p class="form-intro">报告会按生成时的数据保存，可在报告库中查看或下载。</p>
+      <div class="collection-state" v-if="loading" role="status">正在加载模板…</div>
+      <div class="msg err" v-else-if="loadError" role="alert">模板加载失败。<button class="link" type="button" @click="load">重试</button></div>
+      <div class="collection-state" v-else-if="!list.length">
+        还没有可用模板。先创建模板，或通过已接入的 AI 助手提交分析需求。
+        <div class="actions"><a class="btn" href="#templates" @click="$emit('close')">前往报告模板</a></div>
+      </div>
+      <template v-else>
+        <div class="field"><label for="generate-template">报告模板</label>
+          <select id="generate-template" class="in" v-model="selectedId" :disabled="busy" required>
+            <option :value="null" disabled>请选择模板</option>
+            <option v-for="t in list" :key="t.id" :value="t.id">{{t.name}}{{t.business_scenario ? ' · ' + t.business_scenario : ''}}{{admin && t.created_by ? ' · ' + (t.creator_name || t.created_by) : ''}}</option>
+          </select></div>
+        <div class="field"><label for="generate-name">报告名称 <small>选填</small></label>
+          <input id="generate-name" class="in" v-model.trim="name" :placeholder="selected ? selected.name : '默认使用模板名称'" :disabled="busy"></div>
+        <div v-if="error" class="msg err" role="alert">{{error}}</div>
+      </template>
+    </form>
+    <template #foot>
+      <template v-if="result">
+        <a class="btn" href="#reports" @click="$emit('close')">前往报告库</a>
+        <a class="btn primary" :href="'/reports/'+result.id" target="_blank" rel="noopener">查看报告</a>
+      </template>
+      <template v-else>
+        <button class="btn" :disabled="busy" @click="$emit('close')">取消</button>
+        <button class="btn primary" type="submit" form="generate-report-form" :disabled="!selected || busy || loading || !!loadError">{{busy ? '正在生成…' : '生成报告'}}</button>
+      </template>
+    </template>
+  </Drawer>`,
+  setup(props) {
+    const { list, loading, loadError, load } = useCollection('/api/templates', props.template ? [props.template] : []);
+    const selectedId = ref(props.template?.id ?? null), name = ref(''), busy = ref(false), error = ref(''), result = ref(null);
+    const selected = computed(() => list.value.find(t => t.id === selectedId.value));
+    watch(selectedId, () => { error.value = ''; });
+    async function generate() {
+      if (!selected.value || busy.value || loading.value || loadError.value) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        result.value = await api('/api/templates/' + selectedId.value + '/render', { method: 'POST', body: name.value ? { name: name.value } : {} });
+        reportRevision.value += 1;
+      } catch (e) { error.value = e.message; }
+      finally { busy.value = false; }
+    }
+    return { list, loading, loadError, load, selectedId, selected, name, busy, error, result, generate, admin: computed(isAdmin), icon };
+  }
+};
 
 // ------------------------------------------------------------ 数据源
 function emptyDs() {
@@ -187,9 +312,9 @@ const DsBrowser = {
 const Datasources = {
   components: { Drawer, DsBrowser },
   template: `<div>
-    <div class="page-head"><div><h1>数据源</h1><p>支持 MySQL、PostgreSQL、Oracle、StarRocks 与 HTTP API；密码/令牌加密存储，建议使用只读账号</p></div>
+    <div class="page-head"><div><h1>数据源</h1><p>{{admin ? '管理业务场景使用的数据连接，检查连接是否可用。' : '查看已授权业务场景使用的数据连接。'}}</p></div>
       <div class="actions"><button v-if="admin" class="btn primary" @click="edit()">新建数据源</button><span v-else class="badge">只读 · 仅显示你有权限的数据源</span></div></div>
-    <div class="card"><table class="tbl"><thead><tr><th>名称</th><th>类型</th><th v-if="admin">连接</th><th>描述</th><th>状态</th><th v-if="admin">操作</th></tr></thead>
+    <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>名称</th><th>类型</th><th v-if="admin">连接</th><th>描述</th><th>状态</th><th v-if="admin">操作</th></tr></thead>
       <tbody><tr v-for="d in list"><td><b>{{d.name}}</b></td><td><span class="badge blue">{{DS_LABEL[d.type]}}</span></td>
         <td v-if="admin" class="mono small">{{addr(d)}}</td><td><div class="clip">{{d.description}}</div></td>
         <td><span class="dot" :class="{on:d.enabled}"></span>{{d.enabled?'启用':'停用'}}</td>
@@ -242,7 +367,7 @@ const Datasources = {
         const body = run(() => formToDs(form.value));
         const b = await body;
         await run(() => form.value.id ? api(`/api/datasources/${form.value.id}`, { method: 'PUT', body: b }) : api('/api/datasources', { method: 'POST', body: b }), '已保存');
-        form.value = null; load(); loadMeta();
+        form.value = null; load();
       } finally { busy.value = false; }
     }
     async function testForm() {
@@ -254,7 +379,7 @@ const Datasources = {
       } catch (e) { testRes.value = { ok: false, text: e.message }; } finally { busy.value = false; }
     }
     async function test(d) { const r = await run(() => api(`/api/datasources/${d.id}/test`, { method: 'POST' })); toast(`「${d.name}」连接成功：${r.version}（${r.latency_ms} ms）`, 'ok'); }
-    async function del(d) { if (!confirm(`删除数据源「${d.name}」？`)) return; await run(() => api(`/api/datasources/${d.id}`, { method: 'DELETE' }), '已删除'); load(); loadMeta(); }
+    async function del(d) { if (!confirm(`删除数据源「${d.name}」？`)) return; await run(() => api(`/api/datasources/${d.id}`, { method: 'DELETE' }), '已删除'); load(); }
     return { admin, list, form, browse, busy, testRes, addr, edit, save, testForm, test, del, DS_LABEL, DEFAULT_PORT };
   }
 };
@@ -263,40 +388,66 @@ const Datasources = {
 const Datasets = {
   components: { Drawer },
   template: `<div>
-    <div class="page-head"><div><h1>数据集</h1><p>一个数据集即一个业务场景：业务描述参与混合检索，数据表供报告取数</p></div>
-      <div class="actions"><template v-if="admin"><button class="btn" @click="reindex">重建检索索引</button><button class="btn primary" @click="edit()">新建数据集</button></template>
-        <span v-else class="badge">只读 · 仅显示你有权限的业务场景与数据表</span></div></div>
-    <div class="card card-pad" style="margin-bottom:14px">
-      <div class="actions"><input class="in" v-model="q" placeholder="输入一段报告需求，测试混合检索命中的业务场景，例如：分析今年各区域和渠道的销售增长与毛利变化" style="flex:1;min-width:280px" @keyup.enter="search">
-        <button class="btn primary" @click="search">检索</button></div>
-      <div v-if="sr" style="margin-top:12px">
-        <div class="small muted" style="margin-bottom:8px">分词：{{sr.query_tokens.join(' / ') || '（无）'}}</div>
-        <div class="msg warn" v-for="w in sr.warnings">{{w}}</div>
-        <div v-for="(h,i) in sr.hits" class="hit"><h4><span class="badge" :class="i===0?'green':''">#{{i+1}}</span>{{h.dataset.business_scenario}}<span class="score">RRF {{h.rrf}}</span></h4>
-          <div class="score">向量 {{h.vector_score ?? '-'}}（第{{h.vector_rank ?? '-'}}） · 关键词 {{h.keyword_score ?? '-'}}（第{{h.keyword_rank ?? '-'}}） · 命中 {{(h.matched_terms||[]).join('、') || '-'}}</div>
-          <p>{{h.dataset.business_description}}</p></div>
-        <div v-if="!sr.hits.length" class="muted small">没有命中</div>
+    <div class="page-head"><div><h1>业务场景</h1><p>按业务主题找数据，查看每个场景可用于分析的数据表。</p></div>
+      <div class="actions" v-if="admin"><button class="btn" @click="reindex">重建检索索引</button><button class="btn primary" @click="edit()">新建业务场景</button></div></div>
+    <section class="card list-panel" aria-label="业务场景列表" :aria-busy="loading">
+      <div class="list-tools">
+        <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索业务场景、描述或标签" aria-label="搜索业务场景"></label>
+        <span class="list-count" v-if="!loading && !loadError" aria-live="polite">{{shown.length}} 个场景</span>
       </div>
-    </div>
-    <div class="card"><table class="tbl"><thead><tr><th>业务场景</th><th>业务描述</th><th>数据源</th><th class="num">数据表</th><th>向量</th><th>操作</th></tr></thead>
-      <tbody><tr v-for="d in list"><td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div></td>
-        <td><div class="clip">{{d.business_description}}</div></td><td>{{d.datasource_name}} <span class="badge">{{DS_LABEL[d.datasource_type]}}</span></td>
-        <td class="num">{{d.table_count}}</td><td><span class="badge" :class="d.vectorized?'green':'amber'">{{d.vectorized?'已向量化':'未向量化'}}</span></td>
-        <td><div class="links"><button class="link" @click="view(d)">查看</button><template v-if="admin"><button class="link" @click="edit(d)">编辑</button><button class="link danger" @click="del(d)">删除</button></template></div></td></tr>
-        <tr v-if="!list.length"><td colspan="6" class="empty">{{admin ? '暂无数据集' : '暂无你有权限的业务场景，如需开通请联系管理员'}}</td></tr></tbody></table></div>
+      <div v-if="loading" class="collection-state" role="status">正在加载业务场景…</div>
+      <div v-else-if="loadError" class="collection-state" role="alert">业务场景加载失败。<button class="link" @click="load">重试</button></div>
+      <div v-else-if="!shown.length" class="collection-state">
+        <span class="empty-icon" v-html="icon('set')"></span><h2>{{kw.trim() ? '未找到匹配的场景' : '暂无可用的业务场景'}}</h2>
+        <p>{{kw.trim() ? '可以改用业务主题或常见指标搜索。' : admin ? '新建业务场景并添加该主题下的数据表。' : '如需使用业务数据，请联系管理员开通权限。'}}</p>
+        <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
+        <button v-else-if="admin" class="btn" @click="edit()">新建业务场景</button>
+        <a v-else-if="hasMine" class="btn" href="#mine">查看我的数据权限</a>
+      </div>
+      <div v-else class="scroll-x" tabindex="0" aria-label="业务场景表格">
+        <table class="tbl scene-table" role="table"><thead><tr><th scope="col">业务场景</th><th scope="col">分析范围</th><th scope="col">数据表</th><th v-if="admin" scope="col">状态</th><th scope="col">操作</th></tr></thead>
+          <tbody><tr v-for="d in shown" :key="d.id">
+            <td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div></td>
+            <td class="scene-description"><div class="clip">{{d.business_description || '—'}}</div></td><td data-label="数据表">{{d.table_count}} 张</td>
+            <td v-if="admin" data-label="状态"><span class="badge" :class="!d.enabled ? '' : d.vectorized ? 'green' : 'amber'">{{!d.enabled ? '停用' : d.vectorized ? '可用' : '索引待更新'}}</span></td>
+            <td><div class="links"><button class="link" @click="view(d)">查看数据表</button><template v-if="admin"><button class="link" @click="edit(d)">编辑</button><button class="link danger" @click="del(d)">删除</button></template></div></td>
+          </tr></tbody>
+        </table>
+      </div>
+    </section>
+    <details class="card card-pad discovery">
+      <summary>按分析需求匹配业务场景</summary>
+      <p class="muted">描述要回答的业务问题，查找可能用到的数据。</p>
+      <form class="query-form" @submit.prevent="search">
+        <input class="in" v-model="q" aria-label="分析需求" placeholder="例如：分析各渠道的销售增长与毛利变化">
+        <button class="btn primary" type="submit" :disabled="searching || !q.trim()">{{searching ? '正在匹配…' : '匹配场景'}}</button>
+      </form>
+      <div v-if="searchError" class="msg err" role="alert">{{searchError}}</div>
+      <div v-if="sr" class="match-results" aria-live="polite">
+        <div class="msg warn" v-for="w in sr.warnings">{{w}}</div>
+        <div v-for="h in sr.hits" :key="h.dataset.id" class="hit"><h4>{{h.dataset.business_scenario}}</h4>
+          <p>{{h.dataset.business_description}}</p><button class="link" @click="view(h.dataset)">查看数据表</button>
+          <details v-if="admin"><summary class="small muted">查看匹配依据</summary>
+            <p class="score">关键词 {{(h.matched_terms||[]).join('、') || '—'}} · 综合分 {{h.rrf}} · 向量 {{h.vector_score ?? '—'}} · 关键词分 {{h.keyword_score ?? '—'}}</p>
+          </details>
+        </div>
+        <p v-if="!sr.hits.length" class="muted">暂无匹配的场景。试试换一个业务主题或缩短描述。</p>
+      </div>
+    </details>
+    <p class="small muted legacy-link" v-if="!admin"><a href="#datasources">查看这些场景使用的数据源</a></p>
     <Drawer v-if="detail" :title="detail.business_scenario" @close="detail=null">
       <dl class="kv"><dt>业务描述</dt><dd>{{detail.business_description}}</dd><dt>标签</dt><dd>{{(detail.tags||[]).join('、') || '-'}}</dd>
         <dt>数据源</dt><dd>{{detail.datasource_name}}（{{DS_LABEL[detail.datasource_type]}}）</dd></dl>
       <h4 style="margin:16px 0 8px">数据表 <small class="muted" v-if="!admin">（仅显示你有权限的表）</small></h4>
-      <table class="tbl card"><thead><tr><th>数据表名</th><th>数据表描述</th></tr></thead>
+      <table class="tbl card"><thead><tr><th scope="col">数据表名</th><th scope="col">数据表描述</th></tr></thead>
         <tbody><tr v-for="t in detail.tables"><td class="mono">{{t.table_name}}</td><td>{{t.table_description}}</td></tr>
         <tr v-if="!detail.tables.length"><td colspan="2" class="empty">无</td></tr></tbody></table>
     </Drawer>
-    <Drawer v-if="form" :title="form.id ? '编辑数据集' : '新建数据集'" wide @close="form=null">
+    <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide @close="form=null">
       <div class="row2"><div class="field"><label>业务场景</label><input class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
         <div class="field"><label>数据源</label><select class="in" v-model="form.datasource_id"><option :value="null" disabled>请选择</option><option v-for="s in sources" :value="s.id">{{s.name}}（{{DS_LABEL[s.type]}}）</option></select></div></div>
-      <div class="field"><label>业务描述 <small>越具体越利于检索：覆盖范围、指标、维度、适用分析</small></label><textarea class="in" v-model="form.business_description" rows="4"></textarea></div>
-      <div class="field"><label>标签 <small>逗号分隔，作为高权重关键词</small></label><input class="in" v-model="form.tagsTxt"></div>
+      <div class="field"><label>业务描述 <small>说明数据范围、指标及适用的分析问题</small></label><textarea class="in" v-model="form.business_description" rows="4"></textarea></div>
+      <div class="field"><label>标签 <small>用逗号分隔，帮助同事查找场景</small></label><input class="in" v-model="form.tagsTxt"></div>
       <div class="field"><label>数据表 <small>{{form.tables.length}} 张</small></label>
         <table class="tbl tbl-editor card"><thead><tr><th style="width:36%">数据表名</th><th>数据表描述</th><th style="width:60px"></th></tr></thead>
           <tbody><tr v-for="(t,i) in form.tables"><td><input class="in mono" v-model="t.table_name" placeholder="schema.table"></td>
@@ -309,15 +460,18 @@ const Datasets = {
           <div v-if="!picker.length" class="muted small">加载中或无表</div>
         </div></div>
       <label class="check"><input type="checkbox" v-model="form.enabled"> 启用（停用后不参与检索）</label>
-      <template #foot><button class="btn" @click="form=null">取消</button><button class="btn primary" @click="save" :disabled="busy">保存并建立索引</button></template>
+      <template #foot><button class="btn" @click="form=null">取消</button><button class="btn primary" @click="save" :disabled="busy">保存业务场景</button></template>
     </Drawer>
   </div>`,
   setup() {
-    const list = ref([]), sources = ref([]), form = ref(null), busy = ref(false), q = ref(''), sr = ref(null), picker = ref(null), pickKw = ref(''), detail = ref(null);
+    const scenes = useCollection('/api/datasets');
+    const { load } = scenes;
+    const sources = ref([]), form = ref(null), busy = ref(false), q = ref(''), sr = ref(null), picker = ref(null), pickKw = ref(''), detail = ref(null);
+    const kw = ref(''), searching = ref(false), searchError = ref('');
+    const shown = computed(() => scenes.list.value.filter(d => matches(kw.value, d.business_scenario, d.business_description, ...(d.tags || []))));
     const admin = computed(isAdmin);
-    async function view(d) { detail.value = await run(() => api(`/api/datasets/${d.id}`)); }
-    const load = async () => { list.value = await api('/api/datasets'); };
-    onMounted(async () => { load(); sources.value = await api('/api/datasources'); });
+    async function view(d) { detail.value = await run(() => api('/api/datasets/' + d.id)); }
+    onMounted(async () => { if (admin.value) sources.value = await run(() => api('/api/datasources')); });
     async function edit(d) {
       picker.value = null;
       if (d) { const full = await run(() => api(`/api/datasets/${d.id}`)); form.value = { ...full, tagsTxt: (full.tags || []).join(', '), tables: full.tables.map(t => ({ ...t })) }; }
@@ -328,17 +482,26 @@ const Datasets = {
       const f = form.value;
       const body = { business_scenario: f.business_scenario, business_description: f.business_description, datasource_id: f.datasource_id,
         tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables: f.tables.filter(t => t.table_name.trim()) };
-      try { await run(() => f.id ? api(`/api/datasets/${f.id}`, { method: 'PUT', body }) : api('/api/datasets', { method: 'POST', body }), '已保存'); form.value = null; load(); loadMeta(); }
+      try { await run(() => f.id ? api(`/api/datasets/${f.id}`, { method: 'PUT', body }) : api('/api/datasets', { method: 'POST', body }), '已保存'); form.value = null; load(); }
       finally { busy.value = false; }
     }
-    async function del(d) { if (!confirm(`删除数据集「${d.business_scenario}」？`)) return; await run(() => api(`/api/datasets/${d.id}`, { method: 'DELETE' }), '已删除'); load(); loadMeta(); }
-    async function search() { if (!q.value.trim()) return; sr.value = await run(() => api(`/api/datasets/search?q=${encodeURIComponent(q.value)}&top_k=5`)); }
+    async function del(d) { if (!confirm(`删除数据集「${d.business_scenario}」？`)) return; await run(() => api(`/api/datasets/${d.id}`, { method: 'DELETE' }), '已删除'); load(); }
+    async function search() {
+      const query = q.value.trim();
+      if (!query || searching.value) return;
+      searching.value = true;
+      searchError.value = '';
+      sr.value = null;
+      try { sr.value = await api('/api/datasets/search?q=' + encodeURIComponent(query) + '&top_k=5'); }
+      catch (e) { searchError.value = e.message; }
+      finally { searching.value = false; }
+    }
     async function reindex() { const r = await run(() => api('/api/datasets/reindex', { method: 'POST' })); toast(`已重建：数据集 ${r.datasets}，样式规则 ${r.style_rules}，未向量化 ${r.not_vectorized}`, 'ok'); load(); }
     async function pick() { picker.value = []; picker.value = await run(() => api(`/api/datasources/${form.value.datasource_id}/tables`)); }
     const pickShown = computed(() => (picker.value || []).filter(t => !pickKw.value || t.name.includes(pickKw.value)));
     const has = n => form.value.tables.some(t => t.table_name === n);
     function togglePick(t) { const i = form.value.tables.findIndex(x => x.table_name === t.name); if (i >= 0) form.value.tables.splice(i, 1); else form.value.tables.push({ table_name: t.name, table_description: t.comment || '' }); }
-    return { admin, detail, view, list, sources, form, busy, q, sr, picker, pickKw, pickShown, edit, save, del, search, reindex, pick, has, togglePick, DS_LABEL };
+    return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, picker, pickKw, pickShown, edit, save, del, search, reindex, pick, has, togglePick, DS_LABEL, icon, hasMine: computed(canVisitMine) };
   }
 };
 
@@ -383,26 +546,53 @@ const Templates = {
   components: { Drawer },
   template: `<div>
     <template v-if="!form">
-      <div class="page-head"><div><h1>报告模板</h1><p>{{admin ? '全部用户的报告模板' : '我创建的报告模板'}}。Markdown 模板：章节（维度视角）→ 本节结论 → 子结论 → 支撑图表</p></div>
-        <div class="actions"><input class="in" v-model="kw" placeholder="搜索模板…" style="width:200px" @keyup.enter="load"><button class="btn primary" @click="edit()">新建模板</button></div></div>
-      <div class="card"><table class="tbl"><thead><tr><th>名称</th><th>业务场景</th><th v-if="admin">创建人</th><th>结构</th><th class="num">版本</th><th>创建时间</th><th>更新时间</th><th>操作</th></tr></thead>
-        <tbody><tr v-for="t in list"><td><b>{{t.name}}</b><div class="small muted clip">{{t.user_requirement}}</div></td><td>{{t.business_scenario || '-'}}</td><td v-if="admin" class="small">{{creator(t)}}</td>
-          <td class="small">{{(t.summary.sections||[]).length}} 章 · {{t.summary.chart_count}} 图 · {{t.summary.filter_count}} 筛选</td><td class="num">v{{t.version}}</td><td class="small">{{fmtTime(t.created_at)}}</td><td class="small">{{fmtTime(t.updated_at)}}</td>
-          <td><div class="links"><button class="link" @click="edit(t)">编辑</button><button class="link" @click="gen(t)">生成报告</button><button class="link danger" @click="del(t)">删除</button></div></td></tr>
-          <tr v-if="!list.length"><td colspan="8" class="empty">暂无模板。通常由 Skill 通过 MCP 自动生成，也可手动新建。</td></tr></tbody></table></div>
+      <div class="page-head"><div><h1>报告模板</h1><p>{{admin ? '查看所有用户的模板。' : '查看你创建的模板。'}}选择已有模板可生成新的报告。</p></div>
+        <button class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button></div>
+      <section class="card list-panel" aria-label="模板列表" :aria-busy="loading">
+        <div class="list-tools">
+          <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索模板名称、场景或分析需求" aria-label="搜索模板"></label>
+          <span v-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 个模板</span>
+        </div>
+        <div v-if="loading" class="collection-state" role="status">正在加载模板…</div>
+        <div v-else-if="loadError" class="collection-state" role="alert">模板加载失败。<button class="link" @click="load">重试</button></div>
+        <div v-else-if="!shown.length" class="collection-state">
+          <span class="empty-icon" v-html="icon(kw.trim() ? 'search' : 'tpl')"></span>
+          <h2>{{kw.trim() ? '未找到匹配的模板' : '还没有报告模板'}}</h2>
+          <p>{{kw.trim() ? '试试其他关键词。' : '可以新建模板，也可以在已接入的 AI 助手中提交分析需求，由助手保存模板。'}}</p>
+          <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
+          <button v-else class="btn" @click="edit()">新建模板</button>
+        </div>
+        <div v-else class="scroll-x" tabindex="0" aria-label="模板表格"><table class="tbl report-table" role="table">
+          <thead><tr><th scope="col">模板名称</th><th scope="col">业务场景</th><th scope="col" v-if="admin">创建人</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead>
+          <tbody><tr v-for="t in shown" :key="t.id">
+            <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.user_requirement}}</div>
+              <details class="small record-details"><summary>模板信息</summary><p v-if="t.summary">{{t.summary.sections?.length || 0}} 章 · {{t.summary.chart_count || 0}} 个图表 · {{t.summary.filter_count || 0}} 个筛选项</p>
+                <p v-if="t.created_at">创建于 {{fmtTime(t.created_at)}}</p></details></td>
+            <td data-label="业务场景">{{t.business_scenario || '—'}}</td><td v-if="admin" data-label="创建人">{{creator(t)}}</td><td data-label="更新时间"><time :datetime="t.updated_at">{{fmtTime(t.updated_at)}}</time></td>
+            <td><div class="links"><button class="link" @click="gen(t)">生成报告</button><button class="link" @click="edit(t)">编辑</button>
+              <button class="link danger" @click="del(t)">删除</button></div></td>
+          </tr></tbody>
+        </table></div>
+      </section>
     </template>
     <template v-else>
-      <div class="page-head"><div><h1>{{form.id ? '编辑模板 · v' + form.version : '新建模板'}}</h1><p>保存时自动校验语法；“校验”会实际执行查询并检查字段</p></div>
-        <div class="actions"><button class="btn ghost" @click="form=null;load()">← 返回列表</button><button class="btn" @click="doValidate" :disabled="busy">校验</button><button class="btn" @click="preview" :disabled="busy">预览</button>
-          <button class="btn" @click="save(false)" :disabled="busy">保存</button><button class="btn primary" @click="save(true)" :disabled="busy">保存并生成报告</button></div></div>
-      <div class="meta-bar"><input class="in" v-model="form.name" placeholder="模板名称（默认取标题）">
-        <select class="in" v-model="form.dataset_id"><option :value="null">关联数据集（决定默认数据源）</option><option v-for="d in datasets" :value="d.id">{{d.business_scenario}}</option></select>
-        <input class="in" v-model="form.user_requirement" placeholder="用户原始需求"></div>
-      <div class="editor"><div class="pane"><textarea class="in code" v-model="form.markdown" spellcheck="false" @keydown.tab.prevent="tab"></textarea></div>
+      <div class="page-head"><div><h1>{{form.id ? '编辑模板 · v' + form.version : '新建模板'}}</h1><p>先填写模板信息和正文，再检查数据或预览报告。</p></div>
+        <div class="actions"><button class="btn ghost" :disabled="busy" @click="form=null;load()">返回模板</button><button class="btn" @click="doValidate" :disabled="busy">检查数据</button><button class="btn" @click="preview" :disabled="busy">预览</button>
+          <button class="btn" @click="save(false)" :disabled="busy">保存</button><button class="btn primary" @click="save(true)" :disabled="busy">保存并生成…</button></div></div>
+      <div class="card card-pad meta-bar">
+        <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
+        <div class="field"><label for="template-scenario">业务场景</label>
+          <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">选择默认取数的业务场景</option>
+            <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
+            <option v-for="d in datasets" :key="d.id" :value="d.id">{{d.business_scenario}}</option></select></div>
+        <div class="field"><label for="template-requirement">分析需求 <small>选填</small></label><input id="template-requirement" class="in" v-model="form.user_requirement" placeholder="填写需要回答的业务问题"></div>
+      </div>
+      <div class="editor"><div class="pane"><label class="editor-label" for="template-markdown">模板正文（Markdown）</label>
+        <textarea id="template-markdown" class="in code" v-model="form.markdown" :disabled="busy" spellcheck="false"></textarea></div>
         <div class="right"><div class="subtabs"><button :class="{on:side==='check'}" @click="side='check'">校验结果</button><button :class="{on:side==='preview'}" @click="side='preview'">预览</button>
           <button v-if="form.versions && form.versions.length" :class="{on:side==='ver'}" @click="side='ver'">版本 ({{form.versions.length}})</button></div>
           <div class="body" v-show="side==='check'">
-            <div v-if="!vr" class="muted small">点击“校验”执行模板中的全部查询并检查字段引用。</div>
+            <div v-if="!vr" class="muted small">点击“检查数据”执行模板中的查询并检查字段。</div>
             <div v-else class="msgs">
               <div class="msg ok" v-if="vr.ok">校验通过：{{vr.summary.sections.length}} 个章节，{{vr.summary.chart_count}} 个图表，{{vr.summary.filter_count}} 个筛选器</div>
               <div class="msg err" v-for="e in vr.errors">{{e}}</div><div class="msg warn" v-for="w in vr.warnings">{{w}}</div>
@@ -412,18 +602,20 @@ const Templates = {
               <template v-if="vr.filters"><h4 style="margin:10px 0 4px">筛选器取值</h4>
                 <div v-for="(f,k) in vr.filters" class="small"><b class="mono">{{k}}</b>：{{f.distinct}} 个取值 · {{f.examples.join('、')}}</div></template>
             </div></div>
-          <div class="body" v-show="side==='preview'" style="padding:0"><iframe v-if="previewHtml" :srcdoc="previewHtml"></iframe><div v-else class="empty">点击“预览”渲染</div></div>
+          <div class="body" v-show="side==='preview'" style="padding:0"><iframe v-if="previewHtml" title="报告模板预览" :srcdoc="previewHtml"></iframe><div v-else class="empty">点击“预览”渲染</div></div>
           <div class="body" v-show="side==='ver'"><div v-for="v in form.versions" class="hit" style="display:flex;justify-content:space-between;align-items:center"><span>v{{v.version}} · {{fmtTime(v.created_at)}} · {{fmtSize(v.size)}}</span><button class="link" @click="loadVer(v.version)">载入编辑器</button></div></div>
         </div></div>
     </template>
   </div>`,
   setup() {
-    const list = ref([]), form = ref(null), datasets = ref([]), busy = ref(false), vr = ref(null), side = ref('check'), previewHtml = ref(''), kw = ref('');
-    const load = async () => { list.value = await api('/api/templates' + (kw.value ? '?q=' + encodeURIComponent(kw.value) : '')); };
-    onMounted(async () => { load(); datasets.value = await api('/api/datasets'); });
+    const templates = useCollection('/api/templates');
+    const { load } = templates;
+    const form = ref(null), datasets = ref([]), busy = ref(false), vr = ref(null), side = ref('check'), previewHtml = ref(''), kw = ref('');
+    const shown = computed(() => templates.list.value.filter(t => matches(kw.value, t.name, t.business_scenario, t.user_requirement)));
+    onMounted(async () => { datasets.value = await run(() => api('/api/datasets')); });
     async function edit(t) {
       vr.value = null; previewHtml.value = ''; side.value = 'check';
-      form.value = t ? await run(() => api(`/api/templates/${t.id}`)) : { id: null, name: '', dataset_id: datasets.value[0] ? datasets.value[0].id : null, user_requirement: '', markdown: STARTER, version: 1 };
+      form.value = t ? await run(() => api(`/api/templates/${t.id}`)) : { id: null, name: '', dataset_id: null, user_requirement: '', markdown: STARTER, version: 1 };
     }
     async function doValidate() {
       busy.value = true; side.value = 'check';
@@ -439,38 +631,63 @@ const Templates = {
       try {
         const t = await run(() => f.id ? api(`/api/templates/${f.id}`, { method: 'PUT', body }) : api('/api/templates', { method: 'POST', body }), '模板已保存');
         form.value = await api(`/api/templates/${t.id}`);
-        if (andRender) { const r = await run(() => api(`/api/templates/${t.id}/render`, { method: 'POST', body: {} }), '报告已生成'); window.open(`/reports/${r.id}`, '_blank'); }
-        loadMeta();
+        if (andRender) startReport(t);
       } finally { busy.value = false; }
     }
-    async function gen(t) { const r = await run(() => api(`/api/templates/${t.id}/render`, { method: 'POST', body: {} }), '报告已生成'); window.open(`/reports/${r.id}`, '_blank'); loadMeta(); }
-    async function del(t) { if (!confirm(`删除模板「${t.name}」？已生成的报告会保留。`)) return; await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load(); loadMeta(); }
+    function gen(t) { startReport(t); }
+    async function del(t) { if (!confirm(`删除模板「${t.name}」？已生成的报告会保留。`)) return; await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load(); }
     async function loadVer(v) { const r = await run(() => api(`/api/templates/${form.value.id}/versions/${v}`)); form.value.markdown = r.markdown; toast(`已载入 v${v}，保存后成为新版本`); }
-    function tab(e) { const ta = e.target, s = ta.selectionStart; form.value.markdown = ta.value.slice(0, s) + '  ' + ta.value.slice(ta.selectionEnd); nextTick(() => { ta.selectionStart = ta.selectionEnd = s + 2; }); }
     const admin = computed(isAdmin);
-    return { admin, creator, list, form, datasets, busy, vr, side, previewHtml, kw, load, edit, doValidate, preview, save, gen, del, loadVer, tab, fmtTime, fmtSize };
+    return { ...templates, admin, creator, shown, form, datasets, busy, vr, side, previewHtml, kw, edit, doValidate, preview, save, gen, del, loadVer, fmtTime, fmtSize, icon };
   }
 };
 
 // ------------------------------------------------------------ 报告
 const Reports = {
   template: `<div>
-    <div class="page-head"><div><h1>报告</h1><p>{{admin ? '全部用户的报告' : '我生成的报告'}}。数据快照内嵌，支持筛选联动；可下载离线单文件</p></div></div>
-    <div class="card"><table class="tbl"><thead><tr><th>报告名称</th><th>来源模板</th><th v-if="admin">创建人</th><th>创建时间</th><th class="num">大小</th><th>数据行</th><th>操作</th></tr></thead>
-      <tbody><tr v-for="r in list"><td><b>{{r.name}}</b><div class="small muted" v-if="(r.meta.warnings||[]).length">{{r.meta.warnings.length}} 条提示</div></td>
-        <td>{{r.template_name || '-'}} <span class="badge" v-if="r.template_version">v{{r.template_version}}</span></td>
-        <td v-if="admin" class="small">{{creator(r)}}</td><td class="small">{{fmtTime(r.created_at)}}</td><td class="num">{{fmtSize(r.size)}}</td><td class="small">{{rows(r)}}</td>
-        <td><div class="links"><a :href="'/reports/'+r.id" target="_blank">查看</a><a :href="'/reports/'+r.id+'/download'">下载离线版</a><button class="link danger" @click="del(r)">删除</button></div></td></tr>
-        <tr v-if="!list.length"><td colspan="7" class="empty">暂无报告</td></tr></tbody></table></div>
+    <div class="page-head"><div><h1>报告库</h1><p>{{admin ? '查看所有用户已生成的报告。' : '查看你已生成的报告。'}}下载 HTML 文件后可离线打开。</p></div>
+      <button class="btn primary" @click="create"><span class="ico" v-html="icon('plus')"></span>生成报告</button></div>
+    <section class="card list-panel" aria-label="报告列表" :aria-busy="loading">
+      <div class="list-tools">
+        <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索报告名称或来源模板" aria-label="搜索报告"></label>
+        <span v-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 份报告</span>
+      </div>
+      <div v-if="loading" class="collection-state" role="status">正在加载报告…</div>
+      <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button class="link" @click="load">重试</button></div>
+      <div v-else-if="!shown.length" class="collection-state">
+        <span class="empty-icon" v-html="icon(kw.trim() ? 'search' : 'rep')"></span>
+        <h2>{{kw.trim() ? '未找到匹配的报告' : '还没有报告'}}</h2>
+        <p>{{kw.trim() ? '可以修改关键词，或查看全部报告。' : '选择已有模板，使用当前数据生成第一份报告。'}}</p>
+        <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
+        <button v-else class="btn" @click="create">选择模板</button>
+      </div>
+      <div v-else class="scroll-x" tabindex="0" aria-label="报告表格"><table class="tbl report-table" role="table">
+        <thead><tr><th scope="col">报告名称</th><th scope="col">来源模板</th><th scope="col" v-if="admin">创建人</th><th scope="col">生成时间</th><th scope="col">操作</th></tr></thead>
+        <tbody><tr v-for="r in shown" :key="r.id">
+          <td><a class="record-name" :href="'/reports/'+r.id" target="_blank" rel="noopener">{{r.name}}</a>
+            <div class="small muted">{{fmtSize(r.size)}}<span v-if="r.meta?.queries"> · 查询结果 {{queryRows(r)}} 行</span></div>
+            <details v-if="r.meta?.warnings?.length" class="small report-warnings"><summary>{{r.meta.warnings.length}} 条生成提示</summary>
+              <ul><li v-for="(w,i) in r.meta.warnings" :key="i">{{w}}</li></ul></details></td>
+          <td data-label="来源模板">{{r.template_name || '—'}} <span class="badge" v-if="r.template_version">v{{r.template_version}}</span></td>
+          <td v-if="admin" data-label="创建人">{{creator(r)}}</td><td data-label="生成时间"><time :datetime="r.created_at">{{fmtTime(r.created_at)}}</time></td>
+          <td><div class="links"><a :href="'/reports/'+r.id" target="_blank" rel="noopener">查看</a><a :href="'/reports/'+r.id+'/download'">下载 HTML</a>
+            <button class="link danger" @click="del(r)">删除</button></div></td>
+        </tr></tbody>
+      </table></div>
+    </section>
   </div>`,
   setup() {
-    const list = ref([]);
-    const load = async () => { list.value = await api('/api/reports'); };
-    onMounted(load);
-    const rows = r => Object.values((r.meta && r.meta.queries) || {}).reduce((a, q) => a + (q.rows || 0), 0) || '-';
-    async function del(r) { if (!confirm(`删除报告「${r.name}」？`)) return; await run(() => api(`/api/reports/${r.id}`, { method: 'DELETE' }), '已删除'); load(); loadMeta(); }
-    const admin = computed(isAdmin);
-    return { admin, creator, list, del, rows, fmtTime, fmtSize };
+    const reports = useCollection('/api/reports');
+    const kw = ref('');
+    const shown = computed(() => reports.list.value.filter(r => matches(kw.value, r.name, r.template_name, r.creator_name, r.created_by)));
+    const queryRows = r => Object.values(r.meta.queries).reduce((total, q) => total + (q.rows || 0), 0);
+    watch(reportRevision, reports.load);
+    async function del(r) {
+      if (!confirm('删除报告「' + r.name + '」？')) return;
+      await run(() => api('/api/reports/' + r.id, { method: 'DELETE' }), '已删除');
+      reports.load();
+    }
+    return { ...reports, admin: computed(isAdmin), creator, shown, kw, del, create: () => startReport(), fmtTime, fmtSize, queryRows, icon };
   }
 };
 
@@ -484,6 +701,8 @@ function showVal(t, v) {
   if (t.type === 'bool') return v ? '是' : '否';
   if (t.type === 'choice') return ((t.options || []).find(o => o.value === v) || {}).label || v;
   if (t.type === 'palette') return `${v.length} 种颜色`;
+  if (t.type === 'percent') return `${v}%`;
+  if (t.type === 'color_auto') return v || '自动';
   return String(v);
 }
 const TokenControl = {
@@ -491,6 +710,13 @@ const TokenControl = {
   template: `<div class="tok-ctl">
     <template v-if="t.type==='color'"><input type="color" :value="hex(value)" :disabled="readonly" @input="$emit('set', $event.target.value.toUpperCase())">
       <input class="in mono sm" :value="value" :disabled="readonly" @change="onText($event.target.value)"></template>
+    <template v-else-if="t.type==='color_auto'">
+      <label class="check small"><input type="checkbox" :checked="!value" :disabled="readonly" @change="$emit('set', $event.target.checked ? '' : '#2168F3')"> 自动</label>
+      <template v-if="value"><input type="color" :value="hex(value)" :disabled="readonly" @input="$emit('set', $event.target.value.toUpperCase())">
+        <input class="in mono sm" :value="value" :disabled="readonly" @change="onText($event.target.value)"></template>
+      <span v-else class="muted small">{{t.desc}}</span></template>
+    <template v-else-if="t.type==='number'"><input class="in sm" type="number" :step="t.step || 0.1" :min="t.min" :max="t.max" :value="value" :disabled="readonly" @change="$emit('set', +$event.target.value)"><span class="muted small">{{t.min}} ~ {{t.max}}</span></template>
+    <template v-else-if="t.type==='percent'"><input type="range" min="0" max="40" :value="value" :disabled="readonly" @input="$emit('set', +$event.target.value)"><span class="small mono">{{value}}%</span></template>
     <template v-else-if="t.type==='palette'"><div class="pal">
       <span v-for="(c,i) in value" class="pal-chip"><input type="color" :value="hex(c)" :disabled="readonly" @input="setPal(i,$event.target.value.toUpperCase())">
         <button v-if="!readonly && value.length>2" class="pal-x" title="移除" @click="delPal(i)">×</button></span>
@@ -507,8 +733,8 @@ const TokenControl = {
     <template v-else><input class="in sm" :value="value" :disabled="readonly" @change="$emit('set', $event.target.value)" style="flex:1"></template>
   </div>`,
   setup(props, { emit }) {
-    const sizes = [12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48];
-    const weights = [[400, '常规'], [500, '中等'], [600, '半粗'], [700, '粗']];
+    const sizes = [12, 13, 14, 15, 16, 18, 20, 22, 24, 26, 28, 32, 36, 40, 44, 48, 56, 64, 72];
+    const weights = [[300, '细'], [400, '常规'], [500, '中等'], [600, '半粗'], [700, '粗'], [800, '特粗']];
     const hex = v => { v = String(v || '#000000'); return /^#[0-9a-f]{6}$/i.test(v) ? v : /^#[0-9a-f]{3}$/i.test(v) ? '#' + v.slice(1).split('').map(x => x + x).join('') : '#000000'; };
     function onText(v) { v = v.trim(); if (isColor(v)) emit('set', v.toUpperCase()); else toast('请输入 #RRGGBB 格式的颜色', 'err'); }
     function setPal(i, c) { const a = props.value.slice(); a[i] = c; emit('set', a); }
@@ -521,39 +747,49 @@ const TokenGroups = {
   components: { TokenControl },
   props: ['meta', 'effective', 'sources', 'own', 'readonly', 'showAdvanced'], emits: ['set', 'reset'],
   template: `<div>
-    <details v-for="(g,gi) in meta.groups" class="tok-group" :open="gi<2">
-      <summary><b>{{g.label}}</b><span class="muted small">{{g.desc}}</span><span class="badge blue" v-if="ownCount(g)">本规则调整 {{ownCount(g)}} 项</span></summary>
-      <div v-for="t in g.tokens.filter(t=>showAdvanced || !t.advanced)" class="tok-row" :class="{own: own && t.key in own}">
-        <div class="tok-label"><b>{{t.label}}</b><span v-if="t.desc">{{t.desc}}</span></div>
+    <div class="type-nav" role="tablist" aria-label="样式类型">
+      <button v-for="g in groups" type="button" role="tab" :aria-selected="cur===g.key" :class="{on: cur===g.key}" @click="cur=g.key">{{g.label}}<b v-if="ownCount(g)">{{ownCount(g)}}</b></button>
+    </div>
+    <div v-for="g in groups" v-show="cur===g.key" class="tok-group" role="tabpanel">
+      <div class="tok-group-head"><b>{{g.label}}</b><span class="muted small">{{g.desc}}</span>
+        <span class="spacer"></span><span class="badge blue" v-if="ownCount(g)">本规则调整 {{ownCount(g)}} 项</span></div>
+      <div v-for="t in g.tokens" class="tok-row" :class="{own: own && t.key in own}">
+        <div class="tok-label"><b>{{t.label}}</b><span v-if="t.desc && t.type!=='color_auto'">{{t.desc}}</span></div>
         <TokenControl :t="t" :value="effective[t.key]" :readonly="readonly" @set="v => $emit('set', t.key, v)"/>
         <div class="tok-src">
           <template v-if="own && t.key in own"><span class="badge blue">本规则设置</span><button v-if="!readonly" class="link small" @click="$emit('reset', t.key)">恢复继承</button></template>
           <span v-else class="src" :class="sources[t.key] && sources[t.key].level">{{srcText(t.key)}}</span>
         </div>
       </div>
-    </details>
+    </div>
   </div>`,
   setup(props) {
+    // 按报告页面的组成部分分类；“高级”只在勾选显示高级选项时出现
+    const groups = computed(() => props.meta.groups.filter(g => props.showAdvanced || g.key !== 'advanced'));
+    const cur = ref(props.meta.groups[0].key);
     const ownCount = g => props.own ? g.tokens.filter(t => t.key in props.own).length : 0;
     const srcText = k => { const s = props.sources && props.sources[k]; if (!s) return '内置默认'; return s.level === 'default' ? '内置默认' : (props.own ? '继承：' : '') + `${LEVEL_LABEL[s.level]}「${s.rule}」`; };
-    return { ownCount, srcText };
+    return { groups, cur, ownCount, srcText };
   }
 };
 const Styles = {
   components: { TokenGroups },
   template: `<div>
-    <template v-if="!form && !viewSc">
-      <div class="page-head"><div><h1>样式规则</h1><p>决定报告长什么样：通用规则由管理员配置、对所有报告生效；业务场景样式由每个人自己配置，只对本人生成的报告生效</p></div>
-        <div class="actions"><button class="btn primary" @click="edit()">{{admin ? '新建规则' : '新建我的场景样式'}}</button></div></div>
-      <div class="chain card card-pad">
-        <div class="chain-steps"><span class="step">内置默认</span><i>→</i><span class="step">通用规则<small>对所有报告生效</small></span><i>→</i><span class="step strong">业务场景样式<small>只对该场景、只对创建人本人的报告生效</small></span></div>
-        <p class="small muted" style="margin:8px 0 0">{{meta ? meta.precedence : ''}}。同一项设置，右边的覆盖左边的。</p>
-        <div class="actions" style="margin-top:12px"><span class="small">查看最终效果：</span>
-          <button class="btn sm" @click="openView('')">通用（不区分场景）</button>
-          <button v-for="sc in scenarios" class="btn sm" @click="openView(sc)">{{sc}}</button></div>
-      </div>
-      <div v-for="grp in grouped" style="margin-top:18px">
-        <h3 class="grp-title">{{grp.title}} <span class="muted small">{{grp.sub}}</span></h3>
+    <template v-if="!form && viewSc === null">
+      <div class="page-head"><div><h1>报告样式</h1><p>设置新报告的版式、图表和数字格式，并预览应用后的效果。</p></div>
+        <div class="actions"><button class="btn primary" :disabled="!meta || (!admin && !scenarios.length)" @click="edit()">{{admin ? '新建样式' : '新建我的场景样式'}}</button></div></div>
+      <section class="card card-pad style-overview" aria-labelledby="style-preview-title">
+        <div><h2 id="style-preview-title">预览当前样式</h2>
+          <p>同一项设置优先采用个人场景样式，其次是通用样式和系统默认。</p></div>
+        <div class="style-preview-actions"><label class="field"><span>预览范围</span>
+          <select class="in" v-model="viewChoice"><option value="">通用样式</option><option v-for="sc in scenarios" :key="sc" :value="sc">{{sc}}</option></select></label>
+          <button class="btn" :disabled="!meta" @click="openView(viewChoice)">查看生效效果</button></div>
+      </section>
+      <div class="msg err" v-if="styleError" role="alert">{{styleError}} <button class="link" @click="loadStyles">重试</button></div>
+      <div class="collection-state" v-else-if="styleLoading" role="status">正在加载报告样式…</div>
+      <div v-else>
+      <div v-for="grp in grouped" :key="grp.title" class="style-section">
+        <h2 class="grp-title">{{grp.title}} <span class="muted small">{{grp.sub}}</span></h2>
         <div class="rule-grid">
           <div v-for="r in grp.rules" class="card rule-card" :class="{off: !r.enabled}">
             <div class="rule-head"><b>{{r.name}}</b><span class="spacer"></span>
@@ -564,77 +800,102 @@ const Styles = {
               <li v-if="r.items.length>4" class="muted small">… 共 {{r.items.length}} 条规则</li>
               <li v-if="!r.items.length" class="muted small">没有规则条目</li></ul>
             <div class="rule-foot"><div class="swatches"><span v-for="c in colors(r.theme)" class="swatch" :style="{background:c}"></span></div>
-              <span class="small muted">{{Object.keys(r.theme||{}).length ? '视觉调整 ' + Object.keys(r.theme).length + ' 项' : '沿用上一级视觉样式'}}</span>
+              <span class="small muted">{{typeSummary(r.theme)}}</span>
               <span class="spacer"></span><template v-if="canEdit(r)"><button class="link" @click="edit(r)">编辑</button><button class="link danger" @click="del(r)">删除</button></template>
               <button v-else class="link" @click="edit(r, true)">查看</button></div>
           </div>
           <div v-if="!grp.rules.length" class="empty card">{{grp.empty}}</div>
         </div>
-      </div>
+      </div></div>
     </template>
 
     <template v-else-if="viewSc !== null && !form">
-      <div class="page-head"><div><h1>最终效果 · {{viewSc || '通用'}}</h1><p>该范围内所有规则叠加后的样式；每一项都标明了来自哪一级规则</p></div>
-        <div class="actions"><button class="btn ghost" @click="viewSc=null">← 返回</button></div></div>
-      <div class="style-editor"><div class="pane-left">
+      <div class="page-head"><div><h1>最终效果 · {{viewSc || '通用'}}</h1><p>查看此范围内实际采用的设置及其来源。</p></div>
+        <div class="actions"><button class="btn ghost" @click="closeView">返回样式列表</button></div></div>
+      <div v-if="viewError" class="msg err" role="alert">{{viewError}} <button class="link" @click="openView(viewSc)">重试</button></div>
+      <div v-else-if="viewLoading" class="collection-state" role="status">正在加载生效样式…</div>
+      <div v-else class="style-editor"><div class="pane-left">
         <div class="card card-pad" v-if="viewRules.length"><h3>生效的规则条目</h3>
           <div v-for="r in viewRules" style="margin-bottom:10px"><div class="small muted">{{r.scope==='general'?'通用规则':'业务场景规则'}}「{{r.name}}」</div>
             <ul class="rule-items"><li v-for="it in r.items"><span class="cat">{{catLabel(it.category)}}</span>{{it.text}}</li></ul></div></div>
         <div class="card card-pad" style="margin-top:12px" v-if="eff"><h3>视觉样式</h3><TokenGroups :meta="meta" :effective="eff.theme" :sources="eff.sources" :readonly="true"/></div>
       </div>
-      <div class="pane-right"><div class="preview-box"><div class="preview-bar">示例报告预览</div><iframe :srcdoc="previewHtml"></iframe></div></div></div>
+      <div class="pane-right"><div class="preview-box"><div class="preview-bar">示例报告预览</div><iframe title="示例报告预览" :srcdoc="previewHtml"></iframe></div></div></div>
     </template>
 
     <template v-else-if="form">
       <div class="page-head"><div><h1>{{form.readonly ? '查看样式规则' : form.id ? '编辑样式规则' : '新建样式规则'}}</h1>
-          <p>{{form.readonly ? '通用规则由管理员配置，你可以查看；如需个人调整，请新建“我的场景样式”' : '右侧为示例报告的实时预览'}}</p></div>
-        <div class="actions"><button class="btn ghost" @click="close">← 返回</button><button v-if="!form.readonly" class="btn primary" @click="save">保存</button></div></div>
+          <p>{{form.readonly ? '通用规则由管理员配置，你可以查看；如需个人调整，请新建“我的场景样式”' : '先确定适用范围，再填写生成要求或调整视觉样式。'}}</p></div>
+        <div class="actions"><button class="btn ghost" :disabled="saving" @click="close">返回样式列表</button>
+          <button class="btn style-preview-jump" @click="jumpToPreview">查看示例预览</button>
+          <button v-if="!form.readonly" class="btn primary" :disabled="saving" @click="save">{{saving ? '正在保存…' : '保存样式'}}</button></div></div>
       <fieldset class="plain-fs" :disabled="form.readonly">
       <div class="card card-pad meta-row">
-        <div class="field"><label>规则名称</label><input class="in" v-model="form.name" placeholder="如：零售销售报告风格"></div>
-        <div class="field" v-if="admin"><label>适用范围</label><div class="seg"><button :class="{on:form.scope==='general'}" @click="form.scope='general'">通用规则（所有报告）</button><button :class="{on:form.scope==='scenario'}" @click="form.scope='scenario'">我的业务场景样式</button></div></div>
+        <div class="field"><label for="style-name">样式名称</label><input id="style-name" class="in" v-model="form.name" placeholder="如：零售销售报告风格"></div>
+        <div class="field" v-if="admin"><label>适用范围</label><div class="seg"><button :class="{on:form.scope==='general'}" @click="form.scope='general'">通用规则（所有报告）</button><button :class="{on:form.scope==='scenario'}" :disabled="!personalStyle" @click="form.scope='scenario'">个人场景样式</button></div></div>
         <div class="field" v-else><label>适用范围</label><div class="small" style="line-height:34px">{{form.scope==='general' ? '通用规则（管理员配置）' : '我的业务场景样式（只对我的报告生效）'}}</div></div>
-        <div class="field" v-if="form.scope==='scenario'"><label>业务场景</label><select class="in" v-model="form.business_scenario"><option v-for="s in scenarios" :value="s">{{s}}</option></select></div>
-        <div class="field" v-else><label>预览场景</label><select class="in" v-model="previewSc"><option value="">不区分场景</option><option v-for="s in scenarios" :value="s">{{s}}</option></select></div>
+        <div class="field" v-if="form.scope==='scenario'"><label for="style-scenario">业务场景</label><select id="style-scenario" class="in" v-model="form.business_scenario"><option value="" disabled>选择场景</option><option v-if="form.business_scenario && !scenarios.includes(form.business_scenario)" :value="form.business_scenario">{{form.business_scenario}}</option><option v-for="s in scenarios" :value="s">{{s}}</option></select></div>
+        <div class="field" v-else><label for="preview-scenario">预览场景</label><select id="preview-scenario" class="in" v-model="previewSc"><option value="">不区分场景</option><option v-for="s in scenarios" :value="s">{{s}}</option></select></div>
         <div class="field"><label>状态</label><label class="check" style="height:34px"><input type="checkbox" v-model="form.enabled"> 启用</label></div>
       </div>
       </fieldset>
+      <div class="msg err" v-if="saveError" role="alert">{{saveError}}</div>
       <div class="style-editor">
         <div class="pane-left">
-          <div class="subtabs"><button :class="{on:tab==='items'}" @click="tab='items'">规则条目（{{form.items.length}}）</button><button :class="{on:tab==='theme'}" @click="tab='theme'">视觉样式（调整 {{Object.keys(form.theme).length}} 项）</button></div>
+          <div class="subtabs"><button :class="{on:tab==='items'}" @click="tab='items'">生成要求（{{form.items.length}}）</button><button :class="{on:tab==='theme'}" @click="tab='theme'">视觉样式（调整 {{Object.keys(form.theme).length}} 项）</button></div>
           <fieldset class="plain-fs" :disabled="form.readonly" v-show="tab==='items'">
-            <p class="small muted" style="margin:0 0 10px">用一句话写一条要求，智能体生成报告时会遵守。不知道怎么写时，点类别下面的“示例”直接添加再修改。</p>
+            <p class="small muted" style="margin:0 0 10px">写下生成报告时应遵循的要求。可以添加示例，再改成自己的口径。</p>
             <div v-for="c in meta.categories" class="cat-block">
               <div class="cat-head"><b>{{c.label}}</b><span class="muted small">{{c.hint}}</span></div>
               <div v-for="(it,i) in form.items" v-show="it.category===c.key" class="item-row">
-                <textarea class="in" rows="1" v-model="it.text" @input="grow($event)" :placeholder="'写一条' + c.label + '要求'"></textarea>
-                <select class="in sm" v-model="it.category" title="移到其他类别"><option v-for="cc in meta.categories" :value="cc.key">{{cc.label}}</option></select>
+                <textarea class="in" rows="1" v-model="it.text" @input="grow($event)" :aria-label="c.label + '要求'" :placeholder="'写一条' + c.label + '要求'"></textarea>
+                <select class="in sm" v-model="it.category" aria-label="要求类别"><option v-for="cc in meta.categories" :value="cc.key">{{cc.label}}</option></select>
                 <button class="link danger" @click="form.items.splice(i,1)">删除</button></div>
               <div class="cat-actions" v-if="!form.readonly"><button class="btn sm" @click="add(c.key)">+ 添加</button>
                 <button v-for="ex in c.examples" class="ex-chip" @click="add(c.key, ex)" :title="ex">示例：{{ex}}</button></div>
             </div>
           </fieldset>
           <div v-show="tab==='theme'">
-            <p class="small muted" style="margin:0 0 10px">只改需要调整的项；没改的项沿用上一级（{{form.scope==='scenario' ? '通用规则与内置默认' : '内置默认'}}），并标明来源。</p>
+            <p class="small muted" style="margin:0 0 10px">按报告页面的组成部分分类（主题、排版、页面布局、头部、筛选栏、章节与结论、卡片、指标卡、数据配色、图表、表格）。只改需要调整的项；没改的项沿用上一级（{{form.scope==='scenario' ? '通用规则与内置默认' : '内置默认'}}），并标明来源。</p>
             <label class="check small" style="margin-bottom:8px"><input type="checkbox" v-model="advanced"> 显示高级选项</label>
             <TokenGroups v-if="inherited" :meta="meta" :effective="effective" :sources="inherited.sources" :own="form.theme" :readonly="form.readonly" :show-advanced="advanced" @set="setTok" @reset="resetTok"/>
           </div>
         </div>
-        <div class="pane-right"><div class="preview-box"><div class="preview-bar">示例报告预览 <span class="muted small">{{previewing ? '更新中…' : '改动后自动更新'}}</span></div><iframe :srcdoc="previewHtml"></iframe></div></div>
+        <div class="pane-right" ref="previewPane" tabindex="-1"><div class="preview-box"><div class="preview-bar">示例报告预览 <span class="muted small">{{previewing ? '更新中…' : '改动后自动更新'}}</span></div><iframe title="示例报告预览" :srcdoc="previewHtml"></iframe></div></div>
       </div>
     </template>
   </div>`,
   setup() {
     const list = ref([]), scenarios = ref([]), meta = ref(null), form = ref(null), tab = ref('items'), advanced = ref(false);
-    const inherited = ref(null), previewHtml = ref(''), previewing = ref(false), previewSc = ref('');
-    const viewSc = ref(null), eff = ref(null), viewRules = ref([]);
-    const load = async () => { list.value = await api('/api/style-rules'); };
-    onMounted(async () => { [meta.value, scenarios.value] = await Promise.all([api('/api/style-tokens'), api('/api/scenarios')]); load(); });
+    const inherited = ref(null), previewHtml = ref(''), previewing = ref(false), previewSc = ref(''), previewPane = ref(null);
+    const viewSc = ref(null), viewChoice = ref(''), eff = ref(null), viewRules = ref([]);
+    const styleLoading = ref(true), styleError = ref(''), viewLoading = ref(false), viewError = ref('');
+    const saving = ref(false), saveError = ref('');
+    async function loadStyles() {
+      styleLoading.value = true;
+      styleError.value = '';
+      try {
+        const [tokens, names, rules] = await Promise.all([api('/api/style-tokens'), api('/api/scenarios'), api('/api/style-rules')]);
+        meta.value = tokens;
+        scenarios.value = [...new Set(names)];
+        list.value = rules;
+      } catch (e) { styleError.value = e.message; }
+      finally { styleLoading.value = false; }
+    }
+    onMounted(loadStyles);
     const catLabel = k => ((meta.value && meta.value.categories.find(c => c.key === k)) || {}).label || '其他';
     const colors = t => { t = t || {}; return Object.entries(t).flatMap(([k, v]) => Array.isArray(v) ? v : isColor(v) ? [v] : []).slice(0, 8); };
+    // 卡片上按类型概括本规则调整了哪些部分，例如“调整：卡片 2 项 · 数据配色 1 项”
+    const typeSummary = t => {
+      const keys = Object.keys(t || {});
+      if (!keys.length || !meta.value) return '沿用上一级视觉样式';
+      const parts = meta.value.groups.map(g => [g.label, g.tokens.filter(x => keys.includes(x.key)).length]).filter(x => x[1]);
+      return parts.length ? '调整：' + parts.map(x => `${x[0]} ${x[1]} 项`).join(' · ') : '沿用上一级视觉样式';
+    };
     const admin = computed(isAdmin);
     const meNo = () => (state.me && state.me.emp_no) || null;
-    const canEdit = r => admin.value || (r.scope === 'scenario' && r.created_by === meNo());
+    const personalStyle = computed(() => !!meNo() && scenarios.value.length > 0);
+    const canEdit = r => (admin.value && (r.scope === 'general' || !!meNo())) || (r.scope === 'scenario' && !!meNo() && r.created_by === meNo());
     const ownerText = r => r.created_by ? `${r.creator_name || r.created_by}的样式` : '无归属';
     const grouped = computed(() => {
       const g = [{ title: '通用规则', sub: admin.value ? '对所有报告生效' : '管理员配置，对所有报告生效（只读）', empty: '暂无通用规则，使用内置默认样式',
@@ -651,65 +912,107 @@ const Styles = {
       Object.assign(out, form.value.theme);
       return out;
     });
+    let timer = null, inheritedRequest = 0, previewRequest = 0;
+    // 更换场景或继续调整时，仅采用最后一次请求的预览和继承值。
     async function loadInherited() {
+      const request = ++inheritedRequest;
+      inherited.value = null;
       if (!form.value) return;
-      inherited.value = await api('/api/style-rules/effective', { method: 'POST', body: { scenario: scopeScenario() || null, exclude_id: form.value.id || null } });
-      if (form.value.scope === 'general' && !previewSc.value) {
-        // 编辑通用规则时，“继承”只来自内置默认与其他通用规则
-      }
+      try {
+        const value = await api('/api/style-rules/effective', { method: 'POST', body: { scenario: scopeScenario() || null, exclude_id: form.value.id || null } });
+        if (request === inheritedRequest) inherited.value = value;
+      } catch (e) { if (request === inheritedRequest) toast(e.message, 'err'); }
     }
-    let timer = null;
     function schedulePreview() {
       clearTimeout(timer);
+      const request = ++previewRequest;
+      previewing.value = !!form.value;
+      if (!form.value) return;
       timer = setTimeout(async () => {
-        if (!form.value) return;
-        previewing.value = true;
         try {
-          previewHtml.value = await api('/api/style-rules/preview', { method: 'POST', body: {
+          const html = await api('/api/style-rules/preview', { method: 'POST', body: {
             scenario: scopeScenario() || null, exclude_id: form.value.id || null,
             draft: { scope: form.value.scope, name: form.value.name, theme: form.value.theme } } });
-        } catch (e) { toast(e.message, 'err'); } finally { previewing.value = false; }
+          if (request === previewRequest) previewHtml.value = html;
+        } catch (e) { if (request === previewRequest) toast(e.message, 'err'); }
+        finally { if (request === previewRequest) previewing.value = false; }
       }, 450);
     }
     watch(() => form.value && JSON.stringify(form.value.theme), schedulePreview);
-    watch(() => form.value && [form.value.scope, form.value.business_scenario, previewSc.value].join('|'), () => { loadInherited(); schedulePreview(); });
+    watch(() => form.value && [form.value.id, form.value.scope, form.value.business_scenario, previewSc.value].join('|'), () => { loadInherited(); schedulePreview(); });
+    onBeforeUnmount(() => { clearTimeout(timer); inheritedRequest += 1; previewRequest += 1; });
     function legacy(content) {
       return (content || '').split('\n').map(l => /^\s*(?:[-*]|\d+[.、])\s+(.+)$/.exec(l)).filter(Boolean).map(m => ({ category: 'other', text: m[1].replace(/\*\*|`/g, '').trim() }));
     }
-    async function edit(r, readonly) {
-      tab.value = 'items'; previewHtml.value = '';
+    function edit(r, readonly) {
+      if (!meta.value) return;
+      tab.value = 'items';
+      advanced.value = false;
+      previewSc.value = '';
+      inherited.value = null;
+      previewHtml.value = '';
+      saveError.value = '';
       if (r) {
         const items = (r.items && r.items.length) ? r.items.map(x => ({ ...x })) : legacy(r.content);
         if (!(r.items && r.items.length) && items.length) toast('已把原有的文字说明拆成条目（类别为“其他”），请调整类别后保存');
         form.value = { id: r.id, name: r.name, scope: r.scope, business_scenario: r.business_scenario || scenarios.value[0] || '', enabled: r.enabled, priority: r.priority, items, theme: { ...(r.theme || {}) }, readonly: !!readonly };
       } else {
-        form.value = { id: null, name: '', scope: 'scenario', business_scenario: scenarios.value[0] || '', enabled: true, priority: 100, items: [], theme: {} };
+        form.value = { id: null, name: '', scope: personalStyle.value ? 'scenario' : 'general', business_scenario: '', enabled: true, priority: 100, items: [], theme: {} };
       }
-      await loadInherited(); schedulePreview();
     }
-    function close() { form.value = null; inherited.value = null; load(); }
+    function close() { form.value = null; inherited.value = null; loadStyles(); }
     function add(cat, text) { form.value.items.push({ category: cat, text: text || '' }); }
     function grow(e) { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; }
     function setTok(k, v) { form.value.theme = { ...form.value.theme, [k]: v }; }
     function resetTok(k) { const t = { ...form.value.theme }; delete t[k]; form.value.theme = t; }
     async function save() {
+      if (saving.value) return;
       const f = form.value;
-      const body = { name: f.name, scope: f.scope, business_scenario: f.business_scenario, enabled: f.enabled, priority: f.priority,
+      saveError.value = '';
+      if (!f.name.trim()) { saveError.value = '请填写样式名称。'; return; }
+      if (f.scope === 'scenario' && !f.business_scenario) { saveError.value = '请选择要应用此样式的业务场景。'; return; }
+      const body = { name: f.name.trim(), scope: f.scope, business_scenario: f.business_scenario, enabled: f.enabled, priority: f.priority,
         items: f.items.filter(i => i.text.trim()), theme: f.theme };
-      await run(() => f.id ? api(`/api/style-rules/${f.id}`, { method: 'PUT', body }) : api('/api/style-rules', { method: 'POST', body }), '已保存，新生成的报告将使用该样式');
-      close(); loadMeta();
+      saving.value = true;
+      try {
+        await api(f.id ? '/api/style-rules/' + f.id : '/api/style-rules', { method: f.id ? 'PUT' : 'POST', body });
+        toast('样式已保存，将应用于新生成的报告', 'ok');
+        close();
+      } catch (e) { saveError.value = e.message; }
+      finally { saving.value = false; }
     }
-    async function del(r) { if (!confirm(`删除样式规则「${r.name}」？`)) return; await run(() => api(`/api/style-rules/${r.id}`, { method: 'DELETE' }), '已删除'); load(); loadMeta(); }
+    async function del(r) {
+      if (!confirm('删除样式「' + r.name + '」？')) return;
+      await run(() => api('/api/style-rules/' + r.id, { method: 'DELETE' }), '已删除');
+      loadStyles();
+    }
+    // 窄屏将预览排在设置之后，入口可直接把滚动位置和键盘焦点移到预览。
+    function jumpToPreview() {
+      previewPane.value?.scrollIntoView({ block: 'start' });
+      previewPane.value?.focus({ preventScroll: true });
+    }
+    let viewRequest = 0;
+    function closeView() { viewRequest += 1; viewSc.value = null; }
     async function openView(sc) {
-      viewSc.value = sc; eff.value = null; previewHtml.value = '';
-      const [e, rs, html] = await Promise.all([
-        api('/api/style-rules/effective', { method: 'POST', body: { scenario: sc || null } }),
-        api('/api/style-rules/resolve' + (sc ? '?scenario=' + encodeURIComponent(sc) : '')),
-        api('/api/style-rules/preview', { method: 'POST', body: { scenario: sc || null } })]);
-      eff.value = e; viewRules.value = [...rs.general_rules, ...rs.scenario_rules]; previewHtml.value = html;
+      const request = ++viewRequest;
+      viewSc.value = sc;
+      viewLoading.value = true;
+      viewError.value = '';
+      try {
+        const [e, rs, html] = await Promise.all([
+          api('/api/style-rules/effective', { method: 'POST', body: { scenario: sc || null } }),
+          api('/api/style-rules/resolve' + (sc ? '?scenario=' + encodeURIComponent(sc) : '')),
+          api('/api/style-rules/preview', { method: 'POST', body: { scenario: sc || null } })]);
+        if (request !== viewRequest) return;
+        eff.value = e;
+        viewRules.value = [...rs.general_rules, ...rs.scenario_rules];
+        previewHtml.value = html;
+      } catch (e) { if (request === viewRequest) viewError.value = e.message; }
+      finally { if (request === viewRequest) viewLoading.value = false; }
     }
-    return { admin, canEdit, ownerText, list, scenarios, meta, form, tab, advanced, inherited, effective, previewHtml, previewing, previewSc, viewSc, eff, viewRules,
-      catLabel, colors, grouped, edit, close, add, grow, setTok, resetTok, save, del, openView };
+    return { typeSummary, admin, canEdit, personalStyle, ownerText, scenarios, meta, form, tab, advanced, inherited, effective, previewHtml, previewing, previewSc, viewSc, viewChoice, eff, viewRules,
+      catLabel, colors, grouped, edit, close, add, grow, setTok, resetTok, save, del, openView, closeView, styleLoading, styleError, loadStyles, viewLoading, viewError, saving, saveError, previewPane, jumpToPreview };
+
   }
 };
 
@@ -717,12 +1020,12 @@ const Styles = {
 const Perms = {
   components: { Drawer },
   template: `<div>
-    <div class="page-head"><div><h1>权限与令牌</h1><p>MCP 必须携带令牌访问；令牌中的员工工号决定可检索的业务场景与可访问的数据表（默认拒绝）</p></div></div>
+    <div class="page-head"><div><h1>员工与授权</h1><p>为员工或角色开放业务场景和数据表，也可在这里管理访问令牌。</p></div></div>
     <div class="subtabs"><button v-for="t in tabs" :class="{on:tab===t[0]}" @click="tab=t[0]">{{t[1]}}</button></div>
 
     <template v-if="tab==='emp'">
       <div class="actions" style="margin-bottom:12px"><button class="btn primary" @click="editEmp()">新增员工</button></div>
-      <div class="card"><table class="tbl"><thead><tr><th>工号</th><th>姓名</th><th>部门</th><th>角色</th><th>类型</th><th>注册来源</th><th>状态</th><th>操作</th></tr></thead>
+      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>工号</th><th>姓名</th><th>部门</th><th>角色</th><th>类型</th><th>注册来源</th><th>状态</th><th>操作</th></tr></thead>
         <tbody><tr v-for="e in emps"><td class="mono">{{e.emp_no}}</td><td>{{e.name}}</td><td>{{e.department}}</td>
           <td><span v-for="r in e.roles" class="badge" style="margin-right:4px">{{r}}</span><span v-if="e.direct_grants" class="small muted">+{{e.direct_grants}} 项直授</span></td>
           <td><span class="badge" :class="e.is_admin?'red':''">{{e.is_admin?'管理员（全部数据）':'普通用户'}}</span></td>
@@ -751,7 +1054,7 @@ const Perms = {
           </div></div>
         <button class="btn primary" @click="addGrant" :disabled="!g.subject || !g.dataset_id || !g.tables.length">授权</button>
       </div>
-      <div class="card"><table class="tbl"><thead><tr><th>授权对象</th><th>业务场景</th><th>数据表</th><th>授权时间</th><th>操作</th></tr></thead>
+      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>授权对象</th><th>业务场景</th><th>数据表</th><th>授权时间</th><th>操作</th></tr></thead>
         <tbody><tr v-for="x in grants"><td><span class="badge" :class="x.subject_type==='role'?'blue':'amber'">{{x.subject_type==='role'?'角色':'员工'}}</span> <span class="mono">{{x.subject}}</span> {{x.employee_name || ''}}</td>
           <td>{{x.business_scenario}}</td><td class="mono">{{x.table_name==='*' ? '全部表' : x.table_name}}</td><td class="small">{{fmtTime(x.created_at)}}</td>
           <td><button class="link danger" @click="delGrant(x)">撤销</button></td></tr>
@@ -774,7 +1077,7 @@ const Perms = {
           <div class="actions" style="margin-top:8px"><button class="btn sm" @click="copy(issued.token)">复制令牌</button><button class="btn sm" @click="copy(cmd)">复制命令</button></div></div>
         <div class="small muted" style="margin-top:8px">令牌为 JWT，工号位于 claim「{{jwt.emp_claim}}」，iss={{jwt.issuer}}，aud={{jwt.audience}}。{{jwt.external_public_key ? '已配置外部公钥，也接受企业 SSO 签发的令牌。' : '如需接入企业 SSO 签发的令牌，配置 JWT_PUBLIC_KEY。'}}</div>
       </div>
-      <div class="card"><table class="tbl"><thead><tr><th>员工</th><th>备注</th><th>签发时间</th><th>过期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead>
+      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>员工</th><th>备注</th><th>签发时间</th><th>过期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead>
         <tbody><tr v-for="t in tokens"><td><span class="mono">{{t.emp_no}}</span> {{t.name}}</td><td>{{t.note}}</td><td class="small">{{fmtTime(t.created_at)}}</td><td class="small">{{fmtTime(t.expires_at)}}</td><td class="small">{{fmtTime(t.last_used_at) || '-'}}</td>
           <td><span class="badge" :class="t.revoked?'red':t.expired?'amber':'green'">{{t.revoked?'已吊销':t.expired?'已过期':'有效'}}</span></td>
           <td><button class="link danger" v-if="!t.revoked" @click="revoke(t)">吊销</button></td></tr>
@@ -823,14 +1126,21 @@ const Perms = {
     async function saveEmp() {
       const e = emp.value, body = { emp_no: e.emp_no, name: e.name, department: e.department, roles: e.rolesTxt.split(/[,，\s]+/).filter(Boolean), is_admin: e.is_admin, enabled: e.enabled };
       await run(() => e._new ? api('/api/employees', { method: 'POST', body }) : api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'PUT', body }), '已保存');
-      emp.value = null; load(); loadMeta();
+      emp.value = null; load();
     }
-    async function delEmp(e) { if (!confirm(`删除员工 ${e.emp_no}？其直授权限会删除、令牌会被吊销。`)) return; await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load(); loadMeta(); }
+    async function delEmp(e) { if (!confirm(`删除员工 ${e.emp_no}？其直授权限会删除、令牌会被吊销。`)) return; await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load(); }
     function toggleT(t) { const i = g.tables.indexOf(t); if (i >= 0) g.tables.splice(i, 1); else g.tables.push(t); }
     async function addGrant() { const r = await run(() => api('/api/grants', { method: 'POST', body: { ...g } })); toast(`新增 ${r.added} 条授权`, 'ok'); load(); }
     async function delGrant(x) { if (!confirm('撤销该授权？')) return; await run(() => api('/api/grants/' + x.id, { method: 'DELETE' }), '已撤销'); load(); }
     function issueFor(e) { tab.value = 'token'; tk.emp_no = e.emp_no; issued.value = null; }
-    async function issue() { issued.value = await run(() => api('/api/tokens', { method: 'POST', body: { ...tk } }), '令牌已签发'); load(); }
+    async function issue() {
+      if (issuing.value) return;
+      issuing.value = true;
+      try {
+        issued.value = await run(() => api('/api/me/tokens', { method: 'POST', body: { days: days.value, note: note.value } }), '令牌已创建');
+        await load();
+      } finally { issuing.value = false; }
+    }
     async function revoke(t) { if (!confirm(`吊销 ${t.emp_no} 的令牌？使用该令牌的 MCP 客户端将立即失效。`)) return; await run(() => api(`/api/tokens/${t.jti}/revoke`, { method: 'POST' }), '已吊销'); load(); }
     async function checkEmp(no) { tab.value = 'check'; chk.value = no; chkRes.value = await run(() => api('/api/permissions/check?emp_no=' + encodeURIComponent(no))); }
     function copy(text) { navigator.clipboard.writeText(text).then(() => toast('已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err')); }
@@ -841,41 +1151,55 @@ const Perms = {
 
 // ------------------------------------------------------------ 根组件
 const Login = {
-  template: `<div class="card login">
-    <div class="brand-row"><i>S</i><div><h2>SmartReportGen</h2><p class="muted small">智能报告生成 · 管理台</p></div></div>
-    <template v-if="cfg">
-      <template v-if="cfg.mode==='iam'">
-        <a class="btn primary big" :class="{disabled: !cfg.iam_configured}" :href="cfg.iam_configured ? '/auth/iam/login?next=/' : null">使用海尔 IAM 单点登录</a>
-        <div class="msg warn small" v-if="!cfg.iam_configured" style="margin-top:10px">IAM 单点登录未配置（缺 {{cfg.iam_missing.join('、')}}），请联系运维；管理员可使用下方应急登录。</div>
-        <p class="small muted" style="margin:10px 0 0">登录后可在「我的令牌」中为 Claude Code、Codex 等 agent 签发个人 MCP 令牌。</p>
+  template: `<main class="login-shell">
+    <div class="card login">
+      <a class="brand" href="/"><span class="brand-icon" v-html="icon('rep')"></span><span>报告工作台<small>SmartReportGen</small></span></a>
+      <h1>登录报告工作台</h1><p class="login-intro">登录后可生成报告、查看已有报告和已授权的业务数据。</p>
+      <template v-if="cfg">
+        <template v-if="cfg.mode==='iam'">
+          <a v-if="cfg.iam_configured" class="btn primary big" href="/auth/iam/login?next=/">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
+          <div v-else class="msg warn" role="status">海尔单点登录暂不可用，请联系系统管理员。</div>
+        </template>
+        <details v-if="cfg.admin_token_login" :open="cfg.mode!=='iam'" class="fallback">
+          <summary>管理员令牌登录</summary>
+          <form @submit.prevent="login">
+            <div class="field"><label for="admin-token">管理员令牌</label><input id="admin-token" class="in" type="password" v-model="tok" autocomplete="current-password" required></div>
+            <div class="msg err" v-if="error" role="alert">{{error}}</div>
+            <button class="btn" :disabled="busy || !tok">{{busy ? '正在登录…' : '登录'}}</button>
+          </form>
+        </details>
+        <div class="msg err" v-if="cfg.mode!=='iam' && !cfg.admin_token_login" role="alert">登录方式暂不可用，请联系系统管理员。</div>
       </template>
-      <details v-if="cfg.admin_token_login" :open="cfg.mode!=='iam'" class="fallback">
-        <summary>{{cfg.mode==='iam' ? '管理员应急登录（ADMIN_TOKEN）' : '管理员令牌登录'}}</summary>
-        <input class="in" type="password" v-model="tok" placeholder="ADMIN_TOKEN" @keyup.enter="login" style="margin-top:10px">
-        <button class="btn" style="width:100%;margin-top:10px" @click="login">登录</button>
-      </details>
-      <div class="msg err small" v-if="cfg.mode!=='iam' && !cfg.admin_token_login" style="margin-top:10px">未配置任何登录方式。</div>
-    </template>
-  </div>`,
+    </div>
+  </main>`,
   setup() {
-    const tok = ref(''), cfg = ref(null);
-    onMounted(async () => { cfg.value = await api('/api/auth/config'); });
-    async function login() { await run(() => api('/api/auth/token-login', { method: 'POST', body: { token: tok.value } })); location.reload(); }
-    return { tok, cfg, login };
+    const tok = ref(''), busy = ref(false), error = ref('');
+    const cfg = computed(() => state.authCfg);
+    async function login() {
+      if (busy.value || !tok.value) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        await api('/api/auth/token-login', { method: 'POST', body: { token: tok.value } });
+        location.reload();
+      } catch (e) { error.value = e.message; }
+      finally { busy.value = false; }
+    }
+    return { tok, cfg, busy, error, login, icon };
   }
 };
 
 // ------------------------------------------------------------ 我的令牌（所有登录员工）
 const Mine = {
   template: `<div>
-    <div class="page-head"><div><h1>我的令牌</h1><p>为你使用的 agent（Claude Code、Codex 等）签发个人 MCP 令牌；令牌只代表你本人，权限与你的数据权限一致</p></div></div>
+    <div class="page-head"><div><h1>我的令牌</h1><p>连接 Codex 或 Claude Code，并查看 AI 助手可以使用的业务数据。</p></div></div>
     <div class="grid g2">
       <div class="card card-pad">
-        <h3>我的身份</h3>
+        <h2>账号信息</h2>
         <dl class="kv" v-if="state.me"><dt>工号</dt><dd class="mono">{{state.me.emp_no || '（管理员令牌登录）'}}</dd><dt>姓名</dt><dd>{{state.me.name || '-'}}</dd>
           <dt>身份</dt><dd><span class="badge" :class="state.me.is_admin?'red':''">{{state.me.is_admin ? '管理员' : '员工'}}</span> <span class="badge" v-if="!state.me.registered" style="margin-left:4px">未登记 / 已停用</span></dd>
           <dt>登录方式</dt><dd>{{({session:'海尔 IAM 单点登录', admin_token:'管理员令牌', open:'开发模式'})[state.me.via] || state.me.via}}</dd></dl>
-        <h3 style="margin-top:18px">我的数据权限</h3>
+        <h2 class="account-section">我的数据权限</h2>
         <div v-if="perm">
           <div class="msg ok" v-if="perm.all">管理员：可访问全部业务场景与数据表。</div>
           <div class="msg warn" v-else-if="!perm.registered">工号未登记或已停用，暂无数据权限，请联系管理员开通。</div>
@@ -885,34 +1209,41 @@ const Mine = {
         </div>
       </div>
       <div class="card card-pad">
-        <h3>签发个人 MCP 令牌</h3>
+        <h2>接入 AI 助手</h2>
+        <p class="muted">个人令牌用于验证身份，使用你已有的数据权限。</p>
         <template v-if="canIssue">
-          <div class="row2"><div class="field"><label>有效期</label><select class="in" v-model.number="days"><option v-for="d in dayOpts" :value="d">{{d}} 天</option></select></div>
-            <div class="field"><label>备注</label><input class="in" v-model="note" placeholder="如：我的 Codex"></div></div>
-          <button class="btn primary" @click="issue">签发</button>
-          <div v-if="issued" class="msg ok" style="margin-top:12px">令牌仅显示这一次，请立即配置到 agent：
-            <pre class="block" style="margin-top:8px">{{issued.token}}</pre>
-            <div class="small" style="margin:10px 0 4px">① 设置环境变量（在启动 agent 的终端中）</div>
-            <pre class="block">export SMARTREPORT_TOKEN={{issued.token}}</pre>
-            <div class="small" style="margin:10px 0 4px">② Claude Code</div>
-            <pre class="block">claude mcp add --transport http smartreportgen {{mcpUrl}} --header "Authorization: Bearer $SMARTREPORT_TOKEN"</pre>
-            <div class="small" style="margin:10px 0 4px">③ Codex</div>
+          <div class="row2"><div class="field"><label for="token-days">有效期</label><select id="token-days" class="in" v-model.number="days"><option v-for="d in dayOpts" :value="d">{{d}} 天</option></select></div>
+            <div class="field"><label for="token-note">用途备注 <small>选填</small></label><input id="token-note" class="in" v-model="note" placeholder="如：我的 Codex"></div></div>
+          <button class="btn primary" :disabled="issuing" @click="issue">{{issuing ? '正在创建…' : '创建个人令牌'}}</button>
+          <div v-if="issued" class="msg ok issued-token">令牌仅在创建后显示一次，请复制并妥善保存。
+            <pre class="block">{{issued.token}}</pre>
+            <div class="actions"><button class="btn sm" @click="copy(issued.token)">复制令牌</button><button class="btn sm" @click="copy('export SMARTREPORT_TOKEN=' + issued.token)">复制环境变量命令</button></div>
+          </div>
+          <details class="fallback">
+            <summary>查看接入步骤</summary>
+            <p>在启动 AI 助手的终端中，把个人令牌设为环境变量：</p>
+            <pre class="block">export SMARTREPORT_TOKEN=&lt;个人令牌&gt;</pre>
+            <p>Codex</p>
             <pre class="block">codex mcp add smartreportgen --url {{mcpUrl}} --bearer-token-env-var SMARTREPORT_TOKEN</pre>
-            <div class="actions" style="margin-top:8px"><button class="btn sm" @click="copy(issued.token)">复制令牌</button><button class="btn sm" @click="copy('export SMARTREPORT_TOKEN=' + issued.token)">复制 export 命令</button></div></div>
+            <p>Claude Code</p>
+            <pre class="block">claude mcp add --transport http smartreportgen {{mcpUrl}} --header "Authorization: Bearer $SMARTREPORT_TOKEN"</pre>
+          </details>
         </template>
         <div v-else class="msg warn">{{whyNot}}</div>
       </div>
     </div>
-    <div class="card" style="margin-top:14px"><table class="tbl"><thead><tr><th>备注</th><th>签发时间</th><th>过期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead>
+    <div class="card scroll-x token-list"><div class="card-pad"><h2>已创建的令牌</h2></div><table class="tbl"><thead><tr><th>备注</th><th>签发时间</th><th>过期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead>
       <tbody><tr v-for="t in tokens"><td>{{t.note}}</td><td class="small">{{fmtTime(t.created_at)}}</td><td class="small">{{fmtTime(t.expires_at)}}</td><td class="small">{{fmtTime(t.last_used_at) || '-'}}</td>
         <td><span class="badge" :class="t.revoked?'red':t.expired?'amber':'green'">{{t.revoked?'已吊销':t.expired?'已过期':'有效'}}</span></td>
         <td><button class="link danger" v-if="!t.revoked && !t.expired" @click="revoke(t)">吊销</button></td></tr>
         <tr v-if="!tokens.length"><td colspan="6" class="empty">还没有个人令牌</td></tr></tbody></table></div>
   </div>`,
   setup() {
-    const tokens = ref([]), perm = ref(null), issued = ref(null), note = ref(''), days = ref(30);
+    const tokens = ref([]), perm = ref(null), issued = ref(null), note = ref(''), days = ref(30), issuing = ref(false);
     const maxDays = computed(() => (state.authCfg && state.authCfg.token_max_days) || 90);
-    const dayOpts = computed(() => [7, 30, 60, 90, 180, 365].filter(d => d <= maxDays.value));
+    // 部署可配置更短的签发上限，确保下拉框始终包含可提交的有效期。
+    const dayOpts = computed(() => [...new Set([7, 30, 60, 90, 180, 365, maxDays.value])].filter(d => d <= maxDays.value).sort((a,b) => a-b));
+    days.value = Math.min(days.value, maxDays.value);
     const mcpUrl = computed(() => state.meta ? state.meta.mcp_url : '');
     const canIssue = computed(() => state.authCfg && state.authCfg.self_service_tokens && state.me && state.me.emp_no && state.me.registered);
     const whyNot = computed(() => !state.authCfg || !state.authCfg.self_service_tokens ? '未开启自助签发，请联系管理员签发令牌。'
@@ -922,49 +1253,90 @@ const Mine = {
     async function issue() { issued.value = await run(() => api('/api/me/tokens', { method: 'POST', body: { days: days.value, note: note.value } }), '令牌已签发'); load(); }
     async function revoke(t) { if (!confirm('吊销这枚令牌？使用它的 agent 将立即无法访问。')) return; await run(() => api(`/api/me/tokens/${t.jti}/revoke`, { method: 'POST' }), '已吊销'); load(); }
     function copy(text) { navigator.clipboard.writeText(text).then(() => toast('已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err')); }
-    return { state, tokens, perm, issued, note, days, dayOpts, mcpUrl, canIssue, whyNot, issue, revoke, copy, fmtTime };
+    return { state, tokens, perm, issued, note, days, dayOpts, mcpUrl, canIssue, whyNot, issuing, issue, revoke, copy, fmtTime };
   }
 };
 
 const PAGES = { home: Home, datasources: Datasources, datasets: Datasets, templates: Templates, reports: Reports, styles: Styles, perms: Perms, mine: Mine };
-const ADMIN_NAV = [['home', '概览', 'home'], ['datasources', '数据源', 'ds', 'datasources'], ['datasets', '数据集', 'set', 'datasets'],
-  ['templates', '报告模板', 'tpl', 'templates'], ['reports', '报告', 'rep', 'reports'], ['styles', '样式规则', 'sty', 'style_rules'],
-  ['perms', '权限与令牌', 'perm', 'employees']];
-const MINE_NAV = ['mine', '我的令牌', 'key'];
+// 页面地址继续使用原来的 hash，现有收藏和深链接可以直接打开。
+const NAV_GROUPS = [
+  { title: '报告', items: [['home', '工作台', 'home'], ['reports', '报告库', 'rep'], ['templates', '报告模板', 'tpl']] },
+  { title: '资源', items: [['datasets', '业务场景', 'set'], ['styles', '报告样式', 'sty']] },
+  { title: '账号', items: [['mine', '我的令牌', 'key']] },
+  { title: '系统管理', admin: true, items: [['datasources', '数据源', 'ds'], ['perms', '员工与授权', 'perm']] }
+];
+function canVisitMine() { return !!(state.me?.emp_no || state.authCfg?.mode === 'iam'); }
 
 createApp({
-  components: { Login },
+  components: { Login, GenerateReport },
   template: `<Login v-if="state.needLogin"/>
   <div class="shell" v-else-if="state.me">
-    <aside class="side"><div class="brand"><i>S</i><div>SmartReportGen<small>智能报告生成</small></div></div>
-      <nav class="nav"><a v-for="n in nav" :class="{on: state.page===n[0]}" @click="go(n[0])"><span v-html="icon(n[2])"></span>{{n[1]}}<span class="n" v-if="n[3] && state.meta">{{state.meta.stats[n[3]]}}</span></a></nav>
-      <div class="side-foot">
-        <div class="user"><b>{{state.me.name || state.me.emp_no || '管理员'}}</b><span>{{state.me.emp_no || ''}} · {{state.me.is_admin ? '管理员' : '员工'}}</span></div>
-        <button v-if="state.me.via!=='open'" class="logout" @click="logout">退出登录</button>
-        <div v-if="state.meta" style="margin-top:8px">MCP · <span class="mono">{{state.meta.mcp_url.replace(/^https?:\\/\\//,'')}}</span></div></div></aside>
-    <main class="main"><component :is="page" :key="state.page"/></main>
+    <aside class="side">
+      <div class="brand-area">
+        <a class="brand" href="#home" @click="menuOpen=false"><span class="brand-icon" v-html="icon('rep')"></span>
+          <span>报告工作台<small>SmartReportGen</small></span></a>
+        <button class="x menu-toggle" type="button" aria-label="导航菜单" aria-controls="workspace-nav" :aria-expanded="menuOpen" @click="menuOpen=!menuOpen" v-html="icon(menuOpen ? 'close' : 'menu')"></button>
+      </div>
+      <nav id="workspace-nav" class="nav" :class="{expanded: menuOpen}" aria-label="工作台导航">
+        <div class="nav-group" v-for="g in groups" :key="g.title">
+          <div class="nav-label">{{g.title}}</div>
+          <a v-for="n in g.items" :key="n[0]" :href="'#'+n[0]" :class="{on: current[0]===n[0]}" :aria-current="current[0]===n[0] ? 'page' : null" @click="menuOpen=false">
+            <span class="ico" v-html="icon(n[2])"></span>{{n[1]}}</a>
+        </div>
+      </nav>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="location"><span>{{currentGroup.title}}</span><span class="location-sep" aria-hidden="true">/</span><b>{{current[1]}}</b></div>
+        <div class="account">
+          <span class="avatar" aria-hidden="true">{{person.slice(0,1)}}</span>
+          <span class="account-name"><b :title="person">{{person}}</b><small>{{state.me.is_admin ? '管理员' : '员工'}}</small></span>
+          <button v-if="state.me.via!=='open'" type="button" class="btn ghost logout" @click="logout">退出登录</button>
+        </div>
+      </header>
+      <main id="main-content" ref="main" class="main" tabindex="-1"><component :is="page" :key="current[0]"/></main>
+    </div>
+    <GenerateReport v-if="reportDraft" :template="reportDraft.template" @close="reportDraft=null"/>
   </div>
-  <div class="toasts"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>`,
+  <div v-else class="app-pending" role="status">
+    <template v-if="bootError"><p>无法打开工作台。{{bootError}}</p><button class="btn" @click="init">重试</button></template>
+    <template v-else>正在打开报告工作台…</template>
+  </div>
+  <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>`,
   setup() {
-    const nav = computed(() => {
-      const me = state.me || {};
-      const mine = me.emp_no || (state.authCfg && state.authCfg.mode === 'iam') ? [MINE_NAV] : [];
-      return me.is_admin ? [...ADMIN_NAV, ...mine] : [...ADMIN_NAV.filter(n => n[0] !== 'perms'), ...mine];
+    const menuOpen = ref(false), main = ref(null), bootError = ref('');
+    const groups = computed(() => NAV_GROUPS
+      .filter(g => !g.admin || isAdmin())
+      .map(g => ({ ...g, items: g.items.filter(n => n[0] !== 'mine' || canVisitMine()) }))
+      .filter(g => g.items.length));
+    // 普通员工从业务场景查看获授权的数据；旧版数据源链接仍可打开只读列表。
+    const legacySource = ['datasources', '数据源', 'ds'];
+    const currentGroup = computed(() => groups.value.find(g => g.items.some(n => n[0] === state.page))
+      || (state.page === 'datasources' ? { title: '资源', items: [legacySource] } : groups.value[0]));
+    const current = computed(() => currentGroup.value.items.find(n => n[0] === state.page) || groups.value[0].items[0]);
+    const page = computed(() => PAGES[current.value[0]]);
+    const person = computed(() => state.me?.name || state.me?.emp_no || '管理员');
+    watch(() => current.value[0], async () => {
+      menuOpen.value = false;
+      await nextTick();
+      window.scrollTo(0, 0);
+      main.value?.focus({ preventScroll: true });
     });
-    const page = computed(() => {
-      const allowed = nav.value.map(n => n[0]);
-      return PAGES[allowed.includes(state.page) ? state.page : allowed[0]] || Mine;
-    });
-    async function logout() { await api('/auth/logout', { method: 'POST' }); location.hash = ''; location.reload(); }
-    onMounted(async () => {
+    async function logout() {
+      await run(() => api('/auth/logout', { method: 'POST' }));
+      location.replace(location.pathname);
+    }
+    async function init() {
+      bootError.value = '';
       try {
         const cfg = await api('/api/auth/config');
         state.authCfg = cfg;
         if (!cfg.open_mode && !cfg.me.logged_in) { state.needLogin = true; return; }
         state.me = cfg.me.logged_in ? cfg.me : { emp_no: null, name: '开发模式', is_admin: true, via: 'open', registered: true };
-        await loadMeta();
-      } catch (e) { toast(e.message, 'err'); }
-    });
-    return { state, page, nav, go, icon, toasts, logout };
+        loadMeta().catch(e => toast(e.message, 'err'));
+      } catch (e) { bootError.value = e.message; }
+    }
+    onMounted(init);
+    return { state, page, groups, currentGroup, current, person, menuOpen, main, reportDraft, bootError, init, icon, toasts, logout };
   }
 }).mount('#app');

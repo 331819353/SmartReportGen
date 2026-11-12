@@ -176,21 +176,26 @@ theme:
   header_style: plain           # banner（主题蓝面板 + 反白文字）/ plain（白色卡片）
 ```
 
-| 类别 | 令牌 |
+令牌按**报告页面的组成部分**分为 12 类（与管理台「报告样式」中的分类一致）：
+
+| 类型 | 令牌 |
 |---|---|
-| 页面与卡片 | `color-bg-page` `color-bg-card` `color-border-card` `color-brand` |
-| 文字 | `color-text-primary` `color-text-secondary` `color-text-inverse` |
-| 健康度 | `color-status-positive` `color-status-warning` `color-status-negative`（蓝·不判 = `color-brand`） |
-| 升降色 | `color-trend-up` `color-trend-down` |
-| 图表色板 | `chart-palette-categorical`（系列、类目）`chart-palette-sequential`（热力、强度）`chart-palette-diverging`（有正有负） |
-| 字体 | `font-family`；八个文字角色 `rre-card-font-{title,unit,hero,affix,read,label,table,prose}`，值为 `{size, weight}`，最小 12px |
-| 间距尺寸 | `rre-card-pad` `rre-card-gap` `rre-card-title-line` `rre-card-head-gap` `rre-card-fact-line` `rre-card-fact-gap` `rre-card-row-height` `rre-card-legend-gap` `rre-card-axis-gap` `rre-card-axis-title-gap` `rre-card-bar-max`（px） |
-| 形状 | `radius-card` `rre-radius-panel` `rre-radius-tile` `rre-radius-chip` `rre-radius-control` `rre-radius-pill` `rre-data-radius` `shadow-card` |
-| 页面选项 | `header_style` `toc` `max_width` `custom_css` |
+| 主题 | `color-brand` `color-bg-page` `color-text-primary` `color-text-secondary` `color-text-inverse` `font-family` |
+| 排版 | `rre-page-font-title`（报告大标题）`rre-page-font-section`（章节标题）、卡片内八个文字角色 `rre-card-font-{title,unit,hero,affix,read,label,table,prose}`（值为 `{size, weight}`，12~72px）、`rre-prose-line-height`（1.2~2.4） |
+| 页面布局 | `max_width` `rre-page-pad` `rre-section-gap` `rre-card-gap` `toc` `rre-toc-width` |
+| 报告头部 | `header_style`（banner / plain）`color-header-start` `color-header-end`（留空 = 由主题色派生）`rre-header-pad` `rre-radius-panel` |
+| 筛选栏 | `filter_sticky` `rre-control-height` `rre-radius-control` `rre-radius-pill` |
+| 章节与结论 | `rre-summary-tint` `rre-summary-border-tint`（主题色占比 0~40%） |
+| 卡片 | `color-bg-card` `color-border-card` `rre-card-border-width` `radius-card` `shadow-card` `rre-card-pad` `rre-card-title-line` `rre-card-head-gap` `rre-radius-chip` |
+| 指标卡 | `rre-card-fact-line` `rre-card-fact-gap` `rre-radius-tile` `rre-status-bar` |
+| 数据配色 | `chart-palette-categorical` `chart-palette-sequential` `chart-palette-diverging`、`color-status-{positive,warning,negative}`（蓝·不判 = `color-brand`）、`color-trend-up` `color-trend-down` |
+| 图表 | `rre-card-bar-max` `rre-data-radius` `rre-chart-line-width` `chart_grid`（dashed / solid / none）`rre-card-legend-gap` `rre-card-axis-gap` `rre-card-axis-title-gap` |
+| 表格 | `rre-card-row-height` `color-table-head-bg`（留空 = 卡片底色）`table_zebra` |
+| 高级 | `custom_css` |
 
 图表着色规则（运行时自动执行）：多系列按分类色板顺序取色；单系列柱图有正有负时用发散色阶两端；热力图用顺序色阶；
 健康度卡用状态色；其余图形用色板与卡片主色的深浅。组件中不要写死色值（`y` 中的 `color` 仅在有充分理由时使用）。
-未知令牌会被忽略并告警；颜色值不得包含 `; { } < >`。
+未知令牌会被忽略并告警；颜色须为 `#RRGGBB`、`rgb()/rgba()`、`hsl()` 或颜色名，否则忽略。
 
 ## 7. 校验与常见错误
 

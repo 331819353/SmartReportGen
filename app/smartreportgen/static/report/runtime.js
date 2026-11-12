@@ -404,7 +404,7 @@
       axisLine: { lineStyle: { color: C.border } },
       axisTick: { show: false },
       axisLabel: { color: C.muted, fontSize: LBL, hideOverlap: true, margin: SZ('axis-gap') },
-      splitLine: { lineStyle: { color: C.border, type: 'dashed' } },
+      splitLine: T.chart_grid === 'none' ? { show: false } : { lineStyle: { color: C.border, type: T.chart_grid === 'solid' ? 'solid' : 'dashed' } },
       nameTextStyle: { color: C.muted, fontSize: LBL },
       nameGap: SZ('axis-title-gap') + LBL + SZ('axis-gap')
     };
@@ -471,7 +471,7 @@
         o.itemStyle = { borderRadius: horiz ? [0, rr, rr, 0] : [rr, rr, 0, 0] };
       } else {
         o.smooth = s.smooth; o.symbolSize = cats.length > 24 ? 4 : 6; o.showSymbol = cats.length <= 36;
-        o.lineStyle = { width: 2.4 };
+        o.lineStyle = { width: T['rre-chart-line-width'] || 2.4 };
         if (areaish) o.areaStyle = { opacity: stack ? 0.55 : 0.14 };
       }
       if (stack && (isBar || areaish)) { o.stack = 'total'; if (isBar) o.itemStyle.borderRadius = 0; }
