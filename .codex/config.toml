@@ -1,0 +1,5 @@
+# Codex 项目级配置（仅在 Codex 信任本项目时生效）。令牌从环境变量读取，不要把令牌写进本文件。
+#   export SMARTREPORT_TOKEN=<管理台「权限与令牌」签发的员工令牌>
+[mcp_servers.smartreportgen]
+url = "http://localhost:18601/mcp"
+bearer_token_env_var = "SMARTREPORT_TOKEN"

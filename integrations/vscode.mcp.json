@@ -1,0 +1,19 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "smartreport-token",
+      "description": "SmartReportGen 员工令牌",
+      "password": true
+    }
+  ],
+  "servers": {
+    "smartreportgen": {
+      "type": "http",
+      "url": "http://localhost:18601/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:smartreport-token}"
+      }
+    }
+  }
+}

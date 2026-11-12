@@ -1,0 +1,14 @@
+# 本机配置与密钥（模板见 .env.example）
+.env
+.env.*
+!.env.example
+
+# Python / 系统
+__pycache__/
+*.pyc
+.DS_Store
+
+# 备份与过程文件
+backup/
+*.dump
+scripts/out/

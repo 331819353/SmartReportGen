@@ -1,0 +1,105 @@
+name: smartreportgen
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-report}:${POSTGRES_PASSWORD:-report}@postgres:5432/${POSTGRES_DB:-smartreportgen}
+  SECRET_KEY: ${SECRET_KEY:-}
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:18600}
+  MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://localhost:18601/mcp}
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hash}
+  EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+  EMBEDDING_SEND_DIMENSIONS: ${EMBEDDING_SEND_DIMENSIONS:-false}
+  EMBEDDING_QUERY_INSTRUCTION: ${EMBEDDING_QUERY_INSTRUCTION:-}
+  AI_BASE_URL: ${AI_BASE_URL:-}
+  AI_API_KEY: ${AI_API_KEY:-}
+  QUERY_MAX_ROWS: ${QUERY_MAX_ROWS:-50000}
+  QUERY_TIMEOUT_SECONDS: ${QUERY_TIMEOUT_SECONDS:-60}
+  SEED_DEMO: ${SEED_DEMO:-true}
+  DEMO_READER_PASSWORD: ${DEMO_READER_PASSWORD:-demo_reader_pwd}
+  APP_NAME: ${APP_NAME:-SmartReportGen}
+  JWT_SECRET: ${JWT_SECRET:-}
+  JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:-}
+  JWT_ALGORITHMS: ${JWT_ALGORITHMS:-HS256}
+  JWT_EMP_CLAIM: ${JWT_EMP_CLAIM:-emp_no}
+  JWT_NAME_CLAIM: ${JWT_NAME_CLAIM:-name}
+  JWT_ISSUER: ${JWT_ISSUER:-smartreportgen}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-smartreportgen-mcp}
+  MCP_ALLOW_ADMIN_TOKEN: ${MCP_ALLOW_ADMIN_TOKEN:-true}
+  REPORT_SHARE_DAYS: ${REPORT_SHARE_DAYS:-7}
+  AUTH_MODE: ${AUTH_MODE:-iam}
+  HAIER_IAM_HOST: ${HAIER_IAM_HOST:-https://iama.haier.net}
+  HAIER_IAM_AUTHORIZE_HOST: ${HAIER_IAM_AUTHORIZE_HOST:-}
+  HAIER_IAM_CLIENT_ID: ${HAIER_IAM_CLIENT_ID:-}
+  HAIER_IAM_CLIENT_SECRET: ${HAIER_IAM_CLIENT_SECRET:-}
+  HAIER_IAM_SCOPE: ${HAIER_IAM_SCOPE:-read}
+  IAM_REDIRECT_URI: ${IAM_REDIRECT_URI:-}
+  IAM_TOKEN_CACHE_SECONDS: ${IAM_TOKEN_CACHE_SECONDS:-300}
+  MCP_ACCEPT_IAM_TOKEN: ${MCP_ACCEPT_IAM_TOKEN:-true}
+  IAM_AUTO_REGISTER: ${IAM_AUTO_REGISTER:-true}
+  IAM_BOOTSTRAP_ADMINS: ${IAM_BOOTSTRAP_ADMINS:-}
+  DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-user}
+  SESSION_HOURS: ${SESSION_HOURS:-12}
+  SELF_SERVICE_TOKENS: ${SELF_SERVICE_TOKENS:-true}
+  TOKEN_MAX_DAYS: ${TOKEN_MAX_DAYS:-90}
+  TZ: Asia/Shanghai
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-report}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-report}
+      POSTGRES_DB: ${POSTGRES_DB:-smartreportgen}
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${PG_HOST_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: { context: ., dockerfile: app/Dockerfile }
+    image: smartreportgen:latest
+    restart: unless-stopped
+    environment: *app-env
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports:
+      - "${API_BIND:-127.0.0.1}:${API_HOST_PORT:-18600}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  mcp:
+    image: smartreportgen:latest
+    restart: unless-stopped
+    command: ["python", "-m", "smartreportgen.mcp_server"]
+    environment:
+      <<: *app-env
+      MCP_PORT: "8001"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      api: { condition: service_healthy }
+    ports:
+      - "${MCP_BIND:-127.0.0.1}:${MCP_HOST_PORT:-18601}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/healthz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+
+volumes:
+  pgdata:
