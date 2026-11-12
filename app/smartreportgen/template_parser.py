@@ -495,15 +495,7 @@ def parse_template(md: str) -> tuple[Template, list[str], list[str]]:
         m.pop("_display", None)
         tpl.measures[k] = m
 
-    for sec in sections:
-        if not sec["summary"]:
-            tpl.warnings.append(f"章节「{sec['title']}」缺少汇总结论（在章节标题后用 > 引用块书写）")
-        findings = [it for it in sec["items"] if it["kind"] == "finding"]
-        for fd in findings:
-            if not any(it["kind"] == "chart" for it in fd["items"]):
-                tpl.warnings.append(f"结论「{fd['title']}」下没有图表支撑")
-
-    # 文本中的 {{度量}} 占位
+    # 汇总结论与图表由报告结构和样式规则决定；这里只检查文本中的度量引用。
     def scan(items: list[dict]) -> None:
         for it in items:
             if it["kind"] == "text":

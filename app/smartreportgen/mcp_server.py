@@ -48,10 +48,10 @@ def _skill_body() -> str:
 
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP（需令牌认证：员工令牌或海尔 IAM access token；数据按员工工号做表级权限控制）。
 若你所在的 agent 没有加载 smart-report 技能（Skill），请先调用 get_skill_guide 获取完整的生成流程与方法，再按流程执行。推荐流程：
-1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取你有权限的数据表；
-2) describe_table / run_query 了解字段与数据分布（只能访问已授权的表），确定分析目标；先调用 get_template_spec 了解模板语法；
-3) 设计章节（按维度视角平铺）、每节汇总结论、子结论与支撑图表、全局筛选；
-4) get_style_rules(业务场景) 获取样式约束 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，最终以你的判断为准；
+1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
+2) 结合用户需求和场景的 analysis_approach，用 describe_table / run_query 验证数据与分析假设，确定分析目标；调用 get_template_spec 了解模板语法；
+3) 根据用户需求、场景分析思路和查询证据，决定报告的章节、结论、图表、布局及筛选；
+4) get_style_rules(业务场景) 获取视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，未指定的项由你决定；
 5) validate_report_template 校验直至无错误 → save_report_template 存储模板 → render_report_html 生成并存储 HTML。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
@@ -115,7 +115,8 @@ def _dataset_brief(ds: dict, acc: Access) -> dict:
     hidden = len(ds.get("tables", [])) - len(tables)
     out = {
         "dataset_id": ds["id"], "business_scenario": ds["business_scenario"],
-        "business_description": ds["business_description"], "tags": ds.get("tags") or [],
+        "business_description": ds["business_description"], "analysis_approach": ds["analysis_approach"],
+        "tags": ds.get("tags") or [],
         "datasource": {"id": ds.get("datasource_id"), "name": ds.get("datasource_name"), "type": ds.get("datasource_type")},
         "tables": [{"table_name": t["table_name"], "table_description": t["table_description"]} for t in tables],
     }
@@ -142,7 +143,7 @@ def whoami(ctx: Context) -> dict:
 @mcp.tool()
 def search_business_scenarios(query: str, ctx: Context, top_k: int = 3) -> dict:
     """根据用户需求，在【当前员工有权限】的业务场景中做混合检索（向量 + 关键词，RRF 融合），
-    返回最匹配的业务场景及其中有权限的数据表。query 直接传入用户的原始需求描述效果最好。"""
+    返回最匹配的业务场景、分析思路及其中有权限的数据表。query 直接传入用户的原始需求描述效果最好。"""
     try:
         acc = _access(ctx)
         res = repo.search_datasets(query, max(1, min(top_k, 10)), dataset_ids=acc.dataset_ids())
@@ -170,7 +171,7 @@ def search_business_scenarios(query: str, ctx: Context, top_k: int = 3) -> dict:
 
 @mcp.tool()
 def get_dataset_tables(dataset_id: int, ctx: Context) -> dict:
-    """获取某业务场景（数据集）下当前员工有权限的全部数据表（表名 + 表描述）及数据源信息（类型决定 SQL 方言）。"""
+    """获取某业务场景的业务描述、分析思路、当前员工有权限的数据表及数据源信息（类型决定 SQL 方言）。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
@@ -252,8 +253,8 @@ def get_template_spec() -> str:
 @mcp.tool()
 def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> dict:
     """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置样式（仅颜色）合并为一份 specified，
-    作为约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为生成要求（类别：版式结构/图表选择/
-    必备筛选/好坏判定/涨跌颜色/数字格式/文案要求/其他，各类别内优先级高的排在前面）。
+    作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
+    文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
     最终生效顺序：你的决定（模板 theme 与模板写法）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式——默认遵守约束，确有理由时可按自己的判断调整。"""
     try:
         p = _principal(ctx)
@@ -270,10 +271,10 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
         "specified": res["specified"],
         "rules": rules,
         "note": ("specified 是检索出的样式约束（业务场景规则 ≥ 通用规则 ≥ 内置样式 合并的结果）：theme 在渲染时自动生效，"
-                 "模板中无需重复；items 是生成要求，各类别内排在前面的优先，请落实到报告结构、图表、筛选、健康度、升降色、"
-                 "数字格式与文案。最终以你的决定为准（智能体决定 ≥ 业务场景 ≥ 通用 ≥ 内置）：默认遵守约束，"
+                 "模板中无需重复；items 是展示要求，各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
+                 "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。默认遵守展示约束，"
                  "确有理由时（如用户明确要求、报告内容需要）可在模板 theme 中覆盖或不采纳某条要求，并在最终回复中说明。"
-                 "未指定的视觉样式与生成要求由你自由决定（可用样式项见 get_template_spec「主题」）。"),
+                 "未指定的视觉样式与展示要求由你自由决定（可用样式项见 get_template_spec「主题」）。"),
         "warnings": res["warnings"],
     })
 
@@ -294,8 +295,10 @@ def validate_report_template(markdown: str, ctx: Context, dataset_id: int | None
 
 @mcp.tool()
 def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int | None = None,
-                         user_requirement: str = "", analysis_goal: str = "", template_id: int | None = None) -> dict:
-    """存储报告模板（markdown）。传 template_id 则更新该模板（仅限本人创建的模板）并递增版本号。"""
+                         user_requirement: str = "", analysis_goal: str = "", template_id: int | None = None,
+                         business_summary: str | None = None) -> dict:
+    """存储报告模板（markdown）。business_summary 用通俗语言说明模板适用的问题、分析内容和对比口径，供业务人员在管理台阅读。
+    传 template_id 则更新已有模板，源码变化时递增版本号。"""
     try:
         acc = _access(ctx)
         if dataset_id:
@@ -307,6 +310,9 @@ def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int
             data = {k: v for k, v in data.items() if k == "markdown" or v not in (None, "")}
         else:
             data["created_by"] = acc.principal.emp_no
+        # 省略时兼容旧客户端，显式传空字符串可以清除说明。
+        if business_summary is not None:
+            data["business_summary"] = business_summary
         t = repo.save_template(data, template_id)
     except _EXPECTED as e:
         return _err(e)

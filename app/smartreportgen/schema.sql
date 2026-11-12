@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS dataset.dataset (
     id                   bigserial PRIMARY KEY,
     business_scenario    text NOT NULL UNIQUE,
     business_description text NOT NULL DEFAULT '',
+    analysis_approach    text NOT NULL DEFAULT '',  -- 供 Agent 参考的业务分析思路
     datasource_id        bigint REFERENCES datasource.datasource(id) ON DELETE RESTRICT,
     tags                 text[] NOT NULL DEFAULT '{}',
     enabled              boolean NOT NULL DEFAULT true,
@@ -88,6 +89,7 @@ CREATE TABLE IF NOT EXISTS report_template.report_template (
     dataset_id       bigint REFERENCES dataset.dataset(id) ON DELETE SET NULL,
     user_requirement text NOT NULL DEFAULT '',
     analysis_goal    text NOT NULL DEFAULT '',
+    business_summary text NOT NULL DEFAULT '',  -- 展示给业务人员的模板说明
     markdown         text NOT NULL,
     summary          jsonb NOT NULL DEFAULT '{}'::jsonb,  -- 解析摘要：章节/图表/筛选数量
     version          int NOT NULL DEFAULT 1,
@@ -148,6 +150,9 @@ CREATE TABLE IF NOT EXISTS permission.access_token (
     last_used_at timestamptz
 );
 
+-- 兼容已有库，旧记录可以在管理台补充说明。
+ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_approach text NOT NULL DEFAULT '';
+ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS business_summary text NOT NULL DEFAULT '';
 ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS created_by text;
 -- 样式规则的结构化条目 [{category, text}]；content 由条目生成，供模型阅读
 ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS items jsonb NOT NULL DEFAULT '[]'::jsonb;

@@ -240,7 +240,7 @@ def runtime_tokens(t: dict) -> dict:
 
 
 # ============================================================ 业务人员可读的元数据（样式规则编辑器使用）
-PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式（仅颜色）：后三者合并为一份“指定样式”（视觉样式与生成要求），"
+PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式（仅颜色）：后三者合并为一份“指定样式”（视觉样式与展示要求），"
               "同一项以优先级高者为准，作为约束交给智能体；智能体可以按自己的判断调整，没有指定的由智能体自由决定")
 
 # 按报告页面的组成部分分类；每个令牌只属于一类
@@ -347,14 +347,10 @@ TOKEN_GROUPS: list[dict] = [
     ]},
 ]
 
+# 旧条目保留原类别供管理台查阅。章节、选图和筛选由分析阶段决定。
+RETIRED_ANALYSIS_CATEGORIES = {"structure": "版式结构", "chart": "图表选择", "filter": "必备筛选"}
+
 ITEM_CATEGORIES: list[dict] = [
-    {"key": "structure", "label": "版式结构", "hint": "报告应该有哪些章节、先放什么后放什么",
-     "examples": ["报告首节为“经营概览”，放销售额、毛利额、毛利率、订单数 4 个指标卡，并附同比",
-                  "最后一节为“结论与行动建议”，列 3 到 5 条可执行建议"]},
-    {"key": "chart", "label": "图表选择", "hint": "某类分析用什么图表",
-     "examples": ["区域排名使用横向条形图，只显示前 10 名", "渠道构成使用环形图，类别不超过 6 个", "目标达成用仪表盘加分区域子弹图"]},
-    {"key": "filter", "label": "必备筛选", "hint": "报告顶部必须提供哪些筛选条件",
-     "examples": ["必须包含月份区间、大区、省份筛选，省份随大区联动", "提供“本季度”“近 12 个月”两个快捷选项"]},
     {"key": "status", "label": "好坏判定", "hint": "哪些指标判断好坏、标准是什么（只用于指标卡、仪表盘、子弹图）",
      "examples": ["目标达成率 ≥100% 判为达标，≥95% 判为关注，其余判为承压", "满意度 ≥4.5 分为达标，≥4.2 分为关注"]},
     {"key": "trend", "label": "涨跌颜色", "hint": "哪些指标越大越好、哪些越小越好",
@@ -362,8 +358,8 @@ ITEM_CATEGORIES: list[dict] = [
     {"key": "number", "label": "数字格式", "hint": "金额、比例等数字怎么显示",
      "examples": ["金额以万元显示，保留 2 位小数", "比率显示为百分比，保留 1 位小数", "处理时长单位为小时"]},
     {"key": "copy", "label": "文案要求", "hint": "结论、说明文字的写法",
-     "examples": ["每节结论先说结果再说原因，必须带具体数字和对比", "每张图表下用一句话说明它如何支撑结论"]},
-    {"key": "other", "label": "其他", "hint": "以上都不适用的要求", "examples": []},
+     "examples": ["提到同比时注明对比期间", "业务缩写首次出现时写出全称"]},
+    {"key": "other", "label": "其他展示要求", "hint": "补充其他显示格式或文案规范", "examples": []},
 ]
 _CAT_LABEL = {c["key"]: c["label"] for c in ITEM_CATEGORIES}
 for _g in TOKEN_GROUPS:
@@ -377,7 +373,11 @@ def normalize_items(items) -> list[dict]:
         if not isinstance(it, dict):
             continue
         text = str(it.get("text") or "").strip()
-        cat = it.get("category") if it.get("category") in _CAT_LABEL else "other"
+        cat = str(it.get("category") or "")
+        # 兼容旧客户端提交的类别，避免退役条目落入“其他”后重新生效。
+        if cat in RETIRED_ANALYSIS_CATEGORIES:
+            continue
+        cat = cat if cat in _CAT_LABEL else "other"
         if text:
             out.append({"category": cat, "text": text[:500]})
     return out

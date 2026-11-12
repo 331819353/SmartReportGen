@@ -151,7 +151,7 @@ def list_datasets() -> list[dict]:
 def get_dataset(dataset_id: int) -> dict:
     ds = _one(
         db.fetchone(
-            "SELECT d.id, d.business_scenario, d.business_description, d.datasource_id, d.tags, d.enabled, "
+            "SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, d.datasource_id, d.tags, d.enabled, "
             "d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
             "s.type AS datasource_type FROM dataset.dataset d LEFT JOIN datasource.datasource s "
             "ON s.id=d.datasource_id WHERE d.id=%s",
@@ -171,6 +171,8 @@ def _validate_dataset(data: dict) -> None:
         raise Invalid("业务场景不能为空")
     if not (data.get("business_description") or "").strip():
         raise Invalid("业务描述不能为空（混合检索依赖它）")
+    if data.get("analysis_approach") is not None and not isinstance(data["analysis_approach"], str):
+        raise Invalid("分析思路须为文本")
     if not data.get("datasource_id"):
         raise Invalid("请选择数据源")
     names = [t.get("table_name", "").strip() for t in data.get("tables") or []]
@@ -193,9 +195,10 @@ def create_dataset(data: dict) -> dict:
     _validate_dataset(data)
     with db.conn() as c, c.transaction():
         row = c.execute(
-            "INSERT INTO dataset.dataset(business_scenario, business_description, datasource_id, tags, enabled) "
-            "VALUES (%s,%s,%s,%s,%s) RETURNING id",
-            (data["business_scenario"].strip(), data["business_description"].strip(), data["datasource_id"],
+            "INSERT INTO dataset.dataset(business_scenario, business_description, analysis_approach, datasource_id, tags, enabled) "
+            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+            (data["business_scenario"].strip(), data["business_description"].strip(),
+             (data.get("analysis_approach") or "").strip(), data["datasource_id"],
              [t.strip() for t in data.get("tags") or [] if t.strip()], data.get("enabled", True)),
         ).fetchone()
         _save_tables(c, row["id"], data.get("tables") or [])
@@ -209,9 +212,10 @@ def update_dataset(dataset_id: int, data: dict) -> dict:
     _validate_dataset(merged)
     with db.conn() as c, c.transaction():
         c.execute(
-            "UPDATE dataset.dataset SET business_scenario=%s, business_description=%s, datasource_id=%s, tags=%s, "
+            "UPDATE dataset.dataset SET business_scenario=%s, business_description=%s, analysis_approach=%s, datasource_id=%s, tags=%s, "
             "enabled=%s, updated_at=now() WHERE id=%s",
-            (merged["business_scenario"].strip(), merged["business_description"].strip(), merged["datasource_id"],
+            (merged["business_scenario"].strip(), merged["business_description"].strip(),
+             (merged["analysis_approach"] or "").strip(), merged["datasource_id"],
              [t.strip() for t in merged.get("tags") or [] if t.strip()], merged.get("enabled", True), dataset_id),
         )
         if "tables" in data:
@@ -277,8 +281,10 @@ def _validate_rule(data: dict) -> None:
 def _rule_payload(data: dict) -> tuple[list, str, dict]:
     from . import design
 
-    items = design.normalize_items(data.get("items"))
-    content = design.items_to_markdown(data["name"].strip(), items) if items else (data.get("content") or "")
+    raw_items = data.get("items")
+    items = design.normalize_items(raw_items)
+    # 结构化条目全部退役时也重生成说明，避免回退到含旧要求的 Markdown。
+    content = design.items_to_markdown(data["name"].strip(), items) if raw_items else (data.get("content") or "")
     return items, content, _clean_theme(data.get("theme") or {})
 
 
@@ -325,9 +331,16 @@ def create_rule(data: dict) -> dict:
 
 
 def update_rule(rule_id: int, data: dict) -> dict:
-    merged = {**get_rule(rule_id), **data}
+    from . import design
+
+    current = get_rule(rule_id)
+    merged = {**current, **data}
     _validate_rule(merged)
+    if "items" in data and "content" not in data:
+        merged["content"] = ""
     items, content, theme = _rule_payload(merged)
+    # 保存新样式时保留旧分析要求原文；它们只在管理页的历史条目中可见。
+    items.extend(it for it in current["items"] if it["category"] in design.RETIRED_ANALYSIS_CATEGORIES)
     db.execute(
         "UPDATE style_rule.style_rule SET name=%s, scope=%s, business_scenario=%s, content=%s, items=%s, theme=%s, "
         "priority=%s, enabled=%s, updated_at=now() WHERE id=%s",
@@ -388,7 +401,12 @@ def style_rules_for(business_scenario: str | None, query: str | None = None, own
     theme, sources = design.resolve_with_sources(layers)
     cat_label = {c["key"]: c["label"] for c in design.ITEM_CATEGORIES}
     for r in rows:
-        r["items"] = [{**it, "category_label": cat_label.get(it["category"], "其他")} for it in r.get("items") or []]
+        stored_items = r.get("items") or []
+        active_items = [it for it in stored_items if it["category"] not in design.RETIRED_ANALYSIS_CATEGORIES]
+        if len(active_items) != len(stored_items):
+            # 生效接口同时过滤旧条目和由它们生成的说明文本。
+            r["content"] = design.items_to_markdown(r["name"], active_items) if active_items else ""
+        r["items"] = [{**it, "category_label": cat_label.get(it["category"], "其他展示要求")} for it in active_items]
         if r["id"] in relevance:
             r["relevance"] = relevance[r["id"]]
     return {
@@ -407,7 +425,7 @@ def style_rules_for(business_scenario: str | None, query: str | None = None, own
 
 
 # ============================ 报告模板 ============================
-TPL_COLS = ("t.id, t.name, t.dataset_id, t.user_requirement, t.analysis_goal, t.summary, t.version, t.created_at, "
+TPL_COLS = ("t.id, t.name, t.dataset_id, t.user_requirement, t.analysis_goal, t.business_summary, t.summary, t.version, t.created_at, "
             "t.updated_at, t.created_by, d.business_scenario, "
             "(SELECT e.name FROM permission.employee e WHERE e.emp_no = t.created_by) AS creator_name")
 
@@ -416,8 +434,9 @@ def list_templates(q: str | None = None, owner: str | None = None) -> list[dict]
     """owner 不为 None 时只返回该工号创建的模板。"""
     conds, params = [], []
     if q:
-        conds.append("(t.name ILIKE %s OR t.user_requirement ILIKE %s OR d.business_scenario ILIKE %s)")
-        params += [f"%{q}%"] * 3
+        conds.append("(t.name ILIKE %s OR t.user_requirement ILIKE %s OR t.business_summary ILIKE %s "
+                     "OR t.analysis_goal ILIKE %s OR d.business_scenario ILIKE %s)")
+        params += [f"%{q}%"] * 5
     if owner is not None:
         conds.append("t.created_by = %s")
         params.append(owner)
@@ -456,28 +475,33 @@ def save_template(data: dict, tpl_id: int | None = None) -> dict:
     name = (data.get("name") or tpl.title or "").strip()
     if not name:
         raise Invalid("模板名称不能为空")
+    if data.get("business_summary") is not None and not isinstance(data["business_summary"], str):
+        raise Invalid("业务说明须为文本")
     summary = tpl.summary()
     with db.conn() as c, c.transaction():
         if tpl_id:
             cur = c.execute("SELECT * FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone()
             if not cur:
                 raise NotFound("报告模板不存在")
+            # 业务说明是管理信息，源码历史继续只记录报告正文的变更。
             version = cur["version"] + (1 if cur["markdown"] != md else 0)
             c.execute(
                 "UPDATE report_template.report_template SET name=%s, dataset_id=%s, user_requirement=%s, "
-                "analysis_goal=%s, markdown=%s, summary=%s, version=%s, updated_at=now() WHERE id=%s",
+                "analysis_goal=%s, business_summary=%s, markdown=%s, summary=%s, version=%s, updated_at=now() WHERE id=%s",
                 (name, data.get("dataset_id", cur["dataset_id"]),
                  data.get("user_requirement", cur["user_requirement"]) or "",
                  data.get("analysis_goal", cur["analysis_goal"]) or tpl.meta.get("analysis_goal") or "",
+                 (data.get("business_summary", cur["business_summary"]) or "").strip(),
                  md, db.jsonb(summary), version, tpl_id),
             )
         else:
             version = 1
             tpl_id = c.execute(
-                "INSERT INTO report_template.report_template(name, dataset_id, user_requirement, analysis_goal, markdown, "
-                "summary, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                "INSERT INTO report_template.report_template(name, dataset_id, user_requirement, analysis_goal, business_summary, "
+                "markdown, summary, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                 (name, data.get("dataset_id"), data.get("user_requirement") or "",
-                 data.get("analysis_goal") or tpl.meta.get("analysis_goal") or "", md, db.jsonb(summary),
+                 data.get("analysis_goal") or tpl.meta.get("analysis_goal") or "",
+                 (data.get("business_summary") or "").strip(), md, db.jsonb(summary),
                  data.get("created_by")),
             ).fetchone()["id"]
         c.execute(

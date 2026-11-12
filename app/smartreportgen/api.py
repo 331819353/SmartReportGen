@@ -6,12 +6,14 @@ import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
+from functools import cache
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import auth, db, design, embedding, iam, permission, repo, seed, services
@@ -125,9 +127,21 @@ def J(obj) -> JSONResponse:
 
 
 # ------------------------------------------------------------------ 页面
+@cache
+def _admin_index_html() -> str:
+    # 管理台资源随镜像发布。内容变动时换用新的资源 URL，避免浏览器沿用旧脚本或样式。
+    admin = STATIC / "admin"
+    page = (admin / "index.html").read_text(encoding="utf-8")
+    for filename in ("app.css", "app.js"):
+        version = sha256((admin / filename).read_bytes()).hexdigest()[:12]
+        url = f"/static/admin/{filename}"
+        page = page.replace(f'"{url}"', f'"{url}?v={version}"')
+    return page
+
+
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(STATIC / "admin" / "index.html")
+    return HTMLResponse(_admin_index_html(), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -522,6 +536,7 @@ def style_tokens():
     suggested 只是编辑器中“设置此项”时的初始值，不是内置样式。"""
     builtin, _ = design.resolve()
     return J({"groups": design.TOKEN_GROUPS, "categories": design.ITEM_CATEGORIES, "defaults": builtin,
+              "retired_analysis_categories": design.RETIRED_ANALYSIS_CATEGORIES,
               "suggested": {k: v for k, v in design._BASE.items() if k != "custom_css"},
               "precedence": design.PRECEDENCE})
 

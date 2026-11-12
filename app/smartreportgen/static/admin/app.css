@@ -184,30 +184,11 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .token-list{margin-top:16px}
 .token-list .card-pad h2{margin:0}
 
-/* 首页以生成与查阅为主，资源入口放在最近报告旁边。 */
+/* 首页先展示管理入口，右侧便于回看最近报告。 */
 .workbench .page-head{margin-bottom:24px}
-.work-start{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(0,1fr);border-radius:var(--radius);overflow:hidden;border:1px solid #cbd9ef}
-.start-main{padding:28px 30px 30px;background:#172e55;color:#fff}
-.start-mark,.resource-icon,.empty-icon,.result-icon{display:inline-grid;place-items:center;width:38px;height:38px;flex:none;border-radius:9px;background:var(--primary-weak);color:var(--primary)}
-.start-mark{background:#284878;color:#e8f1ff;margin-bottom:12px}
-.start-mark svg,.resource-icon svg,.empty-icon svg,.result-icon svg{width:21px;height:21px}
-.start-main h2{font-size:24px;letter-spacing:-.02em;line-height:1.3;margin:0}
-.start-main p{color:#d5e2f8;margin:7px 0 19px}
-.start-main .actions{gap:16px}
-.start-btn{border-color:#aecdff;background:#c9dcff;color:#142f60;font-weight:700}
-.start-btn:hover{border-color:#fff;background:#e8f1ff}
-.start-main :focus-visible{outline-color:#c9dcff}
-.start-link,.panel-link{display:inline-flex;align-items:center;gap:5px;min-height:36px;font-weight:600}
-.start-link{color:#e6eeff}
-.start-link:hover,.panel-link:hover{text-decoration:underline;text-underline-offset:4px}
-.start-side{background:#eaf1fc;min-width:0;padding:26px 27px}
-.start-side h2{margin:0;font-size:17px}
-.start-side p{margin:7px 0 14px;color:#435776;max-width:35ch}
-.ai-help{border-top:1px solid #cdd9ed;padding-top:11px}
-.ai-help summary{font-weight:600;color:#23488f}
-.ai-help blockquote{margin:10px 0;color:var(--text);font-size:13px}
-.ai-help a{display:inline-flex;gap:5px;align-items:center;font-size:13px}
-.work-grid{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(0,1fr);gap:16px;margin-top:18px;align-items:start}
+.resource-icon,.empty-icon,.result-icon{display:inline-grid;place-items:center;width:38px;height:38px;flex:none;border-radius:9px;background:var(--primary-weak);color:var(--primary)}
+.resource-icon svg,.empty-icon svg,.result-icon svg{width:21px;height:21px}
+.work-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
 .panel-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px 12px;padding:17px 19px;border-bottom:1px solid var(--border)}
 .panel-head h2{font-size:17px;margin:0}
 .panel-head p{margin:3px 0 0;color:var(--muted);font-size:13px}
@@ -240,6 +221,17 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .record-name{color:var(--text);font-weight:700}
 .record-details{color:var(--muted)}
 .record-details p{margin:4px 0}
+/* 业务说明按段落显示，长文本也可在窄屏换行。 */
+.business-copy,.kv dd.business-copy{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal}
+.field-help{color:var(--muted);font-size:13px;margin:0 0 8px}
+.template-brief{padding:20px 24px}
+.template-brief h2{margin-bottom:6px}
+.template-brief h2:not(:first-child){margin-top:20px}
+.template-brief p,.template-brief ol{margin:0;max-width:68ch}
+.template-brief ol{padding-inline-start:1.5em;overflow-wrap:anywhere}
+.template-brief li+li{margin-top:5px}
+.template-summary-field{grid-column:1/-1}
+.template-technical,.template-source-actions{margin:0 0 12px}
 .discovery{margin-top:16px}
 .discovery summary{font-weight:700}
 .discovery p{margin:8px 0}
@@ -338,11 +330,8 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
   .main{padding:22px 16px 40px}
   .page-head{gap:12px}
   .page-head h1{font-size:24px}
-  .work-start,.meta-bar,.g2{grid-template-columns:minmax(0,1fr)}
-  .start-main,.start-side{padding:20px}
-  .start-main h2{font-size:21px}
+  .meta-bar,.g2{grid-template-columns:minmax(0,1fr)}
   .row2,.row3,.meta-row{grid-template-columns:minmax(0,1fr) !important}
-  .start-main .actions{gap:6px 14px}
   .card-pad,.drawer-body{padding:14px}
   .drawer-head,.drawer-foot{padding:10px 14px}
   .list-tools{padding:11px}

@@ -40,7 +40,7 @@ const pretty = v => JSON.stringify(v || {}, null, 2);
 const state = reactive({ page: location.hash.slice(1) || 'home', meta: null, needLogin: false, me: null, authCfg: null });
 window.addEventListener('hashchange', () => { state.page = location.hash.slice(1) || 'home'; });
 
-// 首页、模板和报告库复用同一个生成入口，生成后统一刷新可见报告。
+// 模板和报告库复用同一个生成入口，生成后刷新报告库。
 const reportDraft = ref(null);
 const reportRevision = ref(0);
 function startReport(template = null) { reportDraft.value = { template }; }
@@ -109,34 +109,23 @@ const DataTable = {
     <tbody><tr v-for="r in rows"><td v-for="v in r">{{v === null ? 'NULL' : v}}</td></tr></tbody></table></div>`
 };
 
-// ------------------------------------------------------------ 报告工作台
+// ------------------------------------------------------------ 管理总览
 const Home = {
   template: `<div class="workbench">
-    <div class="page-head"><div><h1>报告工作台</h1><p>生成分析报告，查看已有结果，找到报告所需的数据。</p></div></div>
-    <section class="work-start" aria-labelledby="start-title">
-      <div class="start-main">
-        <span class="start-mark" v-html="icon('rep')"></span>
-        <h2 id="start-title">生成一份报告</h2>
-        <p>复用已有模板，按当前数据生成新的分析报告。</p>
-        <div class="actions">
-          <button class="btn start-btn" @click="startReport"><span class="ico" v-html="icon('plus')"></span>选择模板</button>
-          <a class="start-link" href="#templates">浏览报告模板 <span class="ico" v-html="icon('arrow')"></span></a>
-        </div>
-      </div>
-      <div class="start-side">
-        <h2>用 AI 提出分析需求</h2>
-        <p>在已接入的 Codex 或 Claude Code 中，描述要分析的主题、时间范围和关注指标。</p>
-        <details class="ai-help"><summary>查看示例和接入方式</summary>
-          <blockquote>分析近三个月各区域的销售额和毛利率，找出变化最大的区域。</blockquote>
-          <a v-if="hasMine" href="#mine">查看接入指引 <span class="ico" v-html="icon('arrow')"></span></a>
-          <span v-else class="small muted">接入信息请联系管理员获取。</span>
-        </details>
-      </div>
-    </section>
+    <div class="page-head"><h1>管理总览</h1></div>
     <div class="work-grid">
+      <section class="card work-panel" aria-labelledby="resources-title">
+        <header class="panel-head"><h2 id="resources-title">管理入口</h2></header>
+        <div class="resource-list">
+          <a v-for="entry in entries" :key="entry.page" :href="'#'+entry.page">
+            <span class="resource-icon" v-html="icon(entry.icon)"></span>
+            <span><b>{{entry.label}}</b><small>{{entry.description}}</small></span>
+            <span class="ico" v-html="icon('arrow')"></span>
+          </a>
+        </div>
+      </section>
       <section class="card work-panel" aria-labelledby="recent-title" :aria-busy="loading">
-        <header class="panel-head"><div><h2 id="recent-title">最近生成</h2><p>{{admin ? '所有用户最近生成的报告' : '你最近生成的报告'}}</p></div>
-          <a class="panel-link" href="#reports">查看报告库 <span class="ico" v-html="icon('arrow')"></span></a></header>
+        <header class="panel-head"><div><h2 id="recent-title">最近报告</h2><p>{{admin ? '所有用户最近生成的报告' : '你最近生成的报告'}}</p></div></header>
         <div v-if="loading && !list.length" class="collection-state" role="status">正在加载报告…</div>
         <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button class="link" @click="load">重试</button></div>
         <div v-else-if="!list.length" class="recent-empty">
@@ -147,28 +136,29 @@ const Home = {
           <li v-for="r in list.slice(0,5)" :key="r.id">
             <a :href="'/reports/'+r.id" target="_blank" rel="noopener">
               <span class="resource-icon" v-html="icon('rep')"></span>
-              <span class="recent-info"><b>{{r.name}}</b><small>{{r.template_name || '报告'}}</small></span>
+              <span class="recent-info"><b>{{r.name}}</b><small v-if="r.template_name && r.template_name !== r.name">{{r.template_name}}</small></span>
               <time :datetime="r.created_at">{{fmtTime(r.created_at)}}</time>
               <span class="ico" v-html="icon('arrow')"></span>
             </a>
           </li>
         </ul>
       </section>
-      <section class="card work-panel" aria-labelledby="resources-title">
-        <header class="panel-head"><div><h2 id="resources-title">报告资源</h2></div></header>
-        <div class="resource-list">
-          <a href="#datasets"><span class="resource-icon" v-html="icon('set')"></span>
-            <span><b>业务场景</b><small>查看可用数据及适用范围</small></span><span class="ico" v-html="icon('arrow')"></span></a>
-          <a href="#styles"><span class="resource-icon" v-html="icon('sty')"></span>
-            <span><b>报告样式</b><small>预览版式，设置场景偏好</small></span><span class="ico" v-html="icon('arrow')"></span></a>
-        </div>
-      </section>
     </div>
   </div>`,
   setup() {
     const reports = useCollection('/api/reports');
-    watch(reportRevision, reports.load);
-    return { ...reports, startReport: () => startReport(), admin: computed(isAdmin), hasMine: computed(canVisitMine), fmtTime, icon };
+    // 首页与侧栏使用同样的管理权限，避免员工看到无法打开的管理入口。
+    const admin = computed(isAdmin);
+    const entries = computed(() => [
+      { page: 'datasources', label: '数据源', icon: 'ds', description: '维护连接和取数配置', visible: admin.value },
+      { page: 'datasets', label: '业务场景', icon: 'set', description: admin.value ? '维护业务描述、分析思路和可用数据' : '查看已授权的业务范围、分析思路和数据' },
+      { page: 'templates', label: '报告模板', icon: 'tpl', description: '查看模板用途和报告章节' },
+      { page: 'reports', label: '报告库', icon: 'rep', description: '查阅和下载已有报告' },
+      { page: 'styles', label: '报告样式', icon: 'sty', description: '预览报告版式和设置样式规则' },
+      { page: 'perms', label: '员工与授权', icon: 'perm', description: '维护员工和数据访问权限', visible: admin.value },
+      { page: 'mine', label: '我的令牌', icon: 'key', description: '查看个人权限和接入指引', visible: canVisitMine() }
+    ].filter(entry => entry.visible !== false));
+    return { ...reports, admin, entries, fmtTime, icon };
   }
 };
 
@@ -410,7 +400,7 @@ const Datasets = {
             <td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div></td>
             <td class="scene-description"><div class="clip">{{d.business_description || '—'}}</div></td><td data-label="数据表">{{d.table_count}} 张</td>
             <td v-if="admin" data-label="状态"><span class="badge" :class="!d.enabled ? '' : d.vectorized ? 'green' : 'amber'">{{!d.enabled ? '停用' : d.vectorized ? '可用' : '索引待更新'}}</span></td>
-            <td><div class="links"><button class="link" @click="view(d)">查看数据表</button><template v-if="admin"><button class="link" @click="edit(d)">编辑</button><button class="link danger" @click="del(d)">删除</button></template></div></td>
+            <td><div class="links"><button class="link" @click="view(d)">查看场景</button><template v-if="admin"><button class="link" @click="edit(d)">编辑</button><button class="link danger" @click="del(d)">删除</button></template></div></td>
           </tr></tbody>
         </table>
       </div>
@@ -426,7 +416,7 @@ const Datasets = {
       <div v-if="sr" class="match-results" aria-live="polite">
         <div class="msg warn" v-for="w in sr.warnings">{{w}}</div>
         <div v-for="h in sr.hits" :key="h.dataset.id" class="hit"><h4>{{h.dataset.business_scenario}}</h4>
-          <p>{{h.dataset.business_description}}</p><button class="link" @click="view(h.dataset)">查看数据表</button>
+          <p>{{h.dataset.business_description}}</p><button class="link" @click="view(h.dataset)">查看场景</button>
           <details v-if="admin"><summary class="small muted">查看匹配依据</summary>
             <p class="score">关键词 {{(h.matched_terms||[]).join('、') || '—'}} · 综合分 {{h.rrf}} · 向量 {{h.vector_score ?? '—'}} · 关键词分 {{h.keyword_score ?? '—'}}</p>
           </details>
@@ -436,7 +426,9 @@ const Datasets = {
     </details>
     <p class="small muted legacy-link" v-if="!admin"><a href="#datasources">查看这些场景使用的数据源</a></p>
     <Drawer v-if="detail" :title="detail.business_scenario" @close="detail=null">
-      <dl class="kv"><dt>业务描述</dt><dd>{{detail.business_description}}</dd><dt>标签</dt><dd>{{(detail.tags||[]).join('、') || '-'}}</dd>
+      <dl class="kv"><dt>业务描述</dt><dd class="business-copy">{{detail.business_description}}</dd>
+        <dt>分析思路</dt><dd class="business-copy">{{detail.analysis_approach || '暂未填写'}}</dd>
+        <dt>标签</dt><dd>{{(detail.tags||[]).join('、') || '-'}}</dd>
         <dt>数据源</dt><dd>{{detail.datasource_name}}（{{DS_LABEL[detail.datasource_type]}}）</dd></dl>
       <h4 style="margin:16px 0 8px">数据表 <small class="muted" v-if="!admin">（仅显示你有权限的表）</small></h4>
       <table class="tbl card"><thead><tr><th scope="col">数据表名</th><th scope="col">数据表描述</th></tr></thead>
@@ -446,7 +438,10 @@ const Datasets = {
     <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide @close="form=null">
       <div class="row2"><div class="field"><label>业务场景</label><input class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
         <div class="field"><label>数据源</label><select class="in" v-model="form.datasource_id"><option :value="null" disabled>请选择</option><option v-for="s in sources" :value="s.id">{{s.name}}（{{DS_LABEL[s.type]}}）</option></select></div></div>
-      <div class="field"><label>业务描述 <small>说明数据范围、指标及适用的分析问题</small></label><textarea class="in" v-model="form.business_description" rows="4"></textarea></div>
+      <div class="field"><label for="scene-description">业务描述 <small>说明数据范围、指标及适用的分析问题</small></label><textarea id="scene-description" class="in" v-model="form.business_description" rows="4"></textarea></div>
+      <div class="field"><label for="scene-approach">分析思路 <small>选填</small></label>
+        <p class="field-help" id="scene-approach-help">说明先看什么、怎么比较、需要验证哪些假设。也可补充报告应回答的问题、适合的图表和需要切换的筛选条件。</p>
+        <textarea id="scene-approach" class="in" v-model="form.analysis_approach" rows="4" aria-describedby="scene-approach-help" placeholder="例如：先比较各渠道的销售增速，再找出毛利下降的主要品类，核对促销前后的变化。"></textarea></div>
       <div class="field"><label>标签 <small>用逗号分隔，帮助同事查找场景</small></label><input class="in" v-model="form.tagsTxt"></div>
       <div class="field"><label>数据表 <small>{{form.tables.length}} 张</small></label>
         <table class="tbl tbl-editor card"><thead><tr><th style="width:36%">数据表名</th><th>数据表描述</th><th style="width:60px"></th></tr></thead>
@@ -475,12 +470,12 @@ const Datasets = {
     async function edit(d) {
       picker.value = null;
       if (d) { const full = await run(() => api(`/api/datasets/${d.id}`)); form.value = { ...full, tagsTxt: (full.tags || []).join(', '), tables: full.tables.map(t => ({ ...t })) }; }
-      else form.value = { id: null, business_scenario: '', business_description: '', datasource_id: null, tagsTxt: '', tables: [], enabled: true };
+      else form.value = { id: null, business_scenario: '', business_description: '', analysis_approach: '', datasource_id: null, tagsTxt: '', tables: [], enabled: true };
     }
     async function save() {
       busy.value = true;
       const f = form.value;
-      const body = { business_scenario: f.business_scenario, business_description: f.business_description, datasource_id: f.datasource_id,
+      const body = { business_scenario: f.business_scenario, business_description: f.business_description, analysis_approach: f.analysis_approach, datasource_id: f.datasource_id,
         tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables: f.tables.filter(t => t.table_name.trim()) };
       try { await run(() => f.id ? api(`/api/datasets/${f.id}`, { method: 'PUT', body }) : api('/api/datasets', { method: 'POST', body }), '已保存'); form.value = null; load(); }
       finally { busy.value = false; }
@@ -546,11 +541,11 @@ const Templates = {
   components: { Drawer },
   template: `<div>
     <template v-if="!form">
-      <div class="page-head"><div><h1>报告模板</h1><p>{{admin ? '查看所有用户的模板。' : '查看你创建的模板。'}}选择已有模板可生成新的报告。</p></div>
+      <div class="page-head"><h1>报告模板</h1>
         <button class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button></div>
       <section class="card list-panel" aria-label="模板列表" :aria-busy="loading">
         <div class="list-tools">
-          <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索模板名称、场景或分析需求" aria-label="搜索模板"></label>
+          <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索模板名称、场景或用途" aria-label="搜索模板"></label>
           <span v-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 个模板</span>
         </div>
         <div v-if="loading" class="collection-state" role="status">正在加载模板…</div>
@@ -565,29 +560,58 @@ const Templates = {
         <div v-else class="scroll-x" tabindex="0" aria-label="模板表格"><table class="tbl report-table" role="table">
           <thead><tr><th scope="col">模板名称</th><th scope="col">业务场景</th><th scope="col" v-if="admin">创建人</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead>
           <tbody><tr v-for="t in shown" :key="t.id">
-            <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.user_requirement}}</div>
-              <details class="small record-details"><summary>模板信息</summary><p v-if="t.summary">{{t.summary.sections?.length || 0}} 章 · {{t.summary.chart_count || 0}} 个图表 · {{t.summary.filter_count || 0}} 个筛选项</p>
-                <p v-if="t.created_at">创建于 {{fmtTime(t.created_at)}}</p></details></td>
+            <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.business_summary || t.analysis_goal || t.user_requirement}}</div></td>
             <td data-label="业务场景">{{t.business_scenario || '—'}}</td><td v-if="admin" data-label="创建人">{{creator(t)}}</td><td data-label="更新时间"><time :datetime="t.updated_at">{{fmtTime(t.updated_at)}}</time></td>
-            <td><div class="links"><button class="link" @click="gen(t)">生成报告</button><button class="link" @click="edit(t)">编辑</button>
+            <td><div class="links"><button class="link" @click="view(t)">查看</button><button class="link" @click="gen(t)">生成报告</button>
               <button class="link danger" @click="del(t)">删除</button></div></td>
           </tr></tbody>
         </table></div>
       </section>
     </template>
+    <template v-else-if="!editing">
+      <div class="page-head">
+        <div><h1 ref="templateHeading" tabindex="-1">{{form.name}}</h1><p>{{form.business_scenario || '未关联业务场景'}} · v{{form.version}}</p></div>
+        <div class="actions"><button class="btn ghost" @click="form=null">返回模板列表</button>
+          <button class="btn" @click="edit(form)">编辑模板</button><button class="btn primary" @click="gen(form)">生成报告</button></div>
+      </div>
+      <div class="card card-pad template-brief">
+        <h2>模板用途</h2>
+        <p class="business-copy">{{form.business_summary || form.analysis_goal || form.user_requirement || '暂未填写用途说明。'}}</p>
+        <template v-if="form.business_summary && form.analysis_goal && form.analysis_goal !== form.business_summary">
+          <h2>分析目标</h2><p class="business-copy">{{form.analysis_goal}}</p>
+        </template>
+        <template v-if="form.summary?.sections?.some(Boolean)">
+          <h2>报告章节</h2>
+          <ol><li v-for="(title, i) in form.summary.sections.filter(Boolean)" :key="i">{{title}}</li></ol>
+        </template>
+      </div>
+    </template>
     <template v-else>
-      <div class="page-head"><div><h1>{{form.id ? '编辑模板 · v' + form.version : '新建模板'}}</h1><p>先填写模板信息和正文，再检查数据或预览报告。</p></div>
-        <div class="actions"><button class="btn ghost" :disabled="busy" @click="form=null;load()">返回模板</button><button class="btn" @click="doValidate" :disabled="busy">检查数据</button><button class="btn" @click="preview" :disabled="busy">预览</button>
-          <button class="btn" @click="save(false)" :disabled="busy">保存</button><button class="btn primary" @click="save(true)" :disabled="busy">保存并生成…</button></div></div>
+      <div class="page-head"><h1 ref="templateHeading" tabindex="-1">{{form.id ? '编辑模板' : '新建模板'}}</h1>
+        <div class="actions"><button class="btn ghost" :disabled="busy" @click="cancelEdit">取消</button>
+          <button v-if="technical" class="btn" @click="save(true)" :disabled="busy || !form.markdown.trim()">保存并生成…</button>
+          <button class="btn primary" @click="save(false)" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
       <div class="card card-pad meta-bar">
         <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
         <div class="field"><label for="template-scenario">业务场景</label>
           <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">选择默认取数的业务场景</option>
             <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
             <option v-for="d in datasets" :key="d.id" :value="d.id">{{d.business_scenario}}</option></select></div>
-        <div class="field"><label for="template-requirement">分析需求 <small>选填</small></label><input id="template-requirement" class="in" v-model="form.user_requirement" placeholder="填写需要回答的业务问题"></div>
+        <div class="field"><label for="template-requirement">原始分析需求 <small>选填</small></label><input id="template-requirement" class="in" v-model="form.user_requirement" placeholder="填写需要回答的业务问题"></div>
+        <div class="field template-summary-field"><label for="template-business-summary">业务说明 <small>选填</small></label>
+          <textarea id="template-business-summary" class="in" v-model="form.business_summary" rows="4" placeholder="例如：用于月度销售复盘，比较各渠道的销售额和毛利率，找出变化最大的区域和品类。"></textarea></div>
       </div>
-      <div class="editor"><div class="pane"><label class="editor-label" for="template-markdown">模板正文（Markdown）</label>
+      <div class="actions template-technical">
+        <button class="btn" :aria-expanded="technical" aria-controls="template-source" :disabled="busy" @click="technical=!technical">{{technical ? '收起高级编辑' : form.id ? '高级编辑' : '编写模板源码'}}</button>
+        <span v-if="!form.id && !technical" class="muted small">新建模板需要填写源码。</span>
+      </div>
+      <div id="template-source"><template v-if="technical">
+      <div class="actions template-source-actions">
+        <button v-if="!form.id && !form.markdown.trim()" class="btn" @click="form.markdown=starter">载入零售示例</button>
+        <button class="btn" @click="doValidate" :disabled="busy || !form.markdown.trim()">检查数据</button>
+        <button class="btn" @click="preview" :disabled="busy || !form.markdown.trim()">预览报告</button>
+      </div>
+      <div class="editor"><div class="pane"><label class="editor-label" for="template-markdown">模板源码（Markdown）</label>
         <textarea id="template-markdown" class="in code" v-model="form.markdown" :disabled="busy" spellcheck="false"></textarea></div>
         <div class="right"><div class="subtabs"><button :class="{on:side==='check'}" @click="side='check'">校验结果</button><button :class="{on:side==='preview'}" @click="side='preview'">预览</button>
           <button v-if="form.versions && form.versions.length" :class="{on:side==='ver'}" @click="side='ver'">版本 ({{form.versions.length}})</button></div>
@@ -604,18 +628,38 @@ const Templates = {
             </div></div>
           <div class="body" v-show="side==='preview'" style="padding:0"><iframe v-if="previewHtml" title="报告模板预览" :srcdoc="previewHtml"></iframe><div v-else class="empty">点击“预览”渲染</div></div>
           <div class="body" v-show="side==='ver'"><div v-for="v in form.versions" class="hit" style="display:flex;justify-content:space-between;align-items:center"><span>v{{v.version}} · {{fmtTime(v.created_at)}} · {{fmtSize(v.size)}}</span><button class="link" @click="loadVer(v.version)">载入编辑器</button></div></div>
-        </div></div>
+        </div></div></template></div>
     </template>
   </div>`,
   setup() {
     const templates = useCollection('/api/templates');
     const { load } = templates;
     const form = ref(null), datasets = ref([]), busy = ref(false), vr = ref(null), side = ref('check'), previewHtml = ref(''), kw = ref('');
-    const shown = computed(() => templates.list.value.filter(t => matches(kw.value, t.name, t.business_scenario, t.user_requirement)));
+    const editing = ref(false), technical = ref(false), templateHeading = ref(null);
+    let savedTemplate = null;
+    const shown = computed(() => templates.list.value.filter(t => matches(kw.value, t.name, t.business_scenario, t.business_summary, t.analysis_goal, t.user_requirement)));
     onMounted(async () => { datasets.value = await run(() => api('/api/datasets')); });
+    async function view(t) {
+      form.value = await run(() => api(`/api/templates/${t.id}`));
+      editing.value = false;
+      await nextTick();
+      templateHeading.value?.focus();
+    }
     async function edit(t) {
+      // 编辑使用副本，取消时还原已保存的业务说明与源码。
+      savedTemplate = t ? { ...t } : null;
+      editing.value = true;
+      technical.value = false;
       vr.value = null; previewHtml.value = ''; side.value = 'check';
-      form.value = t ? await run(() => api(`/api/templates/${t.id}`)) : { id: null, name: '', dataset_id: null, user_requirement: '', markdown: STARTER, version: 1 };
+      form.value = t ? { ...t } : { id: null, name: '', dataset_id: null, user_requirement: '', business_summary: '', markdown: '', version: 1 };
+      await nextTick();
+      templateHeading.value?.focus();
+    }
+    async function cancelEdit() {
+      form.value = savedTemplate;
+      editing.value = false;
+      await nextTick();
+      templateHeading.value?.focus();
     }
     async function doValidate() {
       busy.value = true; side.value = 'check';
@@ -627,10 +671,12 @@ const Templates = {
     }
     async function save(andRender) {
       busy.value = true;
-      const f = form.value, body = { name: f.name, markdown: f.markdown, dataset_id: f.dataset_id, user_requirement: f.user_requirement };
+      const f = form.value, body = { name: f.name, markdown: f.markdown, dataset_id: f.dataset_id,
+        user_requirement: f.user_requirement, business_summary: f.business_summary };
       try {
         const t = await run(() => f.id ? api(`/api/templates/${f.id}`, { method: 'PUT', body }) : api('/api/templates', { method: 'POST', body }), '模板已保存');
-        form.value = await api(`/api/templates/${t.id}`);
+        await view(t);
+        load();
         if (andRender) startReport(t);
       } finally { busy.value = false; }
     }
@@ -638,7 +684,8 @@ const Templates = {
     async function del(t) { if (!confirm(`删除模板「${t.name}」？已生成的报告会保留。`)) return; await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load(); }
     async function loadVer(v) { const r = await run(() => api(`/api/templates/${form.value.id}/versions/${v}`)); form.value.markdown = r.markdown; toast(`已载入 v${v}，保存后成为新版本`); }
     const admin = computed(isAdmin);
-    return { ...templates, admin, creator, shown, form, datasets, busy, vr, side, previewHtml, kw, edit, doValidate, preview, save, gen, del, loadVer, fmtTime, fmtSize, icon };
+    return { ...templates, admin, creator, shown, form, datasets, busy, vr, side, previewHtml, kw, editing, technical, templateHeading,
+      starter: STARTER, view, edit, cancelEdit, doValidate, preview, save, gen, del, loadVer, fmtTime, fmtSize, icon };
   }
 };
 
@@ -791,7 +838,7 @@ const Styles = {
   components: { TokenGroups },
   template: `<div>
     <template v-if="!form && viewSc === null">
-      <div class="page-head"><div><h1>报告样式</h1><p>设置新报告的版式、图表和数字格式，并预览应用后的效果。</p></div>
+      <div class="page-head"><div><h1>报告样式</h1><p>设置报告外观、状态标记和数字格式，并预览效果。</p></div>
         <div class="actions"><button class="btn primary" :disabled="!meta || (!admin && !scenarios.length)" @click="edit()">{{admin ? '新建样式' : '新建我的场景样式'}}</button></div></div>
       <section class="card card-pad style-overview" aria-labelledby="style-preview-title">
         <div><h2 id="style-preview-title">预览当前样式</h2>
@@ -813,7 +860,8 @@ const Styles = {
               <span class="badge" :class="r.enabled?'green':''">{{r.enabled?'启用':'停用'}}</span></div>
             <ul class="rule-items"><li v-for="it in r.items.slice(0,4)"><span class="cat">{{catLabel(it.category)}}</span>{{it.text}}</li>
               <li v-if="r.items.length>4" class="muted small">… 共 {{r.items.length}} 条规则</li>
-              <li v-if="!r.items.length" class="muted small">没有规则条目</li></ul>
+              <li v-if="!r.items.length" class="muted small">没有展示要求</li>
+              <li v-if="r.retiredItems.length" class="muted small">{{r.retiredItems.length}} 条旧分析要求已停用</li></ul>
             <div class="rule-foot"><div class="swatches"><span v-for="c in colors(r.theme)" class="swatch" :style="{background:c}"></span></div>
               <span class="small muted">{{typeSummary(r.theme)}}</span>
               <span class="spacer"></span><template v-if="canEdit(r)"><button class="link" @click="edit(r)">编辑</button><button class="link danger" @click="del(r)">删除</button></template>
@@ -830,10 +878,10 @@ const Styles = {
       <div v-if="viewError" class="msg err" role="alert">{{viewError}} <button class="link" @click="openView(viewSc)">重试</button></div>
       <div v-else-if="viewLoading" class="collection-state" role="status">正在加载生效样式…</div>
       <div v-else class="style-editor"><div class="pane-left">
-        <div class="card card-pad"><h3>生成要求（合并后）</h3>
+        <div class="card card-pad"><h3>展示要求（合并后）</h3>
           <p class="small muted" style="margin:0 0 8px">业务场景规则 ≥ 通用规则 合并为一份，作为约束交给智能体；同类要求中排在前面的优先。智能体可按自己的判断调整，没有涉及的方面由智能体自由决定。</p>
           <ul class="rule-items" v-if="viewRules.length"><li v-for="it in viewRules"><span class="cat">{{it.category_label}}</span>{{it.text}} <span class="src" :class="it.level">{{it.source}}</span></li></ul>
-          <p v-else class="muted small">没有指定的生成要求：全部由智能体自由决定。</p></div>
+          <p v-else class="muted small">没有指定的展示要求。</p></div>
         <div class="card card-pad" style="margin-top:12px" v-if="eff"><h3>视觉样式</h3><TokenGroups :meta="meta" :effective="eff.theme" :sources="eff.sources" :readonly="true"/></div>
       </div>
       <div class="pane-right"><div class="preview-box"><div class="preview-bar">示例报告预览</div><iframe title="示例报告预览" :srcdoc="previewHtml"></iframe></div></div></div>
@@ -841,7 +889,7 @@ const Styles = {
 
     <template v-else-if="form">
       <div class="page-head"><div><h1>{{form.readonly ? '查看样式规则' : form.id ? '编辑样式规则' : '新建样式规则'}}</h1>
-          <p>{{form.readonly ? '通用规则由管理员配置，你可以查看；如需个人调整，请新建“我的场景样式”' : '先确定适用范围，再填写生成要求或调整视觉样式。'}}</p></div>
+          <p>{{form.readonly ? '通用规则由管理员配置，你可以查看；如需个人调整，请新建“我的场景样式”' : '先确定适用范围，再填写展示要求或调整视觉样式。'}}</p></div>
         <div class="actions"><button class="btn ghost" :disabled="saving" @click="close">返回样式列表</button>
           <button class="btn style-preview-jump" @click="jumpToPreview">查看示例预览</button>
           <button v-if="!form.readonly" class="btn primary" :disabled="saving" @click="save">{{saving ? '正在保存…' : '保存样式'}}</button></div></div>
@@ -858,9 +906,9 @@ const Styles = {
       <div class="msg err" v-if="saveError" role="alert">{{saveError}}</div>
       <div class="style-editor">
         <div class="pane-left">
-          <div class="subtabs"><button :class="{on:tab==='items'}" @click="tab='items'">生成要求（{{form.items.length}}）</button><button :class="{on:tab==='theme'}" @click="tab='theme'">视觉样式（调整 {{Object.keys(form.theme).length}} 项）</button></div>
+          <div class="subtabs"><button :class="{on:tab==='items'}" @click="tab='items'">展示要求（{{form.items.length}}）</button><button :class="{on:tab==='theme'}" @click="tab='theme'">视觉样式（调整 {{Object.keys(form.theme).length}} 项）</button></div>
           <fieldset class="plain-fs" :disabled="form.readonly" v-show="tab==='items'">
-            <p class="small muted" style="margin:0 0 10px">写下生成报告时应遵循的要求。可以添加示例，再改成自己的口径。</p>
+            <p class="small muted" style="margin:0 0 10px">章节安排、选图建议和筛选条件可写在「业务场景」的分析思路中。</p>
             <div v-for="c in meta.categories" class="cat-block">
               <div class="cat-head"><b>{{c.label}}</b><span class="muted small">{{c.hint}}</span></div>
               <div v-for="(it,i) in form.items" v-show="it.category===c.key" class="item-row">
@@ -871,6 +919,10 @@ const Styles = {
                 <button v-for="ex in c.examples" class="ex-chip" @click="add(c.key, ex)" :title="ex">示例：{{ex}}</button></div>
             </div>
           </fieldset>
+          <details v-if="form.retiredItems.length" v-show="tab==='items'" class="card card-pad">
+            <summary>已停用的分析要求（{{form.retiredItems.length}}）</summary>
+            <ul class="rule-items"><li v-for="(it, i) in form.retiredItems" :key="i"><span class="cat">{{meta.retired_analysis_categories[it.category]}}</span>{{it.text}}</li></ul>
+          </details>
           <div v-show="tab==='theme'">
             <p class="small muted" style="margin:0 0 10px">按报告页面的组成部分分类（主题、排版、页面布局、头部、筛选栏、章节与结论、卡片、指标卡、数据配色、图表、表格）。只改需要调整的项；没改的项沿用上一级（{{form.scope==='scenario' ? '通用规则与内置样式' : '内置样式'}}）。内置样式只有颜色（标“内置”）；其余项都没有设置时，由智能体在生成报告时自行决定。</p>
             <label class="check small" style="margin-bottom:8px"><input type="checkbox" v-model="advanced"> 显示高级选项</label>
@@ -894,7 +946,11 @@ const Styles = {
         const [tokens, names, rules] = await Promise.all([api('/api/style-tokens'), api('/api/scenarios'), api('/api/style-rules')]);
         meta.value = tokens;
         scenarios.value = [...new Set(names)];
-        list.value = rules;
+        // 旧分析条目只供查阅，编辑和保存请求仅使用生效的展示要求。
+        const retired = item => Object.hasOwn(tokens.retired_analysis_categories || {}, item.category);
+        list.value = rules.map(rule => ({
+          ...rule, items: rule.items.filter(item => !retired(item)), retiredItems: rule.items.filter(retired)
+        }));
       } catch (e) { styleError.value = e.message; }
       finally { styleLoading.value = false; }
     }
@@ -969,11 +1025,13 @@ const Styles = {
       previewHtml.value = '';
       saveError.value = '';
       if (r) {
-        const items = (r.items && r.items.length) ? r.items.map(x => ({ ...x })) : legacy(r.content);
-        if (!(r.items && r.items.length) && items.length) toast('已把原有的文字说明拆成条目（类别为“其他”），请调整类别后保存');
-        form.value = { id: r.id, name: r.name, scope: r.scope, business_scenario: r.business_scenario || scenarios.value[0] || '', enabled: r.enabled, priority: r.priority, items, theme: { ...(r.theme || {}) }, readonly: !!readonly };
+        const legacyItems = r.items.length || r.retiredItems.length ? [] : legacy(r.content);
+        if (legacyItems.length) toast('已将原有说明拆成展示要求，请核对内容后保存');
+        form.value = { id: r.id, name: r.name, scope: r.scope, business_scenario: r.business_scenario || scenarios.value[0] || '',
+          enabled: r.enabled, priority: r.priority, items: r.items.map(x => ({ ...x })).concat(legacyItems),
+          retiredItems: r.retiredItems, theme: { ...(r.theme || {}) }, readonly: !!readonly };
       } else {
-        form.value = { id: null, name: '', scope: personalStyle.value ? 'scenario' : 'general', business_scenario: '', enabled: true, priority: 100, items: [], theme: {} };
+        form.value = { id: null, name: '', scope: personalStyle.value ? 'scenario' : 'general', business_scenario: '', enabled: true, priority: 100, items: [], retiredItems: [], theme: {} };
       }
     }
     function close() { form.value = null; inherited.value = null; loadStyles(); }
@@ -1169,8 +1227,8 @@ const Perms = {
 const Login = {
   template: `<main class="login-shell">
     <div class="card login">
-      <a class="brand" href="/"><span class="brand-icon" v-html="icon('rep')"></span><span>报告工作台<small>SmartReportGen</small></span></a>
-      <h1>登录报告工作台</h1><p class="login-intro">登录后可生成报告、查看已有报告和已授权的业务数据。</p>
+      <a class="brand" href="/"><span class="brand-icon" v-html="icon('rep')"></span><span>报告管理台<small>SmartReportGen</small></span></a>
+      <h1>登录报告管理台</h1><p class="login-intro">登录后可查看报告、模板及已授权的业务数据。</p>
       <template v-if="cfg">
         <template v-if="cfg.mode==='iam'">
           <a v-if="cfg.iam_configured" class="btn primary big" href="/auth/iam/login?next=/">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
@@ -1276,7 +1334,7 @@ const Mine = {
 const PAGES = { home: Home, datasources: Datasources, datasets: Datasets, templates: Templates, reports: Reports, styles: Styles, perms: Perms, mine: Mine };
 // 页面地址继续使用原来的 hash，现有收藏和深链接可以直接打开。
 const NAV_GROUPS = [
-  { title: '报告', items: [['home', '工作台', 'home'], ['reports', '报告库', 'rep'], ['templates', '报告模板', 'tpl']] },
+  { title: '报告', items: [['home', '管理总览', 'home'], ['reports', '报告库', 'rep'], ['templates', '报告模板', 'tpl']] },
   { title: '资源', items: [['datasets', '业务场景', 'set'], ['styles', '报告样式', 'sty']] },
   { title: '账号', items: [['mine', '我的令牌', 'key']] },
   { title: '系统管理', admin: true, items: [['datasources', '数据源', 'ds'], ['perms', '员工与授权', 'perm']] }
@@ -1290,10 +1348,10 @@ createApp({
     <aside class="side">
       <div class="brand-area">
         <a class="brand" href="#home" @click="menuOpen=false"><span class="brand-icon" v-html="icon('rep')"></span>
-          <span>报告工作台<small>SmartReportGen</small></span></a>
+          <span>报告管理台<small>SmartReportGen</small></span></a>
         <button class="x menu-toggle" type="button" aria-label="导航菜单" aria-controls="workspace-nav" :aria-expanded="menuOpen" @click="menuOpen=!menuOpen" v-html="icon(menuOpen ? 'close' : 'menu')"></button>
       </div>
-      <nav id="workspace-nav" class="nav" :class="{expanded: menuOpen}" aria-label="工作台导航">
+      <nav id="workspace-nav" class="nav" :class="{expanded: menuOpen}" aria-label="管理台导航">
         <div class="nav-group" v-for="g in groups" :key="g.title">
           <div class="nav-label">{{g.title}}</div>
           <a v-for="n in g.items" :key="n[0]" :href="'#'+n[0]" :class="{on: current[0]===n[0]}" :aria-current="current[0]===n[0] ? 'page' : null" @click="menuOpen=false">
@@ -1315,8 +1373,8 @@ createApp({
     <GenerateReport v-if="reportDraft" :template="reportDraft.template" @close="reportDraft=null"/>
   </div>
   <div v-else class="app-pending" role="status">
-    <template v-if="bootError"><p>无法打开工作台。{{bootError}}</p><button class="btn" @click="init">重试</button></template>
-    <template v-else>正在打开报告工作台…</template>
+    <template v-if="bootError"><p>无法打开管理台。{{bootError}}</p><button class="btn" @click="init">重试</button></template>
+    <template v-else>正在打开报告管理台…</template>
   </div>
   <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>`,
   setup() {

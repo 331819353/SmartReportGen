@@ -211,6 +211,8 @@ def _seed() -> None:
         "business_description": "覆盖全国六大区、17 个省份的零售订单数据（2025-01 至 2026-10），包含销售额、成本、毛利、"
                                 "订单量、客户等信息。适用于销售业绩复盘、增长趋势、区域与省份对比、渠道结构变化（门店/线上商城/"
                                 "直播电商/经销商）、品类与商品贡献、毛利率分析、客户分层与销售目标达成分析。",
+        "analysis_approach": "先核对当前期间和对比期间的覆盖范围，再定位销售或毛利变动最大的区域、渠道或品类。"
+                             "有目标数据时，按大区和月份比较目标与实际，避免把大区目标拆到省份或商品。",
         "tables": [
             {"table_name": "demo_retail.sales_order", "table_description": "零售订单明细：下单日期、大区、省份、渠道、品类、商品、客户、件数、销售额、成本、毛利"},
             {"table_name": "demo_retail.customer", "table_description": "客户档案：客户分层（新客/老客/会员）、所属大区、注册日期"},
@@ -221,12 +223,16 @@ def _seed() -> None:
         "business_scenario": "供应链库存管理", "datasource_id": pg["id"], "tags": ["库存", "仓储", "供应链", "周转"],
         "business_description": "四大区域仓库的商品周度库存快照，包含库存数量、安全库存、出入库数量与库存金额，"
                                 "用于库存健康度、缺货风险、库存周转与仓库对比分析。",
+        "analysis_approach": "先核对各仓库快照是否覆盖同一周，再比较实际库存与安全库存。优先排查持续低于安全库存或库存金额较高的商品，"
+                             "用出入库变化判断问题是近期出现还是持续存在。",
         "tables": [{"table_name": "demo_supply.inventory_snapshot", "table_description": "仓库商品周度库存快照"}],
     })
     repo.create_dataset({
         "business_scenario": "客户服务工单分析", "datasource_id": api["id"], "tags": ["客服", "工单", "满意度", "投诉"],
         "business_description": "2026 年客户服务工单数据（来自客服系统 API），包含受理渠道、问题分类、优先级、处理状态、"
                                 "处理时长与满意度评分，用于服务质量、问题热点、处理时效与满意度分析。",
+        "analysis_approach": "先核对工单受理时间、处理状态及满意度的填写情况。按问题类型和受理渠道寻找工单积压或处理时间偏长的环节，"
+                             "同时说明满意度有评分的工单范围。",
         "tables": [{"table_name": "tickets", "table_description": "客服工单：ticket_id、created_date、month、channel、category、priority、status、region、resolve_hours、satisfaction"}],
     })
     log.info("演示数据源、数据集已创建")
