@@ -37,9 +37,9 @@ def _scenario_of(tpl: Template, dataset_id: int | None) -> str | None:
     return None
 
 
-def resolve_theme(tpl: Template, dataset_id: int | None = None) -> tuple[dict, list[str]]:
-    """默认令牌 → 通用/场景样式规则（库中实时生效）→ 模板 theme 覆盖。"""
-    rules = repo.style_rules_for(_scenario_of(tpl, dataset_id))
+def resolve_theme(tpl: Template, dataset_id: int | None = None, owner: str | None = None) -> tuple[dict, list[str]]:
+    """内置默认 → 通用规则 → 报告创建人（owner）本人的业务场景规则 → 模板 theme 覆盖。"""
+    rules = repo.style_rules_for(_scenario_of(tpl, dataset_id), owner=owner)
     theme, _ = design.resolve(*[r["theme"] for r in rules["general_rules"] + rules["scenario_rules"]])
     theme, warns = design.resolve(theme, tpl.theme)
     return theme, warns
@@ -324,7 +324,7 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
 
 
 def render(markdown: str, dataset_id: int | None = None, inline_echarts: bool = False,
-           guard: Callable[[dict, str], None] | None = None) -> tuple[str, dict]:
+           guard: Callable[[dict, str], None] | None = None, owner: str | None = None) -> tuple[str, dict]:
     t0 = time.time()
     tpl, errors, warnings = parse_template(markdown)
     if errors:
@@ -336,7 +336,7 @@ def render(markdown: str, dataset_id: int | None = None, inline_echarts: bool = 
     ferr = check_against_data(tpl, {k: v["columns"] for k, v in data.items()})
     if ferr:
         raise RenderError("字段校验失败：\n- " + "\n- ".join(ferr))
-    theme, twarn = resolve_theme(tpl, dataset_id)
+    theme, twarn = resolve_theme(tpl, dataset_id, owner)
     generated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     out = build_html(tpl, data, theme, generated_at, inline_echarts=inline_echarts)
     meta = {"queries": stats, "warnings": warnings + twarn + qerrors, "summary": tpl.summary(),
@@ -345,7 +345,7 @@ def render(markdown: str, dataset_id: int | None = None, inline_echarts: bool = 
 
 
 def validate(markdown: str, dataset_id: int | None = None, execute: bool = True,
-             guard: Callable[[dict, str], None] | None = None) -> dict:
+             guard: Callable[[dict, str], None] | None = None, owner: str | None = None) -> dict:
     tpl, errors, warnings = parse_template(markdown)
     res: dict[str, Any] = {"ok": False, "errors": list(errors), "warnings": list(warnings), "summary": tpl.summary()}
     if errors or not execute:
@@ -355,7 +355,7 @@ def validate(markdown: str, dataset_id: int | None = None, execute: bool = True,
     res["errors"] += [e for e in qerrors if "执行失败" in e]
     res["warnings"] += [e for e in qerrors if "执行失败" not in e]
     res["errors"] += check_against_data(tpl, {k: v["columns"] for k, v in data.items()})
-    _, twarn = resolve_theme(tpl, dataset_id)
+    _, twarn = resolve_theme(tpl, dataset_id, owner)
     res["warnings"] += twarn
     res["queries"] = {
         q: {**stats[q], "sample": data[q]["rows"][:5]} for q in stats

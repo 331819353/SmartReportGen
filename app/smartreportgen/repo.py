@@ -245,6 +245,7 @@ def search_datasets(query: str, top_k: int = 5, dataset_ids: list[int] | None = 
 # ============================ 样式规则 ============================
 # 生效顺序：业务场景规则 ≥ 通用规则 ≥ 内置默认（同一层级内按 priority 升序，后者覆盖前者）
 SR_COLS = ("id, name, scope, business_scenario, content, items, theme, priority, enabled, created_at, updated_at, "
+           "created_by, (SELECT e.name FROM permission.employee e WHERE e.emp_no = created_by) AS creator_name, "
            "(embedding IS NOT NULL) AS vectorized")
 
 
@@ -296,9 +297,13 @@ def reindex_rule(rule_id: int) -> None:
     )
 
 
-def list_rules() -> list[dict]:
-    return db.fetchall(f"SELECT {SR_COLS} FROM style_rule.style_rule "
-                       "ORDER BY (scope='scenario'), business_scenario NULLS FIRST, priority, id")
+def list_rules(owner: str | None = None, all_owners: bool = True) -> list[dict]:
+    """all_owners=True（管理员）：全部规则；否则：通用规则 + owner 本人的业务场景规则。"""
+    if all_owners:
+        return db.fetchall(f"SELECT {SR_COLS} FROM style_rule.style_rule "
+                           "ORDER BY (scope='scenario'), business_scenario NULLS FIRST, created_by NULLS FIRST, priority, id")
+    return db.fetchall(f"SELECT {SR_COLS} FROM style_rule.style_rule WHERE scope='general' OR created_by=%s "
+                       "ORDER BY (scope='scenario'), business_scenario NULLS FIRST, priority, id", (owner,))
 
 
 def get_rule(rule_id: int) -> dict:
@@ -309,10 +314,11 @@ def create_rule(data: dict) -> dict:
     _validate_rule(data)
     items, content, theme = _rule_payload(data)
     row = db.fetchone(
-        "INSERT INTO style_rule.style_rule(name, scope, business_scenario, content, items, theme, priority, enabled) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "INSERT INTO style_rule.style_rule(name, scope, business_scenario, content, items, theme, priority, enabled, "
+        "created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (data["name"].strip(), data["scope"], data.get("business_scenario") if data["scope"] == "scenario" else None,
-         content, db.jsonb(items), db.jsonb(theme), int(data.get("priority", 100)), data.get("enabled", True)),
+         content, db.jsonb(items), db.jsonb(theme), int(data.get("priority", 100)), data.get("enabled", True),
+         data.get("created_by")),
     )
     reindex_rule(row["id"])
     return get_rule(row["id"])
@@ -337,13 +343,14 @@ def delete_rule(rule_id: int) -> None:
     db.execute("DELETE FROM style_rule.style_rule WHERE id=%s", (rule_id,))
 
 
-def _rule_layers(business_scenario: str | None, exclude_id: int | None = None,
-                 draft: dict | None = None) -> tuple[list[dict], list[tuple[str, str, dict]]]:
-    """按 内置默认 → 通用规则 → 业务场景规则 的顺序返回生效规则与主题层（可排除正在编辑的规则并放入草稿）。"""
+def _rule_layers(business_scenario: str | None, exclude_id: int | None = None, draft: dict | None = None,
+                 owner: str | None = None) -> tuple[list[dict], list[tuple[str, str, dict]]]:
+    """按 内置默认 → 通用规则 → 业务场景规则 的顺序返回生效规则与主题层（可排除正在编辑的规则并放入草稿）。
+    业务场景规则只取 owner（报告创建人）本人配置的；owner 为空时只有通用规则。"""
     rows = db.fetchall(
-        f"SELECT {SR_COLS} FROM style_rule.style_rule WHERE enabled AND (scope='general' OR business_scenario=%s) "
-        "ORDER BY (scope='scenario'), priority, id",
-        (business_scenario,),
+        f"SELECT {SR_COLS} FROM style_rule.style_rule WHERE enabled AND "
+        "(scope='general' OR (business_scenario=%s AND created_by=%s)) ORDER BY (scope='scenario'), priority, id",
+        (business_scenario, owner),
     )
     rows = [r for r in rows if r["id"] != exclude_id]
     layers = [("general" if r["scope"] == "general" else "scenario", r["name"], r["theme"] or {}) for r in rows]
@@ -355,19 +362,20 @@ def _rule_layers(business_scenario: str | None, exclude_id: int | None = None,
     return rows, layers
 
 
-def effective_style(business_scenario: str | None, exclude_id: int | None = None, draft: dict | None = None) -> dict:
+def effective_style(business_scenario: str | None, exclude_id: int | None = None, draft: dict | None = None,
+                    owner: str | None = None) -> dict:
     from . import design
 
-    _, layers = _rule_layers(business_scenario, exclude_id, draft)
+    _, layers = _rule_layers(business_scenario, exclude_id, draft, owner)
     value, source = design.resolve_with_sources(layers)
     return {"theme": value, "sources": source, "precedence": design.PRECEDENCE}
 
 
-def style_rules_for(business_scenario: str | None, query: str | None = None) -> dict:
-    """通用规则 + 场景私有规则（生效顺序：业务场景 ≥ 通用 ≥ 内置默认）。给出 query 时附带相关度排序。"""
+def style_rules_for(business_scenario: str | None, query: str | None = None, owner: str | None = None) -> dict:
+    """通用规则 + owner 本人的业务场景规则（生效顺序：业务场景 ≥ 通用 ≥ 内置默认）。给出 query 时附带相关度排序。"""
     from . import design
 
-    rows, layers = _rule_layers(business_scenario)
+    rows, layers = _rule_layers(business_scenario, owner=owner)
     relevance: dict[int, dict] = {}
     warnings: list[str] = []
     if query:
@@ -397,7 +405,8 @@ def style_rules_for(business_scenario: str | None, query: str | None = None) -> 
 
 # ============================ 报告模板 ============================
 TPL_COLS = ("t.id, t.name, t.dataset_id, t.user_requirement, t.analysis_goal, t.summary, t.version, t.created_at, "
-            "t.updated_at, t.created_by, d.business_scenario")
+            "t.updated_at, t.created_by, d.business_scenario, "
+            "(SELECT e.name FROM permission.employee e WHERE e.emp_no = t.created_by) AS creator_name")
 
 
 def list_templates(q: str | None = None, owner: str | None = None) -> list[dict]:
@@ -483,8 +492,9 @@ def delete_template(tpl_id: int) -> None:
 # ============================ 报告 ============================
 def list_reports(template_id: int | None = None, owner: str | None = None) -> list[dict]:
     sql = ("SELECT r.id, r.name, r.template_id, r.template_version, r.meta, r.created_at, length(r.html) AS size, "
-           "r.created_by, t.name AS template_name FROM report.report r LEFT JOIN report_template.report_template t "
-           "ON t.id=r.template_id")
+           "r.created_by, t.name AS template_name, "
+           "(SELECT e.name FROM permission.employee e WHERE e.emp_no = r.created_by) AS creator_name "
+           "FROM report.report r LEFT JOIN report_template.report_template t ON t.id=r.template_id")
     conds, params = [], []
     if template_id:
         conds.append("r.template_id=%s")

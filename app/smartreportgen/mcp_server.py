@@ -251,13 +251,14 @@ def get_template_spec() -> str:
 # ============================== d. 样式规则 ==============================
 @mcp.tool()
 def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> dict:
-    """检索样式规则。生效顺序：业务场景规则 ≥ 通用规则 ≥ 内置默认（冲突时以业务场景规则为准）。
+    """检索样式规则：管理员配置的通用规则 + 你本人为该业务场景配置的样式（只对你自己的报告生效）。
+    生效顺序：业务场景规则 ≥ 通用规则 ≥ 内置默认（冲突时以业务场景规则为准）。
     返回每条规则的结构化条目 items（类别：版式结构/图表选择/必备筛选/好坏判定/涨跌颜色/数字格式/文案要求）、
     合并后的设计令牌 merged_theme 及被规则覆盖的令牌来源 overridden_by。
     渲染时会自动应用这些样式，模板 theme 中只需写确有必要的覆盖（例如用户确认过的升降色）。"""
     try:
-        _principal(ctx)
-        res = repo.style_rules_for(business_scenario, query or None)
+        p = _principal(ctx)
+        res = repo.style_rules_for(business_scenario, query or None, owner=p.emp_no)
     except _EXPECTED as e:
         return _err(e)
     for r in res["general_rules"] + res["scenario_rules"]:
@@ -276,7 +277,7 @@ def validate_report_template(markdown: str, ctx: Context, dataset_id: int | None
         acc = _access(ctx)
         if dataset_id:
             _require_dataset(acc, dataset_id)
-        return _ok(validate_md(markdown, dataset_id, execute, guard=_guard(acc)))
+        return _ok(validate_md(markdown, dataset_id, execute, guard=_guard(acc), owner=acc.principal.emp_no))
     except _EXPECTED as e:
         return _err(e)
 
@@ -342,7 +343,8 @@ def render_report_html(template_id: int, ctx: Context, report_name: str = "") ->
         acc = _access(ctx)
         tpl = repo.get_template(template_id)
         _check_owner(acc, tpl.get("created_by"), "报告模板")
-        html, meta = render(tpl["markdown"], dataset_id=tpl.get("dataset_id"), guard=_guard(acc))
+        html, meta = render(tpl["markdown"], dataset_id=tpl.get("dataset_id"), guard=_guard(acc),
+                            owner=tpl.get("created_by"))
         r = repo.save_report(report_name or tpl["name"], html, template_id, tpl["version"], meta,
                              created_by=acc.principal.emp_no)
     except _EXPECTED as e:

@@ -55,10 +55,12 @@ def run_query(ds_row: dict, sql: str, limit: int = 200) -> dict:
     return {"datasource": ds_row["name"], "dialect": ds_row["type"], **res, "row_count": len(res["rows"])}
 
 
-def render_template_to_report(tpl_id: int, name: str | None = None) -> dict:
+def render_template_to_report(tpl_id: int, name: str | None = None, guard=None, created_by: str | None = None) -> dict:
+    """渲染并存储报告。样式取模板创建人本人的业务场景规则；报告归属 created_by（默认同模板创建人）。"""
     tpl = repo.get_template(tpl_id)
-    html, meta = render(tpl["markdown"], dataset_id=tpl.get("dataset_id"))
-    rep = repo.save_report(name or tpl["name"], html, tpl_id, tpl["version"], meta)
+    html, meta = render(tpl["markdown"], dataset_id=tpl.get("dataset_id"), guard=guard, owner=tpl.get("created_by"))
+    rep = repo.save_report(name or tpl["name"], html, tpl_id, tpl["version"], meta,
+                           created_by=created_by or tpl.get("created_by"))
     rep["warnings"] = meta.get("warnings", [])
     return rep
 

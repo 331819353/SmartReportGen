@@ -131,11 +131,12 @@ def _rows() -> list[list]:
     return out
 
 
-def render_preview(business_scenario: str | None, exclude_id: int | None = None, draft: dict | None = None) -> str:
+def render_preview(business_scenario: str | None, exclude_id: int | None = None, draft: dict | None = None,
+                   owner: str | None = None) -> str:
     md = SAMPLE_MD.format(scenario=business_scenario or "通用")
     tpl, errors, _ = parse_template(md)
     if errors:
         raise RuntimeError("示例模板错误：" + "；".join(errors))
-    theme = repo.effective_style(business_scenario, exclude_id, draft)["theme"]
+    theme = repo.effective_style(business_scenario, exclude_id, draft, owner)["theme"]
     data = {"s": {"columns": COLUMNS, "rows": _rows()}}
     return build_html(tpl, data, theme, dt.datetime.now().strftime("%Y-%m-%d %H:%M"))

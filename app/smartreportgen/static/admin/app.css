@@ -215,3 +215,6 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .tok-src .src.general{color:#16A866}
 .tok-src .src.scenario{color:var(--primary)}
 @media (max-width:1200px){.style-editor{grid-template-columns:1fr}.pane-right{position:static}.preview-box{height:640px}.meta-row{grid-template-columns:1fr 1fr}}
+
+.plain-fs{border:0;margin:0;padding:0;min-width:0}
+.plain-fs:disabled .pane-right{pointer-events:auto}

@@ -151,6 +151,8 @@ CREATE TABLE IF NOT EXISTS permission.access_token (
 ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS created_by text;
 -- 样式规则的结构化条目 [{category, text}]；content 由条目生成，供模型阅读
 ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS items jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- 创建人：通用规则由管理员配置；业务场景规则归属创建人，只对其本人的报告生效
+ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS created_by text;
 -- 员工来源：manual（管理员登记）/ iam_login（IAM 登录管理台自动注册）/ mcp（首次调用 MCP 自动注册）
 ALTER TABLE permission.employee ADD COLUMN IF NOT EXISTS registered_via text NOT NULL DEFAULT 'manual';
 ALTER TABLE report.report ADD COLUMN IF NOT EXISTS created_by text;

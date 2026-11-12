@@ -50,7 +50,6 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 # ------------------------------------------------------------------ 认证：IAM 会话 / 管理员令牌
 ADMIN_COOKIE = "r2h_token"
-SELF_PATHS = ("/api/me", "/api/auth/", "/api/meta")
 
 
 def open_mode() -> bool:
@@ -89,11 +88,27 @@ async def auth_middleware(request: Request, call_next):
     if not p:
         return JSONResponse({"detail": "未登录或登录已过期"}, status_code=401)
     request.state.principal = p
-    if path.startswith(SELF_PATHS) or path.startswith("/reports/"):
+    if p.is_admin or path.startswith("/reports/") or _user_allowed(request.method, path):
         return await call_next(request)
-    if not p.is_admin:
-        return JSONResponse({"detail": "需要管理员权限；如需开通请联系管理员"}, status_code=403)
-    return await call_next(request)
+    return JSONResponse({"detail": "需要管理员权限；如需开通请联系管理员"}, status_code=403)
+
+
+# 普通用户可访问的接口（默认拒绝）；接口内部再按“有权限 / 本人创建”过滤
+USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
+    ("GET", r"^/api/(me|meta)(/.*)?$"), ("POST", r"^/api/me/.+$"),
+    ("GET", r"^/api/datasources(/\d+)?$"),
+    ("GET", r"^/api/datasets(/search|/\d+)?$"), ("GET", r"^/api/scenarios$"),
+    ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
+    ("POST", r"^/api/style-rules(/effective|/preview)?$"), ("PUT", r"^/api/style-rules/\d+$"),
+    ("DELETE", r"^/api/style-rules/\d+$"),
+    ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates(/validate|/preview|/\d+/render)?$"),
+    ("PUT", r"^/api/templates/\d+$"), ("DELETE", r"^/api/templates/\d+$"),
+    ("GET", r"^/api/reports(/\d+)?$"), ("DELETE", r"^/api/reports/\d+$"),
+]]
+
+
+def _user_allowed(method: str, path: str) -> bool:
+    return any(method == m and rx.match(path) for m, rx in USER_ALLOW)
 
 
 @app.exception_handler(repo.NotFound)
@@ -259,8 +274,63 @@ def my_token_revoke(request: Request, jti: str):
     return {"ok": True}
 
 
+# ------------------------------------------------------------------ 角色与归属
+def _p(request: Request) -> auth.Principal:
+    return request.state.principal
+
+
+def _is_admin(request: Request) -> bool:
+    return bool(_p(request) and _p(request).is_admin)
+
+
+def _require_admin(request: Request) -> None:
+    if not _is_admin(request):
+        raise HTTPException(403, "需要管理员权限")
+
+
+def _access(request: Request) -> permission.Access:
+    p = _p(request)
+    return permission.access_for(p) if p.is_admin or p.registered else permission.Access(principal=p)
+
+
+def _owner_filter(request: Request) -> str | None:
+    """管理员看全部（None），普通用户只看本人。"""
+    return None if _is_admin(request) else (_p(request).emp_no or "")
+
+
+def _check_owner(request: Request, created_by: str | None, what: str) -> None:
+    if not _is_admin(request) and created_by != _p(request).emp_no:
+        raise HTTPException(403, f"只能操作本人创建的{what}")
+
+
+def _guard(request: Request):
+    """普通用户在管理台校验 / 预览 / 生成报告时，与 MCP 一样按其数据权限校验每条 SQL。"""
+    if _is_admin(request):
+        return None
+    acc = _access(request)
+    return lambda ds_row, sql: permission.check_sql(acc, ds_row, sql)
+
+
+def _require_dataset(request: Request, dataset_id) -> None:
+    if dataset_id and not _is_admin(request) and not _access(request).can_dataset(int(dataset_id)):
+        raise HTTPException(403, "无权使用该业务场景（数据集）")
+
+
+def _scenario_dataset(name: str | None) -> dict | None:
+    return db.fetchone("SELECT id FROM dataset.dataset WHERE business_scenario=%s", (name,)) if name else None
+
+
 @app.get("/api/meta")
-def meta():
+def meta(request: Request):
+    if _is_admin(request):
+        stats = repo.stats()
+    else:
+        acc = _access(request)
+        me_no = _p(request).emp_no or ""
+        ds = [d for d in repo.list_datasets() if d["enabled"] and acc.can_dataset(d["id"])]
+        stats = {"datasources": len({d["datasource_id"] for d in ds}), "datasets": len(ds),
+                 "templates": len(repo.list_templates(owner=me_no)), "reports": len(repo.list_reports(owner=me_no)),
+                 "style_rules": len(repo.list_rules(owner=me_no, all_owners=False)), "employees": 0}
     return J({
         "datasource_types": [
             {"value": "mysql", "label": "MySQL"}, {"value": "postgresql", "label": "PostgreSQL"},
@@ -270,7 +340,7 @@ def meta():
         "embedding": embedding.info(),
         "mcp_url": services.mcp_endpoint(),
         "public_base_url": settings.public_base_url,
-        "stats": repo.stats(),
+        "stats": stats,
         "auth": not open_mode(),
         "auth_mode": settings.auth_mode,
         "app_name": settings.app_name,
@@ -280,38 +350,59 @@ def meta():
     })
 
 
-# ------------------------------------------------------------------ 数据源
+# ------------------------------------------------------------------ 数据源（管理员管理；普通用户只读、只看有权限的）
+DS_PUBLIC = ("id", "name", "type", "description", "enabled", "created_at", "updated_at")
+
+
+def _visible_datasource_ids(request: Request) -> set[int]:
+    acc = _access(request)
+    return {d["datasource_id"] for d in repo.list_datasets() if d["enabled"] and acc.can_dataset(d["id"])}
+
+
 @app.get("/api/datasources")
-def ds_list():
-    return J(repo.list_datasources())
+def ds_list(request: Request):
+    rows = repo.list_datasources()
+    if _is_admin(request):
+        return J(rows)
+    ids = _visible_datasource_ids(request)
+    return J([{k: r[k] for k in DS_PUBLIC} for r in rows if r["id"] in ids])
 
 
 @app.post("/api/datasources")
-def ds_create(data: dict = Body(...)):
+def ds_create(request: Request, data: dict = Body(...)):
+    _require_admin(request)
     return J(repo.create_datasource(data))
 
 
 @app.get("/api/datasources/{ds_id}")
-def ds_get(ds_id: int):
-    return J(repo.get_datasource(ds_id))
+def ds_get(request: Request, ds_id: int):
+    r = repo.get_datasource(ds_id)
+    if _is_admin(request):
+        return J(r)
+    if ds_id not in _visible_datasource_ids(request):
+        raise repo.NotFound("数据源不存在")
+    return J({k: r[k] for k in DS_PUBLIC})
 
 
 @app.put("/api/datasources/{ds_id}")
-def ds_update(ds_id: int, data: dict = Body(...)):
+def ds_update(request: Request, ds_id: int, data: dict = Body(...)):
+    _require_admin(request)
     return J(repo.update_datasource(ds_id, data))
 
 
 @app.delete("/api/datasources/{ds_id}")
-def ds_delete(ds_id: int):
+def ds_delete(request: Request, ds_id: int):
+    _require_admin(request)
     repo.delete_datasource(ds_id)
     return {"ok": True}
 
 
 @app.post("/api/datasources/test")
-def ds_test_unsaved(data: dict = Body(...)):
+def ds_test_unsaved(request: Request, data: dict = Body(...)):
     """测试未保存的配置；若带 id 且未填写 secret，则沿用已保存的密钥。"""
     from . import crypto
 
+    _require_admin(request)
     row = {"id": None, "name": data.get("name") or "test", "type": data.get("type"), "config": data.get("config") or {},
            "enabled": True, "secret": crypto.encrypt(data.get("secret")) if data.get("secret") else None}
     if data.get("id") and not data.get("secret"):
@@ -324,71 +415,105 @@ def ds_test_unsaved(data: dict = Body(...)):
 
 
 @app.post("/api/datasources/{ds_id}/test")
-def ds_test(ds_id: int):
+def ds_test(request: Request, ds_id: int):
+    _require_admin(request)
     return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).test())
 
 
 @app.get("/api/datasources/{ds_id}/tables")
-def ds_tables(ds_id: int, schema: str | None = None):
+def ds_tables(request: Request, ds_id: int, schema: str | None = None):
+    _require_admin(request)
     return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).list_tables(schema))
 
 
 @app.get("/api/datasources/{ds_id}/describe")
-def ds_describe(ds_id: int, table: str, sample_rows: int = 10):
+def ds_describe(request: Request, ds_id: int, table: str, sample_rows: int = 10):
+    _require_admin(request)
     return J(services.describe_table(repo.get_datasource(ds_id, with_secret=True), table, sample_rows))
 
 
 @app.post("/api/datasources/{ds_id}/query")
-def ds_query(ds_id: int, data: dict = Body(...)):
+def ds_query(request: Request, ds_id: int, data: dict = Body(...)):
+    _require_admin(request)
     return J(services.run_query(repo.get_datasource(ds_id, with_secret=True), data.get("sql", ""), data.get("limit", 200)))
 
 
-# ------------------------------------------------------------------ 数据集
+# ------------------------------------------------------------------ 数据集（管理员管理；普通用户只读、只看有权限的表）
+def _scoped_dataset(request: Request, ds: dict) -> dict:
+    if _is_admin(request):
+        return ds
+    acc = _access(request)
+    tables = [t for t in ds.get("tables", []) if acc.can_table(ds["id"], t["table_name"])]
+    return {**ds, "tables": tables, "table_count": len(tables), "read_only": True}
+
+
 @app.get("/api/datasets")
-def dataset_list():
-    return J(repo.list_datasets())
+def dataset_list(request: Request):
+    rows = repo.list_datasets()
+    if _is_admin(request):
+        return J(rows)
+    acc = _access(request)
+    return J([{**d, "table_count": len(acc.tables.get(d["id"], ())), "read_only": True}
+              for d in rows if d["enabled"] and acc.can_dataset(d["id"])])
 
 
 @app.post("/api/datasets")
-def dataset_create(data: dict = Body(...)):
+def dataset_create(request: Request, data: dict = Body(...)):
+    _require_admin(request)
     return J(repo.create_dataset(data))
 
 
 @app.get("/api/datasets/search")
-def dataset_search(q: str, top_k: int = 5):
-    return J(repo.search_datasets(q, top_k))
+def dataset_search(request: Request, q: str, top_k: int = 5):
+    if _is_admin(request):
+        return J(repo.search_datasets(q, top_k))
+    res = repo.search_datasets(q, top_k, dataset_ids=_access(request).dataset_ids())
+    res["hits"] = [{**h, "dataset": _scoped_dataset(request, h["dataset"])} for h in res["hits"]]
+    return J(res)
 
 
 @app.post("/api/datasets/reindex")
-def dataset_reindex():
+def dataset_reindex(request: Request):
+    _require_admin(request)
     return J(repo.reindex_all())
 
 
 @app.get("/api/datasets/{dataset_id}")
-def dataset_get(dataset_id: int):
-    return J(repo.get_dataset(dataset_id))
+def dataset_get(request: Request, dataset_id: int):
+    if not _is_admin(request) and not _access(request).can_dataset(dataset_id):
+        raise repo.NotFound("数据集不存在")
+    return J(_scoped_dataset(request, repo.get_dataset(dataset_id)))
 
 
 @app.put("/api/datasets/{dataset_id}")
-def dataset_update(dataset_id: int, data: dict = Body(...)):
+def dataset_update(request: Request, dataset_id: int, data: dict = Body(...)):
+    _require_admin(request)
     return J(repo.update_dataset(dataset_id, data))
 
 
 @app.delete("/api/datasets/{dataset_id}")
-def dataset_delete(dataset_id: int):
+def dataset_delete(request: Request, dataset_id: int):
+    _require_admin(request)
     repo.delete_dataset(dataset_id)
     return {"ok": True}
 
 
 @app.get("/api/scenarios")
-def scenarios():
-    return J([r["business_scenario"] for r in repo.list_datasets()])
+def scenarios(request: Request):
+    rows = repo.list_datasets()
+    if _is_admin(request):
+        return J([r["business_scenario"] for r in rows])
+    acc = _access(request)
+    return J([r["business_scenario"] for r in rows if r["enabled"] and acc.can_dataset(r["id"])])
 
 
 # ------------------------------------------------------------------ 样式规则
+# 通用规则：管理员配置，所有人可查看；业务场景规则：用户为自己有权限的场景配置，只对本人的报告生效
 @app.get("/api/style-rules")
-def rule_list():
-    return J(repo.list_rules())
+def rule_list(request: Request):
+    if _is_admin(request):
+        return J(repo.list_rules())
+    return J(repo.list_rules(owner=_p(request).emp_no or "", all_owners=False))
 
 
 @app.get("/api/style-tokens")
@@ -399,93 +524,141 @@ def style_tokens():
               "precedence": design.PRECEDENCE})
 
 
+def _style_owner(request: Request, exclude_id) -> str | None:
+    """预览 / 继承值按谁的业务场景规则计算：编辑某条场景规则时取其创建人，否则取当前用户。"""
+    if exclude_id:
+        r = repo.get_rule(int(exclude_id))
+        if r["scope"] == "scenario":
+            _check_owner(request, r.get("created_by"), "样式规则")
+            return r.get("created_by")
+    return _p(request).emp_no
+
+
 @app.post("/api/style-rules/effective")
-def style_effective(data: dict = Body(...)):
-    """某业务场景的最终生效样式（每项标明来源）。exclude_id + draft 用于编辑时计算“继承值”与草稿效果。"""
-    return J(repo.effective_style(data.get("scenario") or None, data.get("exclude_id"), data.get("draft")))
+def style_effective(request: Request, data: dict = Body(...)):
+    """某业务场景对当前用户最终生效的样式（每项标明来源）。exclude_id + draft 用于编辑时计算“继承值”与草稿效果。"""
+    owner = _style_owner(request, data.get("exclude_id"))
+    return J(repo.effective_style(data.get("scenario") or None, data.get("exclude_id"), data.get("draft"), owner))
 
 
 @app.post("/api/style-rules/preview", response_class=HTMLResponse)
-def style_preview(data: dict = Body(...)):
+def style_preview(request: Request, data: dict = Body(...)):
     from .style_preview import render_preview
 
+    owner = _style_owner(request, data.get("exclude_id"))
     draft = data.get("draft")
     if draft is not None:
         draft = {**draft, "theme": repo._clean_theme(draft.get("theme") or {})}
-    return HTMLResponse(render_preview(data.get("scenario") or None, data.get("exclude_id"), draft))
+    return HTMLResponse(render_preview(data.get("scenario") or None, data.get("exclude_id"), draft, owner))
 
 
 @app.get("/api/style-rules/resolve")
-def rule_resolve(scenario: str | None = None, q: str | None = None):
-    return J(repo.style_rules_for(scenario, q))
+def rule_resolve(request: Request, scenario: str | None = None, q: str | None = None):
+    return J(repo.style_rules_for(scenario, q, owner=_p(request).emp_no))
+
+
+def _check_rule_write(request: Request, data: dict, existing: dict | None = None) -> None:
+    scope = data.get("scope") or (existing or {}).get("scope")
+    if scope == "general" or (existing and existing["scope"] == "general"):
+        if not _is_admin(request):
+            raise HTTPException(403, "通用规则由管理员配置；你可以为自己有权限的业务场景配置个人样式")
+        return
+    if existing:
+        _check_owner(request, existing.get("created_by"), "样式规则")
+    if not _p(request).emp_no:
+        raise HTTPException(400, "业务场景样式属于个人配置，请使用 IAM 单点登录后再配置")
+    sc = data.get("business_scenario") or (existing or {}).get("business_scenario")
+    ds = _scenario_dataset(sc)
+    if not ds:
+        raise HTTPException(400, f"业务场景「{sc}」不存在")
+    _require_dataset(request, ds["id"])
 
 
 @app.post("/api/style-rules")
-def rule_create(data: dict = Body(...)):
+def rule_create(request: Request, data: dict = Body(...)):
+    _check_rule_write(request, data)
+    data = {**data, "created_by": _p(request).emp_no}
     return J(repo.create_rule(data))
 
 
 @app.get("/api/style-rules/{rule_id}")
-def rule_get(rule_id: int):
-    return J(repo.get_rule(rule_id))
+def rule_get(request: Request, rule_id: int):
+    r = repo.get_rule(rule_id)
+    if r["scope"] == "scenario":
+        _check_owner(request, r.get("created_by"), "样式规则")
+    return J(r)
 
 
 @app.put("/api/style-rules/{rule_id}")
-def rule_update(rule_id: int, data: dict = Body(...)):
+def rule_update(request: Request, rule_id: int, data: dict = Body(...)):
+    existing = repo.get_rule(rule_id)
+    _check_rule_write(request, data, existing)
+    data = {k: v for k, v in data.items() if k != "created_by"}
     return J(repo.update_rule(rule_id, data))
 
 
 @app.delete("/api/style-rules/{rule_id}")
-def rule_delete(rule_id: int):
+def rule_delete(request: Request, rule_id: int):
+    _check_rule_write(request, {}, repo.get_rule(rule_id))
     repo.delete_rule(rule_id)
     return {"ok": True}
 
 
-# ------------------------------------------------------------------ 报告模板
+# ------------------------------------------------------------------ 报告模板（每人只看自己的，管理员看全部）
 @app.get("/api/templates")
-def tpl_list(q: str | None = None):
-    return J(repo.list_templates(q))
+def tpl_list(request: Request, q: str | None = None):
+    return J(repo.list_templates(q, owner=_owner_filter(request)))
 
 
 @app.post("/api/templates")
-def tpl_create(data: dict = Body(...)):
-    return J(repo.save_template(data))
+def tpl_create(request: Request, data: dict = Body(...)):
+    _require_dataset(request, data.get("dataset_id"))
+    return J(repo.save_template({**data, "created_by": _p(request).emp_no}))
 
 
 @app.post("/api/templates/validate")
-def tpl_validate(data: dict = Body(...)):
-    return J(validate(data.get("markdown", ""), data.get("dataset_id"), bool(data.get("execute", True))))
+def tpl_validate(request: Request, data: dict = Body(...)):
+    _require_dataset(request, data.get("dataset_id"))
+    return J(validate(data.get("markdown", ""), data.get("dataset_id"), bool(data.get("execute", True)),
+                      guard=_guard(request), owner=_p(request).emp_no))
 
 
 @app.post("/api/templates/preview", response_class=HTMLResponse)
-def tpl_preview(data: dict = Body(...)):
+def tpl_preview(request: Request, data: dict = Body(...)):
+    _require_dataset(request, data.get("dataset_id"))
     try:
-        html, _meta = render(data.get("markdown", ""), data.get("dataset_id"))
+        html, _meta = render(data.get("markdown", ""), data.get("dataset_id"), guard=_guard(request),
+                             owner=data.get("owner") if _is_admin(request) and data.get("owner") else _p(request).emp_no)
     except (RenderError, TemplateError, ConnectorError, repo.Invalid) as e:
         raise HTTPException(400, str(e)) from e
     return HTMLResponse(html)
 
 
 @app.get("/api/templates/{tpl_id}")
-def tpl_get(tpl_id: int):
+def tpl_get(request: Request, tpl_id: int):
     t = repo.get_template(tpl_id)
+    _check_owner(request, t.get("created_by"), "报告模板")
     t["versions"] = repo.template_versions(tpl_id)
     return J(t)
 
 
 @app.put("/api/templates/{tpl_id}")
-def tpl_update(tpl_id: int, data: dict = Body(...)):
-    return J(repo.save_template(data, tpl_id))
+def tpl_update(request: Request, tpl_id: int, data: dict = Body(...)):
+    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
+    _require_dataset(request, data.get("dataset_id"))
+    return J(repo.save_template({k: v for k, v in data.items() if k != "created_by"}, tpl_id))
 
 
 @app.delete("/api/templates/{tpl_id}")
-def tpl_delete(tpl_id: int):
+def tpl_delete(request: Request, tpl_id: int):
+    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
     repo.delete_template(tpl_id)
     return {"ok": True}
 
 
 @app.get("/api/templates/{tpl_id}/versions/{version}")
-def tpl_version(tpl_id: int, version: int):
+def tpl_version(request: Request, tpl_id: int, version: int):
+    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
     row = db.fetchone(
         "SELECT version, markdown, created_at FROM report_template.report_template_version WHERE template_id=%s AND version=%s",
         (tpl_id, version),
@@ -496,25 +669,28 @@ def tpl_version(tpl_id: int, version: int):
 
 
 @app.post("/api/templates/{tpl_id}/render")
-def tpl_render(tpl_id: int, data: dict = Body(default={})):
-    return J(services.render_template_to_report(tpl_id, (data or {}).get("name")))
+def tpl_render(request: Request, tpl_id: int, data: dict = Body(default={})):
+    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
+    return J(services.render_template_to_report(tpl_id, (data or {}).get("name"), guard=_guard(request)))
 
 
-# ------------------------------------------------------------------ 报告
+# ------------------------------------------------------------------ 报告（每人只看自己的，管理员看全部）
 @app.get("/api/reports")
-def report_list(template_id: int | None = None):
-    return J(repo.list_reports(template_id))
+def report_list(request: Request, template_id: int | None = None):
+    return J(repo.list_reports(template_id, owner=_owner_filter(request)))
 
 
 @app.get("/api/reports/{report_id}")
-def report_get(report_id: int):
+def report_get(request: Request, report_id: int):
     r = repo.get_report(report_id, with_html=False)
+    _check_owner(request, r.get("created_by"), "报告")
     r["url"] = f"{settings.public_base_url}/reports/{report_id}"
     return J(r)
 
 
 @app.delete("/api/reports/{report_id}")
-def report_delete(report_id: int):
+def report_delete(request: Request, report_id: int):
+    _check_owner(request, repo.get_report(report_id, with_html=False).get("created_by"), "报告")
     repo.delete_report(report_id)
     return {"ok": True}
 
