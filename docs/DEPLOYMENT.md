@@ -387,7 +387,12 @@ export SMARTREPORT_TOKEN=<「我的令牌」签发的令牌，或 IAM access tok
 2. 调用 MCP 工具 `get_skill_guide`（MCP 初始化说明会提示 agent 这样做）；
 3. 使用 MCP 提示词 `smart_report`。
 
-### 10.4 接入自检
+### 10.4 容器中的 Codex 测试客户端
+
+`integrations/codex-docker/` 提供 Codex CLI + 技能 + MCP 客户端的镜像（compose profile `codex`），用于在不安装任何本机工具的情况下做端到端测试。
+模型经 `llm-bridge`（LiteLLM）把 Codex 的 Responses API 转为 AI 网关的 Chat Completions。用法见 `integrations/codex-docker/README.md`。
+
+### 10.5 接入自检
 
 在 agent 中让它调用 MCP 工具 `whoami`。应返回员工工号与有权限的业务场景。也可以用命令行检查：
 

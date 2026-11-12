@@ -100,6 +100,35 @@ services:
       timeout: 5s
       retries: 12
 
+  # ---- 可选：容器内的 Codex CLI 客户端，用于端到端测试（docker compose --profile codex ...）----
+  llm-bridge:
+    profiles: ["codex"]
+    build: { context: ., dockerfile: integrations/codex-docker/llm-bridge.Dockerfile }
+    image: smartreportgen-llm-bridge:latest
+    environment:
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?在 .env 中设置 LITELLM_MASTER_KEY（openssl rand -hex 24，前缀 sk-）}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:4000/health/liveliness',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  codex:
+    profiles: ["codex"]
+    build: { context: ., dockerfile: integrations/codex-docker/Dockerfile }
+    image: smartreportgen-codex:latest
+    environment:
+      SMARTREPORT_TOKEN: ${SMARTREPORT_TOKEN:-}   # 员工 MCP 令牌，运行时传入，不写进 .env
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./integrations/codex-docker/out:/home/agent/work/out
+    depends_on:
+      llm-bridge: { condition: service_healthy }
+      mcp: { condition: service_healthy }
 
 volumes:
   pgdata:

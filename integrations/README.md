@@ -9,7 +9,7 @@
 | Agent | MCP 配置放在 | 本目录模板 | 技能目录 | 验证情况 |
 |---|---|---|---|---|
 | Claude Code | 项目 `.mcp.json`（仓库已带） | — | `.claude/skills/`（仓库已链接）或 `~/.claude/skills/` | 已实测 |
-| Codex | 项目 `.codex/config.toml`（仓库已带）或 `~/.codex/config.toml` | — | `.agents/skills/`（仓库已链接）或 `~/.codex/skills/`、`~/.agents/skills/` | 配置按官方文档编写；鉴权头与服务端已实测，未在 Codex 内实跑 |
+| Codex | 项目 `.codex/config.toml`（仓库已带）或 `~/.codex/config.toml` | `codex-docker/`（容器客户端，见其 README） | `.agents/skills/`（仓库已链接）或 `~/.codex/skills/`、`~/.agents/skills/` | 已在容器中实测（Codex CLI 0.167.2：MCP 鉴权、whoami、生成报告） |
 | Cursor | `.cursor/mcp.json` 或 `~/.cursor/mcp.json` | `cursor.mcp.json` | 无技能机制时读 `AGENTS.md`，或调 `get_skill_guide` | 未实测 |
 | VS Code Copilot | `.vscode/mcp.json` | `vscode.mcp.json`（首次使用时提示输入令牌） | 同上 | 未实测 |
 | Gemini CLI | `~/.gemini/settings.json` 或项目 `.gemini/settings.json` | `gemini.settings.json` | 同上 | 未实测 |
