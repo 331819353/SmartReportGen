@@ -259,12 +259,11 @@ def _clean_theme(theme: dict) -> dict:
 
     if not isinstance(theme, dict):
         raise Invalid("theme 必须是对象")
-    resolved, warns = design.resolve(theme)
+    resolved, warns = design.resolve_overrides(theme)
     bad = [w for w in warns if "不是已知" not in w]
     if bad:
         raise Invalid("；".join(bad))
-    keys = {design.LEGACY_ALIASES.get(str(k).lstrip("-"), str(k).lstrip("-")) for k in theme}
-    return {k: resolved[k] for k in keys if k in resolved}
+    return resolved
 
 
 def _validate_rule(data: dict) -> None:

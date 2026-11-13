@@ -218,7 +218,8 @@
   }
 
   // ------------------------------------------------------------------ 筛选栏 UI
-  var bar = document.querySelector('#rf-filterbar .rf-filterbar-inner');
+  var filterbar = document.getElementById('rf-filterbar');
+  var bar = filterbar.querySelector('.rf-filterbar-inner');
   var controls = {};
   function el(tag, cls, html) {
     var e = document.createElement(tag);
@@ -227,7 +228,7 @@
     return e;
   }
   function buildBar() {
-    if (!F.length && !(R.presets || []).length) { document.getElementById('rf-filterbar').style.display = 'none'; return; }
+    if (!F.length && !(R.presets || []).length) { filterbar.hidden = true; return; }
     var row = el('div', 'rf-filters');
     F.forEach(function (f, idx) {
       var w = el('div', 'rf-f rf-f-' + f.type);
@@ -262,6 +263,14 @@
     s.value = value == null ? '' : value;
     s.onchange = function () { onchange(s.value); };
     return s;
+  }
+  function openMulti(box) {
+    box.classList.add('open');
+    // 筛选在封面右侧时，多选面板向左补偿超出视口的宽度。
+    var pop = box.querySelector('.rf-ms-pop');
+    pop.style.left = '0';
+    var overflow = pop.getBoundingClientRect().right - document.documentElement.clientWidth + 8;
+    if (overflow > 0) pop.style.left = -overflow + 'px';
   }
   function multiEl(c, opts) {
     var f = c.f, v = state[f.id] || [];
@@ -301,7 +310,7 @@
       e.stopPropagation();
       var open = box.classList.contains('open');
       document.querySelectorAll('.rf-ms.open').forEach(function (x) { x.classList.remove('open'); });
-      if (!open) { box.classList.add('open'); search.focus(); }
+      if (!open) { openMulti(box); search.focus(); }
     };
     pop.appendChild(search); pop.appendChild(acts); pop.appendChild(list);
     box.appendChild(btn); box.appendChild(pop);
@@ -323,7 +332,7 @@
       } else if (f.type === 'multi') {
         var ms = multiEl(c, opts);
         c.box.appendChild(ms);
-        if (reopen === f.id) ms.classList.add('open');
+        if (reopen === f.id) openMulti(ms);
       } else if (f.type === 'range') {
         v = v || ['', ''];
         c.box.appendChild(selectEl(opts, v[0], '起', function (x) { state[f.id] = [x, (state[f.id] || [])[1] || '']; changed(); }));
@@ -539,8 +548,10 @@
     opt.tooltip.axisPointer = { type: defType === 'bar' ? 'shadow' : 'line', lineStyle: { color: C.border } };
     opt.tooltip.formatter = tipFormatter(keys);
     var legend = s.legend != null ? !!s.legend : series.length > 1;
-    opt.legend.show = legend;
-    opt.grid.top = legend ? 34 : 16;
+    // 参考报告将多系列图例放在图下方，缩放滑块与图例分别预留空间。
+    opt.legend = Object.assign(opt.legend, { show: legend, top: 'auto', bottom: 4, left: 'center' });
+    opt.grid.top = 22;
+    opt.grid.bottom = legend ? 32 : 10;
     if (horiz) {
       opt.yAxis = catAxis;
       opt.xAxis = valAxis(leftKey);
@@ -548,10 +559,12 @@
     } else {
       opt.xAxis = catAxis;
       opt.yAxis = hasRight ? [valAxis(leftKey, { name: s.y_label }), valAxis(rightKey, { right: true })] : valAxis(leftKey, { name: s.y_label });
+      // 折线的最后一个类目贴近轴端，给居中的刻度文字预留空间。
+      if (!catAxis.boundaryGap) opt.grid.right = 32;
     }
     if (s.zoom || (!horiz && cats.length > 40)) {
-      opt.dataZoom = [{ type: 'inside' }, { type: 'slider', height: 16, bottom: 4, borderColor: C.border, fillerColor: 'rgba(0,0,0,.05)' }];
-      opt.grid.bottom = 30;
+      opt.dataZoom = [{ type: 'inside' }, { type: 'slider', height: 16, bottom: legend ? 28 : 4, borderColor: C.border, fillerColor: 'rgba(0,0,0,.05)' }];
+      opt.grid.bottom += 24;
     }
     // 有正有负的单系列柱：按正负使用发散色阶两端着色，负值柱圆角翻转
     if (!s.series && series.length === 1 && series[0].type === 'bar' && !stack) {
@@ -598,9 +611,11 @@
         return p.marker + esc(p.name) + '<br><b>' + esc(fmtM(key, p.value)) + '</b>　' + (total ? (p.value / total * 100).toFixed(1) + '%' : '');
       };
       var narrow = c.body.clientWidth < 440;
+      // 窄卡缩小图形半径，保留外部百分比标签的宽度。
+      var radius = narrow ? '62%' : '70%';
       opt.legend = Object.assign(opt.legend, { show: data.length <= 10, top: 'auto', bottom: 0 });
       opt.series = [{
-        type: 'pie', data: data, radius: s.type === 'donut' ? ['46%', '70%'] : [0, '70%'], center: ['50%', data.length <= 10 ? '45%' : '50%'],
+        type: 'pie', data: data, radius: s.type === 'donut' ? [narrow ? '42%' : '46%', radius] : [0, radius], center: ['50%', data.length <= 10 ? '45%' : '50%'],
         itemStyle: { borderColor: C.surface, borderWidth: 2, borderRadius: s.type === 'donut' ? 4 : 0 },
         label: { show: true, color: C.muted, fontSize: LBL, formatter: narrow && data.length <= 10 ? '{d}%' : '{b}\n{d}%' },
         labelLine: { length: 8, length2: 8 }, minAngle: 2, avoidLabelOverlap: true
@@ -963,11 +978,16 @@
 
   // ------------------------------------------------------------------ 目录高亮
   function tocSpy() {
-    var links = document.querySelectorAll('.rf-toc a');
+    var links = document.querySelectorAll('.rf-toc-parent');
     if (!links.length || !window.IntersectionObserver) return;
     var io = new IntersectionObserver(function (ents) {
       ents.forEach(function (e) {
-        if (e.isIntersecting) links.forEach(function (a) { a.classList.toggle('on', a.getAttribute('href') === '#' + e.target.id); });
+        if (e.isIntersecting) links.forEach(function (a) {
+          var active = a.hash === '#' + e.target.id;
+          a.classList.toggle('on', active);
+          if (active) a.setAttribute('aria-current', 'location');
+          else a.removeAttribute('aria-current');
+        });
       });
     }, { rootMargin: '-20% 0px -70% 0px' });
     document.querySelectorAll('.rf-section').forEach(function (s) { io.observe(s); });
@@ -976,6 +996,14 @@
   buildBar();
   initState();
   drawControls();
+  // 吸顶筛选可能因视口或控件数量而换行，目录跳转留出实际高度。
+  if (T.filter_sticky && !filterbar.hidden) {
+    var setScrollInset = function () {
+      document.documentElement.style.setProperty('--rf-scroll-inset', (filterbar.offsetHeight + 14) + 'px');
+    };
+    setScrollInset();
+    if (window.ResizeObserver) new ResizeObserver(setScrollInset).observe(filterbar);
+  }
   renderAll();
   tocSpy();
   window.addEventListener('beforeprint', function () { charts.forEach(function (c) { c.inst && c.inst.resize(); }); });

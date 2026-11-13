@@ -114,8 +114,8 @@ note: 该图如何支撑上面的结论
 
 - 同一结论下连续的图表块组成一个 **12 栅格**（内部 60 等分）；卡片间距、内边距、字号由设计令牌固定，**只有图形区随卡片宽度伸缩**。
 - 未写 `span` 时按类型给默认宽：kpi=3、pie/donut/funnel/gauge=4、bar/line/scatter/treemap/bullet=6、table/heatmap/combo=12，逐行装箱后**把行内剩余空间平均分配给自动项**（如 2 个饼图→各 6，3 个柱图→6+6、末行单个自动铺满 12）。
-- KPI 主值固定 36px、放不下只截断不缩小：≤4 个一行等分；5 个自动排成 3+2，6 个排成 3+3。
-- 同一行非 KPI 图表高度自动对齐；窄屏（≤900px）小于半行的卡片变为半行，手机端整行。
+- 内置样式的 KPI 主值为 19px，桌面端连续五张自动宽度的指标卡可等分一行，六张排为两行三列。
+- 同一行未指定高度的非 KPI 图表自动对齐。窄屏（≤980px）目录移到报告上方，小于半行的卡片变为半行。手机端图表单列，小型指标卡可两列显示。
 
 ## 5. 全局筛选（filters）与联动
 
@@ -164,7 +164,7 @@ status: {measure: tgt_rate, direction: up, good: 1.0, warn: 0.95, labels: {posit
 - 用户明确确认过的升降色（如“红涨绿跌”）优先：在模板 theme 中覆盖 `color-trend-up` / `color-trend-down`。
 
 ### 主题（theme）
-报告的视觉来自样式项（CSS 变量）。生效顺序：**智能体决定（模板 `theme`）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式（仅颜色）**。
+报告的视觉来自样式项（CSS 变量）。生效顺序为 **智能体决定（模板 `theme`）≥ 业务场景规则 ≥ 通用规则 ≥ 内置经营报告样式**。
 
 - 后三者合并为一份指定样式，由 `get_style_rules` 的 `specified` 返回。视觉样式 `theme` 在渲染时自动生效，展示要求 `items` 用于状态标记、数字格式及文案等。章节、图表类型和筛选条件按用户需求、场景分析思路和查询证据决定。
 - 你可以有自己的判断：在模板 `theme` 中设置的项**按你的设置展示**，包括覆盖指定样式（校验/渲染会提示覆盖了哪些项）。
@@ -184,14 +184,14 @@ theme:                          # 示例：智能体的决定
 
 | 类型 | 令牌 |
 |---|---|
-| 主题 | `color-brand` `color-bg-page` `color-text-primary` `color-text-secondary` `color-text-inverse` `font-family` |
+| 主题 | `color-brand` `color-bg-page` `color-heading` `color-text-primary` `color-text-secondary` `color-text-inverse` `font-family` |
 | 排版 | `rre-page-font-title`（报告大标题）`rre-page-font-section`（章节标题）、卡片内八个文字角色 `rre-card-font-{title,unit,hero,affix,read,label,table,prose}`（值为 `{size, weight}`，12~72px）、`rre-prose-line-height`（1.2~2.4） |
-| 页面布局 | `max_width` `rre-page-pad` `rre-section-gap` `rre-card-gap` `toc` `rre-toc-width` |
-| 报告头部 | `header_style`（banner / plain）`color-header-start` `color-header-end`（留空 = 由主题色派生）`rre-header-pad` `rre-radius-panel` `header_align` |
-| 筛选栏 | `filter_sticky` `rre-control-height` `rre-radius-control` `rre-radius-pill` `filter_align`（筛选值对齐） |
-| 章节与结论 | `rre-summary-tint` `rre-summary-border-tint`（主题色占比 0~40%）`section_align` |
+| 页面布局 | `max_width` `rre-page-pad` `rre-section-gap` `rre-card-gap` `toc` `rre-toc-width` `rre-toc-gap` |
+| 报告头部 | `header_style`（banner / plain）`color-header-start` `color-header-middle` `color-header-end` `rre-header-pad` `rre-radius-panel` `shadow-header` `header_align` |
+| 筛选栏 | `filter_sticky`（默认在封面内，开启时移到封面下方吸顶）`rre-control-height` `rre-radius-control` `rre-radius-pill` `filter_align`（筛选值对齐） |
+| 章节与结论 | `rre-section-pad` `rre-radius-section` `shadow-section` `color-bg-summary` `rre-summary-tint` `rre-summary-border-tint`（主题色占比 0~40%）`section_align` |
 | 卡片 | `color-bg-card` `color-border-card` `rre-card-border-width` `radius-card` `shadow-card` `rre-card-pad` `rre-card-title-line` `rre-card-head-gap` `rre-radius-chip` `card_title_align` |
-| 指标卡 | `rre-card-fact-line` `rre-card-fact-gap` `rre-radius-tile` `rre-status-bar` `kpi_align` |
+| 指标卡 | `rre-kpi-pad` `rre-kpi-gap` `rre-kpi-min-height` `rre-card-fact-line` `rre-card-fact-gap` `rre-radius-tile` `rre-status-bar` `kpi_align` |
 | 数据配色 | `chart-palette-categorical` `chart-palette-sequential` `chart-palette-diverging`、`color-status-{positive,warning,negative}`（蓝·不判 = `color-brand`）、`color-trend-up` `color-trend-down` |
 | 图表 | `rre-card-bar-max` `rre-data-radius` `rre-chart-line-width` `chart_grid`（dashed / solid / none）`rre-card-legend-gap` `rre-card-axis-gap` `rre-card-axis-title-gap` |
 | 表格 | `rre-card-row-height` `color-table-head-bg`（留空 = 卡片底色）`table_zebra` `table_text_align` `table_num_align` |

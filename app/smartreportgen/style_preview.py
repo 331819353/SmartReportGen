@@ -36,26 +36,31 @@ queries:
 ```chart
 type: kpi
 y: sat
-title: 满意度（向好）
+title: 满意度
 status: {{direction: up, good: 4.5, warn: 4.2}}
 ```
 ```chart
 type: kpi
 y: rate
-title: 目标达成率（关注）
+title: 目标达成率
 status: {{direction: up, good: 1.0, warn: 0.95}}
 ```
 ```chart
 type: kpi
 y: gap
-title: 目标差额（承压）
+title: 目标差额
 status: {{direction: up, good: 0, warn: -1000000}}
 ```
 ```chart
 type: kpi
 y: gmv
-title: 销售额（不判）
+title: 销售额
 sub: [{{measure: yoy, trend: up}}, {{measure: cost_yoy, trend: down}}]
+```
+```chart
+type: kpi
+y: tgt
+title: 销售目标
 ```
 
 ## 二、图表配色与版式

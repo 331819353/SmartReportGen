@@ -1,9 +1,8 @@
 """样式令牌。令牌键名即 CSS 变量名（去掉前缀 --）。
 
-- 内置样式（BUILTIN_TOKENS）只有企业规范中的颜色：页面与卡片、文字、健康度、升降色、图表色板。
-- 其余样式项（字号、间距、圆角、对齐等）没有内置值。只有内置样式与规则中设置过的项会提供给智能体。
+- 内置样式（BUILTIN_TOKENS）取自经营报告参考样式，覆盖配色、排版、页面布局与控件。
 - 展示取值：智能体在模板 theme 中配置了的项按其配置；未配置的项按 业务场景规则 ≥ 通用规则 ≥ 内置样式。
-- _BASE 仅是渲染兜底（智能体也没有决定时避免页面错乱），不属于内置样式，也不会提供给智能体。
+  自定义 CSS 按需提供，内置样式只使用结构化令牌和通用报告组件。
 样式项按报告页面的组成部分分为 12 类（TOKEN_GROUPS）。
 """
 from __future__ import annotations
@@ -12,69 +11,76 @@ import re
 from typing import Any
 
 COLOR_TOKENS = {
-    "color-brand": "#2168F3",              # 标题前标记、多项对比图、判不了好坏的卡
-    "color-bg-page": "#EEF4FE",            # 报告页背景
-    "color-text-primary": "#17396D",       # 标题、主值、读数值
-    "color-text-secondary": "#5F7DA8",     # 单位、标签、坐标轴、注释
+    "color-brand": "#3B82F6",              # 选中态、结论强调线
+    "color-bg-page": "#F5F7FA",            # 报告页背景
+    "color-heading": "#1E3A8A",            # 深蓝章节标题、主数值与表头
+    "color-text-primary": "#1F2937",       # 正文与表格读数
+    "color-text-secondary": "#64748B",     # 单位、标签、坐标轴、注释
     "color-text-inverse": "#FFFFFF",       # 深色底上的文字
     "color-bg-card": "#FFFFFF",            # 卡片画布
-    "color-border-card": "#DCE7F8",        # 卡片边框、分隔线
-    "color-status-positive": "#16A866",    # 达标、向好
-    "color-status-warning": "#F2B22E",     # 临近、关注
-    "color-status-negative": "#F0585B",    # 未达、承压
-    "color-trend-up": "#16A866",           # 同比、环比上升
-    "color-trend-down": "#F0585B",         # 同比、环比下降
+    "color-bg-summary": "#F8FAFC",         # 结论框和辅助读数的浅灰底
+    "color-border-card": "#E5E7EB",        # 卡片边框、分隔线
+    "color-status-positive": "#10B981",    # 达标、向好
+    "color-status-warning": "#F59E0B",     # 临近、关注
+    "color-status-negative": "#EF4444",    # 未达、承压
+    "color-trend-up": "#047857",           # 浅绿底上的涨跌标签
+    "color-trend-down": "#B91C1C",         # 浅红底上的涨跌标签
 }
-AUTO_COLOR_TOKENS = {  # 空值 = 自动（由主题色派生）
-    "color-header-start": "",              # 头部横幅渐变起始色（默认主题色）
-    "color-header-end": "",                # 头部横幅渐变结束色（默认主题色与主文字色混合）
-    "color-table-head-bg": "",             # 表头底色（默认卡片底色）
+AUTO_COLOR_TOKENS = {  # 支持清空，便于覆盖默认配色
+    "color-header-start": "#0B2641",
+    "color-header-middle": "#174A7C",      # 留空时使用两段端点色
+    "color-header-end": "#0F766E",
+    "color-table-head-bg": "#F6F9FD",
 }
 PALETTE_TOKENS = {
-    "chart-palette-categorical": ["#2168F3", "#4EA5F8", "#1A44A5", "#92C3FA", "#3F84EE", "#C4DCFB"],
-    "chart-palette-sequential": ["#EEF5FE", "#D6E6FC", "#B4D3FA", "#85B8F6", "#4C90EE", "#2168F3"],
-    "chart-palette-diverging": ["#1A44A5", "#EEF4FE", "#4EA5F8"],
+    "chart-palette-categorical": ["#2F75B5", "#F28E2B", "#1B9E77", "#7F7F7F", "#3B82F6", "#14B8A6", "#CBD5E1"],
+    "chart-palette-sequential": ["#EFF6FF", "#DBEAFE", "#BFDBFE", "#93C5FD", "#3B82F6", "#1E3A8A"],
+    "chart-palette-diverging": ["#D73027", "#F8FAFC", "#1B9E77"],
 }
-FONT_FAMILY = "'Inter', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif"
+FONT_FAMILY = "'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', Arial, sans-serif"
 FONT_TOKENS = {  # 字号按设备固定，最小 12px
-    "rre-page-font-title": {"size": 28, "weight": 700},   # 报告大标题
-    "rre-page-font-section": {"size": 20, "weight": 700}, # 章节标题
-    "rre-card-font-title": {"size": 16, "weight": 600},   # 卡片标题、子结论标题
-    "rre-card-font-unit": {"size": 12, "weight": 500},    # 标题右侧单位标签
-    "rre-card-font-hero": {"size": 36, "weight": 700},    # 指标卡、仪表盘、子弹图主值
-    "rre-card-font-affix": {"size": 16, "weight": 500},   # 紧跟主值的 %、万元
-    "rre-card-font-read": {"size": 16, "weight": 600},    # 辅助指标值、环心值、合计
+    "rre-page-font-title": {"size": 25, "weight": 700},   # 报告大标题
+    "rre-page-font-section": {"size": 16, "weight": 800}, # 章节标题
+    "rre-card-font-title": {"size": 14, "weight": 700},   # 图表标题、子结论标题
+    "rre-card-font-unit": {"size": 12, "weight": 700},    # 标题右侧单位标签
+    "rre-card-font-hero": {"size": 19, "weight": 800},    # 指标卡、仪表盘、子弹图主值
+    "rre-card-font-affix": {"size": 12, "weight": 600},   # 紧跟主值的 %、万元
+    "rre-card-font-read": {"size": 12, "weight": 700},    # 辅助指标值、环心值、合计
     "rre-card-font-label": {"size": 12, "weight": 400},   # 辅助指标名、坐标轴、图例、表头
     "rre-card-font-table": {"size": 13, "weight": 400},   # 单元格、榜单、漏斗阶段名
     "rre-card-font-prose": {"size": 14, "weight": 400},   # 正文
 }
 SIZE_TOKENS = {  # px；不随卡片宽度变化，只有图形区随卡片伸缩
-    "rre-page-pad": 24, "rre-section-gap": 40, "rre-toc-width": 168, "rre-header-pad": 32, "rre-control-height": 32,
-    "rre-card-pad": 20, "rre-card-gap": 20, "rre-card-border-width": 1, "rre-card-title-line": 22, "rre-card-head-gap": 12,
-    "rre-card-fact-line": 22, "rre-card-fact-gap": 6, "rre-status-bar": 4, "rre-card-row-height": 36,
+    "rre-page-pad": 14, "rre-section-gap": 14, "rre-section-pad": 16, "rre-toc-width": 188, "rre-toc-gap": 16,
+    "rre-header-pad": 24, "rre-control-height": 36,
+    "rre-card-pad": 14, "rre-card-gap": 12, "rre-card-border-width": 1, "rre-card-title-line": 20, "rre-card-head-gap": 8,
+    "rre-kpi-pad": 10, "rre-kpi-gap": 8, "rre-kpi-min-height": 96,
+    "rre-card-fact-line": 18, "rre-card-fact-gap": 3, "rre-status-bar": 2, "rre-card-row-height": 31,
     "rre-card-legend-gap": 16, "rre-card-axis-gap": 8, "rre-card-axis-title-gap": 4, "rre-card-bar-max": 24,
-    "radius-card": 16, "rre-radius-panel": 18, "rre-radius-tile": 999, "rre-radius-chip": 999,
-    "rre-radius-control": 999, "rre-radius-pill": 999, "rre-data-radius": 12,
+    "radius-card": 8, "rre-radius-panel": 16, "rre-radius-section": 10, "rre-radius-tile": 999, "rre-radius-chip": 999,
+    "rre-radius-control": 999, "rre-radius-pill": 999, "rre-data-radius": 2,
 }
 NUMBER_TOKENS = {  # 小数：(默认, 最小, 最大)
-    "rre-prose-line-height": (1.65, 1.2, 2.4),
+    "rre-prose-line-height": (1.55, 1.2, 2.4),
     "rre-chart-line-width": (2.4, 1.0, 6.0),
 }
 PERCENT_TOKENS = {  # 0~40%：派生色的混合比例
-    "rre-summary-tint": 6,                 # 结论框底色中主题色的比例
-    "rre-summary-border-tint": 22,         # 结论框边框中主题色的比例
+    "rre-summary-tint": 0,                 # 结论框底色中主题色的比例
+    "rre-summary-border-tint": 0,          # 结论框边框中主题色的比例
 }
 OTHER_TOKENS = {
     "font-family": FONT_FAMILY,
-    "shadow-card": "0 8px 28px rgba(33, 104, 243, .07)",
+    "shadow-card": "none",
+    "shadow-section": "0 4px 18px rgba(15,23,42,.06)",
+    "shadow-header": "0 12px 28px rgba(11,38,65,.18)",
 }
 LAYOUT_OPTIONS = {  # 非 CSS 变量的页面选项
     "header_style": "banner",   # banner：主题色横幅 + 反白文字；plain：白色卡片
     "toc": True,
-    "max_width": 1360,
-    "filter_sticky": True,      # 滚动时筛选栏吸顶
-    "chart_grid": "dashed",     # 图表网格线：dashed / solid / none
-    "table_zebra": False,       # 表格斑马纹
+    "max_width": 1240,
+    "filter_sticky": False,     # 默认筛选位于封面；开启后移到封面下方并吸顶
+    "chart_grid": "solid",      # 图表网格线：dashed / solid / none
+    "table_zebra": True,        # 表格斑马纹
     # 对齐（水平）；控件、按钮、标签内的文字始终垂直居中
     "header_align": "left",     # 报告头部文字
     "filter_align": "left",     # 筛选控件中的显示值
@@ -83,16 +89,15 @@ LAYOUT_OPTIONS = {  # 非 CSS 变量的页面选项
     "kpi_align": "left",        # 指标卡主数值与辅助数值
     "table_text_align": "left", # 表格文字列
     "table_num_align": "right", # 表格数值列
-    "custom_css": "",
 }
 
-# 内置样式：只有企业规范中的颜色
-BUILTIN_TOKENS: dict[str, Any] = {**COLOR_TOKENS, **PALETTE_TOKENS}
+# 内置视觉样式直接参与优先级合并，管理台和 MCP 都能看到来源。
+BUILTIN_TOKENS: dict[str, Any] = {
+    **COLOR_TOKENS, **AUTO_COLOR_TOKENS, **PALETTE_TOKENS, **FONT_TOKENS, **SIZE_TOKENS,
+    **{k: v[0] for k, v in NUMBER_TOKENS.items()}, **PERCENT_TOKENS, **OTHER_TOKENS, **LAYOUT_OPTIONS,
+}
 DEFAULT_TOKENS = BUILTIN_TOKENS  # 兼容旧名称
-# 非内置样式项的渲染兜底（不是内置样式，不提供给智能体）
-_BASE: dict[str, Any] = {**AUTO_COLOR_TOKENS, **FONT_TOKENS, **SIZE_TOKENS, **{k: v[0] for k, v in NUMBER_TOKENS.items()},
-                         **PERCENT_TOKENS, **OTHER_TOKENS, **LAYOUT_OPTIONS}
-KNOWN_KEYS = set(BUILTIN_TOKENS) | set(_BASE)
+KNOWN_KEYS = set(BUILTIN_TOKENS) | {"custom_css"}
 
 # 旧版主题键 → 令牌
 LEGACY_ALIASES = {
@@ -117,24 +122,33 @@ def canonical_key(k: Any) -> str:
     return LEGACY_ALIASES.get(k, k)
 
 
-def resolve(*layers: dict | None) -> tuple[dict, list[str]]:
-    """内置样式 + 按顺序叠加的样式层，返回 (已设置的样式项, 告警)。未设置的非内置项不在结果中。"""
-    out: dict[str, Any] = dict(BUILTIN_TOKENS)
+def resolve_overrides(layer: dict | None) -> tuple[dict, list[str]]:
+    """只返回该层显式指定且有效的取值，避免非法覆盖退回内置值并盖掉上一级。"""
+    out: dict[str, Any] = {}
     warns: list[str] = []
+    for raw_key, v in (layer or {}).items():
+        k = canonical_key(raw_key)
+        if k in ("header_bg", "summary_bg", "number_font", "chart_label_size"):
+            continue  # 旧版选项，已由令牌体系取代
+        if k not in KNOWN_KEYS:
+            warns.append(f"theme.{k} 不是已知样式项，已忽略")
+            continue
+        ok, val, msg = _validate(k, v)
+        if ok:
+            out[k] = val
+        else:
+            warns.append(f"theme.{k}：{msg}，已忽略")
+    return out, warns
+
+
+def resolve(*layers: dict | None) -> tuple[dict, list[str]]:
+    """从内置样式开始依次叠加各层的有效取值。"""
+    out = dict(BUILTIN_TOKENS)
+    warns = []
     for layer in layers:
-        for k, v in (layer or {}).items():
-            k = str(k).lstrip("-")
-            k = LEGACY_ALIASES.get(k, k)
-            if k in ("header_bg", "summary_bg", "number_font", "chart_label_size"):
-                continue  # 旧版选项，已由令牌体系取代
-            if k not in KNOWN_KEYS:
-                warns.append(f"theme.{k} 不是已知样式项，已忽略")
-                continue
-            ok, val, msg = _validate(k, v)
-            if ok:
-                out[k] = val
-            else:
-                warns.append(f"theme.{k}：{msg}，已忽略")
+        values, notes = resolve_overrides(layer)
+        out.update(values)
+        warns.extend(notes)
     return out, warns
 
 
@@ -193,8 +207,8 @@ def _validate(k: str, v: Any) -> tuple[bool, Any, str]:
 
 
 def full(values: dict) -> dict:
-    """渲染用的完整取值：未设置的非内置项使用兜底值。"""
-    return {**_BASE, **values}
+    """渲染用的完整取值，补全尚未设置的样式和可选 CSS。"""
+    return {**BUILTIN_TOKENS, "custom_css": "", **values}
 
 
 _JUSTIFY = {"left": "flex-start", "center": "center", "right": "flex-end"}
@@ -218,10 +232,14 @@ def css_vars(t: dict) -> str:
         parts.append(f"--{k}:{t[k]}%;")
     # 自动色：留空时由主题色派生
     hs = t["color-header-start"] or "var(--color-brand)"
+    hm = t["color-header-middle"]
     he = t["color-header-end"] or "color-mix(in srgb,var(--color-brand) 62%,var(--color-text-primary))"
-    parts.append(f"--rf-header-bg:linear-gradient(120deg,{hs} 0%,{he} 100%);")
+    middle_stop = f"{hm} 64%," if hm else ""
+    parts.append(f"--rf-header-bg:linear-gradient(120deg,{hs} 0%,{middle_stop}{he} 100%);")
     parts.append(f"--rf-table-head-bg:{t['color-table-head-bg'] or 'var(--color-bg-card)'};")
-    parts.append(f"--font-family:{t['font-family']};--shadow-card:{t['shadow-card']};--rf-max:{int(t['max_width'])}px;")
+    parts.append(f"--font-family:{t['font-family']};--shadow-card:{t['shadow-card']};"
+                 f"--shadow-section:{t['shadow-section']};--shadow-header:{t['shadow-header']};"
+                 f"--rf-max:{int(t['max_width'])}px;")
     for k in ("header_align", "filter_align", "section_align", "card_title_align", "kpi_align", "table_text_align",
               "table_num_align"):
         name = k.replace("_align", "").replace("_", "-")
@@ -240,15 +258,16 @@ def runtime_tokens(t: dict) -> dict:
 
 
 # ============================================================ 业务人员可读的元数据（样式规则编辑器使用）
-PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式（仅颜色）：后三者合并为一份“指定样式”（视觉样式与展示要求），"
+PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式：后三者合并为一份“指定样式”（视觉样式与展示要求），"
               "同一项以优先级高者为准，作为约束交给智能体；智能体可以按自己的判断调整，没有指定的由智能体自由决定")
 
 # 按报告页面的组成部分分类；每个令牌只属于一类
 TOKEN_GROUPS: list[dict] = [
     {"key": "theme", "label": "主题", "desc": "整份报告的主色调、页面底色、文字颜色与字体", "tokens": [
-        {"key": "color-brand", "label": "主题色", "type": "color", "desc": "章节标记、结论标签、多项对比图、无法判断好坏的卡片"},
+        {"key": "color-brand", "label": "主题色", "type": "color", "desc": "选中态、结论强调线与默认图形强调色"},
         {"key": "color-bg-page", "label": "页面底色", "type": "color", "desc": "整个报告页面的背景"},
-        {"key": "color-text-primary", "label": "主文字", "type": "color", "desc": "标题、主数值、正文"},
+        {"key": "color-heading", "label": "标题强调色", "type": "color", "desc": "章节、目录、指标主数值和表头"},
+        {"key": "color-text-primary", "label": "主文字", "type": "color", "desc": "正文、图表标题、读数"},
         {"key": "color-text-secondary", "label": "次要文字", "type": "color", "desc": "单位、标签、坐标轴、注释"},
         {"key": "color-text-inverse", "label": "深色底上的文字", "type": "color", "desc": "例如头部横幅、选中按钮上的文字"},
         {"key": "font-family", "label": "字体", "type": "text", "desc": "按顺序优先使用"},
@@ -273,25 +292,32 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "rre-card-gap", "label": "卡片之间的间距", "type": "px"},
         {"key": "toc", "label": "显示左侧目录", "type": "bool"},
         {"key": "rre-toc-width", "label": "目录宽度", "type": "px"},
+        {"key": "rre-toc-gap", "label": "目录与正文间距", "type": "px"},
     ]},
     {"key": "header", "label": "报告头部", "desc": "报告最上方的标题区域", "tokens": [
         {"key": "header_style", "label": "头部样式", "type": "choice",
          "options": [{"value": "banner", "label": "主题色横幅"}, {"value": "plain", "label": "白色简洁"}]},
         {"key": "color-header-start", "label": "横幅渐变起始色", "type": "color_auto", "desc": "留空则跟随主题色"},
+        {"key": "color-header-middle", "label": "横幅渐变过渡色", "type": "color_auto", "desc": "留空则只使用起始色与结束色"},
         {"key": "color-header-end", "label": "横幅渐变结束色", "type": "color_auto", "desc": "留空则由主题色自动加深"},
         {"key": "rre-header-pad", "label": "头部内边距", "type": "px"},
-        {"key": "rre-radius-panel", "label": "头部与结论框圆角", "type": "px"},
+        {"key": "rre-radius-panel", "label": "头部圆角", "type": "px"},
+        {"key": "shadow-header", "label": "头部投影", "type": "text"},
         {"key": "header_align", "label": "头部文字对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "filter", "label": "筛选栏", "desc": "报告顶部的全局筛选与快捷场景按钮", "tokens": [
-        {"key": "filter_sticky", "label": "滚动时吸顶", "type": "bool"},
+        {"key": "filter_sticky", "label": "滚动时吸顶", "type": "bool", "desc": "开启后放在封面下方，关闭时放在封面内"},
         {"key": "rre-control-height", "label": "筛选控件高度", "type": "px"},
         {"key": "rre-radius-control", "label": "筛选控件圆角", "type": "px", "desc": "999 为胶囊形"},
         {"key": "rre-radius-pill", "label": "按钮圆角", "type": "px", "desc": "快捷场景、重置按钮"},
         {"key": "filter_align", "label": "筛选值对齐", "type": "choice", "desc": "下拉框、多选框中显示的值；文字始终垂直居中",
          "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
-    {"key": "section", "label": "章节与结论", "desc": "每节开头的“本节结论”框", "tokens": [
+    {"key": "section", "label": "章节与结论", "desc": "章节面板和节首结论", "tokens": [
+        {"key": "rre-section-pad", "label": "章节内边距", "type": "px"},
+        {"key": "rre-radius-section", "label": "章节与目录圆角", "type": "px"},
+        {"key": "shadow-section", "label": "章节与目录投影", "type": "text"},
+        {"key": "color-bg-summary", "label": "结论框底色", "type": "color"},
         {"key": "rre-summary-tint", "label": "结论框底色深浅", "type": "percent", "desc": "主题色在底色中的比例，越大越深"},
         {"key": "rre-summary-border-tint", "label": "结论框边框深浅", "type": "percent"},
         {"key": "section_align", "label": "章节标题与结论对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
@@ -309,6 +335,9 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "card_title_align", "label": "卡片标题对齐", "type": "choice", "options": [{"value": "left", "label": "左对齐"}, {"value": "center", "label": "居中"}]},
     ]},
     {"key": "kpi", "label": "指标卡", "desc": "主数值、辅助数值行与好坏判定色条", "tokens": [
+        {"key": "rre-kpi-pad", "label": "指标卡内边距", "type": "px"},
+        {"key": "rre-kpi-gap", "label": "指标卡之间的间距", "type": "px"},
+        {"key": "rre-kpi-min-height", "label": "指标卡最小高度", "type": "px"},
         {"key": "rre-card-fact-line", "label": "辅助数值行高", "type": "px"},
         {"key": "rre-card-fact-gap", "label": "辅助数值行距", "type": "px"},
         {"key": "rre-radius-tile", "label": "辅助数值底块圆角", "type": "px"},
@@ -431,9 +460,8 @@ def legacy_items(content: str) -> list[dict]:
 
 def theme_diff(theme: dict, base: dict) -> dict:
     """只保留与继承值不同的设置（规则只存自己覆盖的部分）。"""
-    resolved, _ = resolve(base, theme)
-    keys = {LEGACY_ALIASES.get(str(k).lstrip("-"), str(k).lstrip("-")) for k in (theme or {})}
-    return {k: resolved[k] for k in keys if k in resolved and resolved[k] != base.get(k)}
+    overrides, _ = resolve_overrides(theme)
+    return {k: v for k, v in overrides.items() if v != base.get(k)}
 
 
 def resolve_with_sources(layers: list[tuple[str, str, dict]]) -> tuple[dict, dict]:
@@ -441,13 +469,11 @@ def resolve_with_sources(layers: list[tuple[str, str, dict]]) -> tuple[dict, dic
     来源 level：builtin（内置样式）/ general / scenario / unset（未设置，由智能体决定）。"""
     value, _ = resolve()
     source = {k: {"level": "builtin", "rule": "内置样式"} for k in value}
-    for k in _BASE:
+    for k in KNOWN_KEYS - value.keys():
         source[k] = {"level": "unset", "rule": "未设置（由智能体决定）"}
     for level, rule_name, theme in layers:
-        resolved, _ = resolve(theme)
-        for k in (theme or {}):
-            kk = LEGACY_ALIASES.get(str(k).lstrip("-"), str(k).lstrip("-"))
-            if kk in resolved:
-                value[kk] = resolved[kk]
-                source[kk] = {"level": level, "rule": rule_name}
+        overrides, _ = resolve_overrides(theme)
+        value.update(overrides)
+        for key in overrides:
+            source[key] = {"level": level, "rule": rule_name}
     return value, source

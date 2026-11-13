@@ -532,12 +532,11 @@ def rule_list(request: Request):
 
 @app.get("/api/style-tokens")
 def style_tokens():
-    """样式编辑器元数据：样式分类与中文说明、规则条目类别与示例、内置样式（仅颜色）、生效顺序。
-    suggested 只是编辑器中“设置此项”时的初始值，不是内置样式。"""
+    """样式编辑器元数据：内置主题、样式分类与说明、展示要求类别与生效顺序。"""
     builtin, _ = design.resolve()
     return J({"groups": design.TOKEN_GROUPS, "categories": design.ITEM_CATEGORIES, "defaults": builtin,
               "retired_analysis_categories": design.RETIRED_ANALYSIS_CATEGORIES,
-              "suggested": {k: v for k, v in design._BASE.items() if k != "custom_css"},
+              "suggested": builtin,
               "precedence": design.PRECEDENCE})
 
 

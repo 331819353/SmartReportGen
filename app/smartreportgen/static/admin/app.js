@@ -924,7 +924,7 @@ const Styles = {
             <ul class="rule-items"><li v-for="(it, i) in form.retiredItems" :key="i"><span class="cat">{{meta.retired_analysis_categories[it.category]}}</span>{{it.text}}</li></ul>
           </details>
           <div v-show="tab==='theme'">
-            <p class="small muted" style="margin:0 0 10px">按报告页面的组成部分分类（主题、排版、页面布局、头部、筛选栏、章节与结论、卡片、指标卡、数据配色、图表、表格）。只改需要调整的项；没改的项沿用上一级（{{form.scope==='scenario' ? '通用规则与内置样式' : '内置样式'}}）。内置样式只有颜色（标“内置”）；其余项都没有设置时，由智能体在生成报告时自行决定。</p>
+            <p class="small muted" style="margin:0 0 10px">调整需要覆盖的样式项。其余设置沿用{{form.scope==='scenario' ? '通用规则或内置经营报告样式' : '内置经营报告样式'}}。</p>
             <label class="check small" style="margin-bottom:8px"><input type="checkbox" v-model="advanced"> 显示高级选项</label>
             <TokenGroups v-if="inherited" :meta="meta" :effective="effective" :sources="inherited.sources" :own="form.theme" :readonly="form.readonly" :show-advanced="advanced" @set="setTok" @reset="resetTok"/>
           </div>
@@ -970,7 +970,7 @@ const Styles = {
     const canEdit = r => (admin.value && (r.scope === 'general' || !!meNo())) || (r.scope === 'scenario' && !!meNo() && r.created_by === meNo());
     const ownerText = r => r.created_by ? `${r.creator_name || r.created_by}的样式` : '无归属';
     const grouped = computed(() => {
-      const g = [{ title: '通用规则', sub: admin.value ? '对所有报告生效' : '管理员配置，对所有报告生效（只读）', empty: '暂无通用规则：颜色使用内置样式，其余样式由智能体决定',
+      const g = [{ title: '通用规则', sub: admin.value ? '对所有报告生效' : '管理员配置，对所有报告生效（只读）', empty: '暂无通用规则，当前使用内置经营报告样式',
         rules: list.value.filter(r => r.scope === 'general') }];
       const scs = Array.from(new Set(scenarios.value.concat(list.value.filter(r => r.scope === 'scenario').map(r => r.business_scenario))));
       scs.forEach(sc => g.push({ title: '业务场景：' + sc, sub: admin.value ? '各人的个人样式，只对其本人的报告生效' : '我的样式，只对我生成的报告生效，优先于通用规则',

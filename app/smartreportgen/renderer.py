@@ -42,10 +42,8 @@ def resolve_theme(tpl: Template, dataset_id: int | None = None, owner: str | Non
     规则合并出的指定样式是约束，智能体可以按自己的判断在模板中覆盖。返回 (渲染用完整取值, 提示)。"""
     rules = repo.style_rules_for(_scenario_of(tpl, dataset_id), owner=owner)
     specified = rules["specified"]["theme"]
-    agent, warns = design.resolve(tpl.theme)
+    chosen, warns = design.resolve_overrides(tpl.theme)
     sources = rules["specified"]["theme_sources"]
-    keys = {design.canonical_key(k) for k in tpl.theme or {}}
-    chosen = {k: agent[k] for k in keys if k in agent}
     overridden = sorted(k for k in chosen if k in specified and chosen[k] != specified[k])
     if overridden:
         warns.append("提示：模板 theme 覆盖了指定样式 " + "、".join(f"{k}（原为{sources.get(k, '')}）" for k in overridden)
@@ -113,15 +111,15 @@ def _layout(charts: list[dict]) -> list[tuple[dict, int, int]]:
     for c in charts:
         auto = c.get("span") is None
         items.append({"c": c, "auto": auto, "span": float(c["span"] if not auto else DEFAULT_SPAN.get(c["type"], 6))})
-    # 连续 5~6 个自动宽度的 KPI：主值 36px 在 5 等分时常放不下，按 3 + 2 / 3 + 3 两行排布（不缩小字号）
+    # 参考样式的紧凑指标卡可五等分；六张按三列两行。窄屏由 CSS 重排，显式 span 优先。
     i = 0
     while i < len(items):
         j = i
         while j < len(items) and items[j]["auto"] and items[j]["c"]["type"] == "kpi":
             j += 1
-        if 5 <= j - i <= 6:
-            for k, it in enumerate(items[i:j]):
-                it["span"] = 4.0 if k < 3 else 12 / (j - i - 3)
+        if j - i in (5, 6):
+            for it in items[i:j]:
+                it["span"] = 12 / 5 if j - i == 5 else 4.0
         i = max(j, i + 1)
     rows: list[list[dict]] = []
     cur: list[dict] = []
@@ -152,7 +150,7 @@ def _layout(charts: list[dict]) -> list[tuple[dict, int, int]]:
         heights = []
         for i in row:
             c = i["c"]
-            h = c.get("height") or DEFAULT_HEIGHT.get(c["type"]) or (340 if i["u"] >= 40 else 300)
+            h = c.get("height") or DEFAULT_HEIGHT.get(c["type"]) or 300
             heights.append(h)
         # 同一行非 KPI 图表统一高度，保证卡片对齐
         non_kpi = [h for i, h in zip(row, heights) if i["c"]["type"] != "kpi" and not i["c"].get("height")]
@@ -224,17 +222,19 @@ def _chart_html(c: dict, span: int, height: int, tpl: Template) -> str:
             f'<div class="rf-chart-body"{body_h}></div>{note}</div>')
 
 
-def _items_html(items: list[dict], tpl: Template) -> str:
+def _items_html(items: list[dict], tpl: Template, section_id: str | None = None) -> str:
     parts: list[str] = []
     group: list[dict] = []
 
     def flush() -> None:
         if group:
-            cells = "".join(_chart_html(c, s, h, tpl) for c, s, h in _layout([tpl.charts[g["spec"]["_id"]] for g in group]))
-            parts.append(f'<div class="rf-grid">{cells}</div>')
+            charts = [tpl.charts[g["spec"]["_id"]] for g in group]
+            cells = "".join(_chart_html(c, s, h, tpl) for c, s, h in _layout(charts))
+            grid = "rf-grid rf-grid-kpi" if all(c["type"] == "kpi" for c in charts) else "rf-grid"
+            parts.append(f'<div class="{grid}">{cells}</div>')
             group.clear()
 
-    for it in items:
+    for index, it in enumerate(items, 1):
         if it["kind"] == "chart":
             if it["spec"].get("_id") in tpl.charts:
                 group.append(it)
@@ -243,8 +243,10 @@ def _items_html(items: list[dict], tpl: Template) -> str:
         if it["kind"] == "text":
             parts.append(f'<div class="rf-text">{_md_html(it["md"], tpl)}</div>')
         elif it["kind"] == "finding":
+            # 子结论锚点使用章节与条目位置，避免重名标题生成重复 ID。
+            anchor = f' id="{section_id}-finding-{index}"' if section_id else ""
             parts.append(
-                f'<div class="rf-finding"><h3 class="rf-finding-title">{html.escape(it["title"])}</h3>'
+                f'<div class="rf-finding"{anchor}><h3 class="rf-finding-title">{html.escape(it["title"])}</h3>'
                 f'{_items_html(it["items"], tpl)}</div>'
             )
     flush()
@@ -258,14 +260,19 @@ def _body_html(tpl: Template) -> tuple[str, str]:
         sid = f"sec-{i}"
         summary = ""
         if s["summary"]:
-            summary = (f'<div class="rf-summary"><div class="rf-summary-label">本节结论</div>'
-                       f'<div class="rf-summary-body">{_md_html(s["summary"], tpl)}</div></div>')
+            summary = f'<div class="rf-summary"><div class="rf-summary-body">{_md_html(s["summary"], tpl)}</div></div>'
         title = html.escape(s["title"])
         secs.append(
             f'<section class="rf-section" id="{sid}"><h2 class="rf-section-title">{title}</h2>'
-            f'{summary}{_items_html(s["items"], tpl)}</section>'
+            f'{summary}{_items_html(s["items"], tpl, sid)}</section>'
         )
-        toc.append(f'<a href="#{sid}">{title}</a>')
+        children = "".join(
+            f'<a href="#{sid}-finding-{index}">{html.escape(it["title"])}</a>'
+            for index, it in enumerate(s["items"], 1) if it["kind"] == "finding"
+        )
+        if children:
+            children = f'<div class="rf-toc-children">{children}</div>'
+        toc.append(f'<div class="rf-toc-group"><a class="rf-toc-parent" href="#{sid}">{title}</a>{children}</div>')
     intro = _items_html(tpl.intro, tpl) if tpl.intro else ""
     return (f'<div class="rf-intro">{intro}</div>' if intro else "") + "".join(secs), "".join(toc)
 
@@ -295,12 +302,13 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
         ech = f'<script src="{html.escape(echarts_src or "/static/vendor/echarts.min.js")}"></script>'
     sub = html.escape(meta.get("subtitle") or "")
     goal = html.escape(str(meta.get("analysis_goal") or ""))
-    chips = []
-    if meta.get("scenario"):
-        chips.append(f'<span class="rf-chip">业务场景 · {html.escape(str(meta["scenario"]))}</span>')
-    chips.append(f'<span class="rf-chip">数据时间 · {html.escape(generated_at)}</span>')
+    scenario = html.escape(str(meta.get("scenario") or ""))
     header_cls = "rf-header rf-header-banner" if theme["header_style"] == "banner" else "rf-header rf-header-plain"
-    toc_html = f'<nav class="rf-toc"><div class="rf-toc-title">目录</div>{toc}</nav>' if theme["toc"] and toc else ""
+    toc_html = f'<nav class="rf-toc" aria-label="报告目录"><div class="rf-toc-card"><div class="rf-toc-title">目录</div>{toc}</div></nav>' if theme["toc"] and toc else ""
+    # 筛选沿用同一套联动控件。默认放在封面内，选择吸顶时移到封面下方。
+    sticky = theme["filter_sticky"]
+    filter_cls = "rf-filter-sticky" if sticky else "rf-filter-in-header"
+    filters = f'<div class="rf-filterbar {filter_cls}" id="rf-filterbar" role="region" aria-label="报告筛选"><div class="rf-filterbar-inner"></div></div>'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -312,17 +320,20 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
 {css}
 {theme['custom_css']}</style>
 </head>
-<body class="{' '.join(c for c, on in (('rf-zebra', theme['table_zebra']), ('rf-filter-static', not theme['filter_sticky'])) if on)}">
-<div class="rf-wrap"><header class="{header_cls}">
-  <h1 class="rf-title">{html.escape(tpl.title)}</h1>
-  {f'<p class="rf-subtitle">{sub}</p>' if sub else ''}
-  {f'<p class="rf-goal"><b>分析目标</b>{goal}</p>' if goal else ''}
-  <div class="rf-chips">{''.join(chips)}</div>
-</header></div>
-<div class="rf-filterbar" id="rf-filterbar"><div class="rf-wrap rf-filterbar-inner"></div></div>
+<body class="{'rf-zebra' if theme['table_zebra'] else ''}">
 <div class="rf-wrap rf-layout{' rf-has-toc' if toc_html else ''}">
   {toc_html}
-  <main class="rf-main">{body}</main>
+  <main class="rf-main">
+    <header class="{header_cls}">
+      <h1 class="rf-title">{html.escape(tpl.title)}</h1>
+      {f'<p class="rf-subtitle">{sub}</p>' if sub else ''}
+      {f'<p class="rf-goal"><b>分析目标</b>{goal}</p>' if goal else ''}
+      {f'<div class="rf-chips"><span class="rf-chip">业务场景 · {scenario}</span></div>' if scenario else ''}
+      {filters if not sticky else ''}
+    </header>
+    {filters if sticky else ''}
+    {body}
+  </main>
 </div>
 <footer class="rf-footer"><div class="rf-wrap">由 {html.escape(settings.app_name)} 生成 · {html.escape(generated_at)}</div></footer>
 {ech}
