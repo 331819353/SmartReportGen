@@ -142,12 +142,14 @@ docker compose logs -f api # 首次启动可看到建表、迁移与向量化日
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `QUERY_MAX_ROWS` | 50000 | 单个查询嵌入报告的最大行数（超出截断并告警） |
+| `QUERY_MAX_ROWS` | 50000 | 报告单个查询的最大行数。快照模式超出时返回截断标记，调整查询后再创建快照 |
 | `QUERY_TIMEOUT_SECONDS` | 60 | 数据源查询超时 |
 | `SEED_DEMO` | true | 首次启动是否写入演示数据源、数据集、员工与授权 |
 | `DEMO_READER_PASSWORD` | demo_reader_pwd | 演示只读账号密码 |
 
 修改 `.env` 后执行 `docker compose up -d` 使其生效（会重建对应容器）。
+
+快照查询把 JSON 写入 `/srv/report-work` 对应的私有 Compose 卷 `report-work`。MCP 写入查询快照和预览 HTML，管理 API 只读访问预览文件。工作文件按工号隔离，24 小时后失效，后续写入时清理。每个 JSON 快照上限为 32 MiB。独立部署时可用 `REPORT_WORK_DIR` 指定共享目录。报告保存时完整数据已内联到该版本的 HTML 中。
 
 ## 5. 单点登录与身份
 

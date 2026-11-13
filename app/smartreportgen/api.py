@@ -11,6 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlencode, urlsplit
+from uuid import UUID
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -22,7 +23,7 @@ from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import auth, db, design, embedding, iam, mcp_oauth, permission, repo, seed, services
+from . import auth, db, design, embedding, iam, mcp_oauth, permission, repo, report_data, seed, services
 from .config import settings
 from .connectors import ConnectorError, get_connector
 from .renderer import RenderError, render, standalone, validate
@@ -109,7 +110,8 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     if not principal:
         # 点击报告链接时引导浏览器完成 IAM 登录，程序调用继续收到标准 401。
-        if (authorization is None and request.method == "GET" and re.fullmatch(r"/reports/\d+(/download|/content)?", path)
+        if (authorization is None and request.method == "GET"
+                and re.fullmatch(r"/reports/(?:\d+(?:/download|/content)?|preview/[\da-f-]{36})", path)
                 and "text/html" in request.headers.get("accept", "")):
             target = path + (f"?{request.url.query}" if request.url.query else "")
             return RedirectResponse("/auth/iam/login?next=" + quote(target, safe=""), status_code=302)
@@ -152,7 +154,8 @@ async def _nf(_r, e):
     return JSONResponse({"detail": str(e)}, status_code=404)
 
 
-for _exc in (repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeError, auth.AuthError):
+for _exc in (repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeError, auth.AuthError,
+             report_data.ReportDataError):
     app.add_exception_handler(_exc, lambda _r, e: JSONResponse({"detail": str(e)}, status_code=400))
 
 
@@ -875,6 +878,17 @@ def _report_attachment(content: str, name: str) -> Response:
     # 普通下载和合并下载使用一致的 UTF-8 文件名及隔离策略。
     fname = quote(f"{name}.html", safe="")
     return HTMLResponse(content, headers={**REPORT_HTML_HEADERS, "Content-Disposition": f"attachment; filename*=UTF-8''{fname}"})
+
+
+@app.get("/reports/preview/{ref}", response_class=HTMLResponse)
+def report_preview(request: Request, ref: UUID, download: bool = False):
+    # 预览包含完整数据，必须按已认证工号读取，不能仅凭 URL 访问。
+    content = report_data.read_preview(_p(request).emp_no, ref)
+    if content is None:
+        raise repo.NotFound("预览不存在、已过期或无权访问")
+    if download:
+        return _report_attachment(content, "报告预览")
+    return HTMLResponse(content, headers=REPORT_HTML_HEADERS)
 
 
 @app.get("/reports/{report_id}", response_class=HTMLResponse)

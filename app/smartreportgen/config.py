@@ -34,6 +34,8 @@ class Settings:
         self.public_base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:18600").rstrip("/")
         self.query_max_rows = int(os.getenv("QUERY_MAX_ROWS", "50000"))
         self.query_timeout = int(os.getenv("QUERY_TIMEOUT_SECONDS", "60"))
+        # MCP 写入查询和预览文件，管理 API 读取预览；容器部署时使用同一个私有卷。
+        self.report_work_dir = os.getenv("REPORT_WORK_DIR", "/srv/report-work")
         self.seed_demo = _bool("SEED_DEMO", True)
         # 演示 API 数据源的内部地址（compose 网络内 api 服务）
         self.demo_api_base_url = os.getenv("DEMO_API_BASE_URL", "http://api:8000/demo-api")

@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any
 
-from . import crypto, db
+from . import crypto, db, report_data
 from .auth import Principal
 from .config import settings
 from .connectors import SUPPORTED_TYPES, ConnectorError, drop_connector, get_connector
@@ -703,6 +703,7 @@ def _insert_report_version(c, report_id: int, version: int, base_version: int | 
 
 def save_report(name: str, html: str, template_id: int | None, template_version: int | None, meta: dict,
                 created_by: str | None = None, *, source: dict | None = None) -> dict:
+    html = report_data.embed(html, created_by or "")
     if error := report_document_error(html):
         raise Invalid(error)
     name = _report_name(name)
@@ -782,6 +783,8 @@ def update_report(report_id: int, principal: Principal, name: str, html: str, ba
             base_version = selected["version"] if selected else row["revision"]
         base = _one(c.execute("SELECT * FROM report.report_version WHERE report_id=%s AND version=%s",
                               (report_id, base_version)).fetchone(), "报告版本")
+        # 先确认可编辑的实际基准，再替换临时引用或复用该版本的数据块。
+        html = report_data.embed(html, principal.emp_no, base["html"])
         # 旧报告的已知图表依赖可直接内联。正文原样保存时允许历史快照仅修改名称或说明。
         edited = html != base["html"]
         if rendered is None and not base["meta"].get("single_file"):

@@ -54,9 +54,11 @@ def norm_value(v: Any) -> Any:
     if v is None or isinstance(v, (bool, int, str)):
         return v
     if isinstance(v, float):
-        return None if v != v else v  # NaN -> None
+        return v if math.isfinite(v) else None  # JSON 无法表示 NaN 和无穷大。
     if isinstance(v, decimal.Decimal):
         f = float(v)
+        if not math.isfinite(f):
+            return None
         return int(f) if v == v.to_integral_value() and abs(f) < 2**53 else f
     if isinstance(v, dt.datetime):
         if v.hour == v.minute == v.second == 0 and v.microsecond == 0:

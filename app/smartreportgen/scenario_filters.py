@@ -147,7 +147,7 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         for key in keys:
             scope_tables.setdefault(key, []).append((item, table))
 
-    params, api_tables, oracle_types = {}, [], {}
+    params, source_tables, oracle_types = {}, {}, {}
     marker = f"sr_{uuid4().hex}_"
     replacements = []
     for scope, table in refs:
@@ -160,7 +160,7 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         item, configured = matches[0]
         if allowed is not None and item["table_name"].lower() not in allowed:
             raise PermissionDenied(f"无权访问数据表或视图：{item['table_name']}")
-        api_tables.append(item["table_name"])
+        source_tables[item["table_name"]] = None
         rules = item.get("row_filters")
         if ds_type == "api":
             # DuckDB 在 CTE 定义内也会拦截同名物理表；明确使用内存库的 main Schema。
@@ -202,8 +202,10 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         replacement = exp.select("*").from_(inner).where(*where).subquery(alias=alias.copy())
         replacements.append((scope, table, replacement, _key(configured, dialect)))
 
+    # 使用已校验且去重的物理表名，让 Agent 能核对各条查询实际覆盖的场景表。
+    tables_used = list(source_tables)
     if not replacements and ds_type != "api":
-        return connector.query(sql, limit, tables=list(dict.fromkeys(api_tables)))
+        return {**connector.query(sql, limit, tables=tables_used), "tables_used": tables_used}
 
     for scope, table, _, configured_name in replacements:
         if not table.args.get("alias"):
@@ -230,4 +232,4 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         else:
             fmt = ":%s" if ds_type == "oracle" else "$%s"
         rendered = re.sub(rf"\b{marker}(p\d+)\b", lambda m: fmt % m[1], rendered)
-    return connector.query(rendered, limit, params=params, tables=list(dict.fromkeys(api_tables)))
+    return {**connector.query(rendered, limit, params=params, tables=tables_used), "tables_used": tables_used}

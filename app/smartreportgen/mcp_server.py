@@ -4,10 +4,10 @@
       决定可检索的业务场景与可访问的数据表。数据访问一律默认拒绝。
 工具按智能报告生成流程组织：
   a. search_business_scenarios → get_dataset_tables
-  b. describe_table / run_query
+  b. describe_tables / describe_table / run_query
   d. get_style_rules
   d 与 e 之间. save_report_template → get_report_template
-  e. agent 按已保存的业务模板开发并验证完整 HTML → save_report
+  e. agent 按已保存的业务模板开发 HTML → preview_report_html → save_report
   f. get_report / revise_report
 """
 from __future__ import annotations
@@ -22,12 +22,13 @@ from mcp.server.fastmcp import Context, FastMCP
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
-from . import auth, db, design, mcp_oauth, repo, services
+from . import auth, db, design, mcp_oauth, repo, report_data, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
 from .permission import Access, PermissionDenied, access_for
 from .renderer import RenderError, validate as validate_md
+from .report_document import inline_legacy_echarts, report_document_error
 from .template_parser import TemplateError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -51,12 +52,12 @@ def _skill_body() -> str:
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP（使用海尔 IAM access token；数据按员工工号做表级权限控制）。
 若你所在的 agent 没有加载 smart-report 技能（Skill），请先调用 get_skill_guide 获取完整的生成流程与方法，再按流程执行。推荐流程：
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
-2) 结合用户需求和场景的 analysis_approach，用 describe_table / run_query 验证数据与分析假设，获取供筛选重新计算的聚合数据；
-3) 根据用户需求、场景分析思路和查询证据，决定报告的章节、结论、图表、布局及筛选；
+2) 多表场景先用 describe_tables 列出所有授权表，逐张用 describe_table 和单表汇总查询核实可用指标、粒度、关联键及覆盖范围，记录每张表的指标或无法使用的原因；
+3) 将场景的 analysis_approach 与用户问题逐项映射到指标、来源表、查询和支撑数值。用 tables_used 核对来源，必要时在验证关联关系和粒度后跨表查询。证据不足时写明缺口，依据已核实的数字确定结论，再设计章节、图表及筛选；
 4) get_style_rules(业务场景) 获取视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，未指定的项由你决定；
-5) 将前面步骤整理成业务人员可读的 Markdown 报告模板，包含目标、分析口径、主要证据、章节、筛选和展示规则。用 save_report_template(template_type="business", ...) 保存，并用 get_report_template 读取指定版本。
-6) Agent 直接编写单文件 HTML，内联 CSS、JavaScript、聚合数据与页面资源。在浏览器验证离线打开、筛选联动和结论指标着色后，用 save_report 提交完整文件并关联实际使用的模板 ID 和版本。
-修改已有报告时用 get_report(include_html=true) 读取选中的版本，显式指定的 version 优先。验证修改后的单文件，再把读取的 revision 作为 base_version 传给 revise_report，在同一份报告下保存新版本。
+5) 将逐表指标、分析项与证据的映射、缺口、章节、筛选和展示要求写入业务 Markdown 模板。用 save_report_template(template_type="business", ...) 保存，并用 get_report_template 读取指定版本。
+6) 用 run_query(snapshot=true) 保存各组报告数据，只接收少量样本。Agent 在 HTML 中内联 CSS、JavaScript 与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。用 preview_report_html 展开数据，在浏览器验证后用 save_report 提交相同 HTML 并关联模板版本；服务端内联完整数据，下载仍为离线单文件。
+修改已有报告时用 get_report(include_html=true, omit_snapshot_data=true) 读取选中的版本，显式指定的 version 优先。预览和 revise_report 均传入读取的 revision 作为 base_version，可复用基准版本的数据块。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
 mcp = FastMCP("smartreportgen", instructions=INSTRUCTIONS, stateless_http=True, json_response=True)
@@ -208,6 +209,40 @@ def list_business_scenarios(ctx: Context) -> dict:
 
 # ============================== b. 数据探查 ==============================
 @mcp.tool()
+def describe_tables(dataset_id: int, ctx: Context, table_names: list[str] | None = None,
+                    offset: int = 0, limit: int = 10) -> dict:
+    """批量查看一个业务场景中已授权的表或视图的字段。默认分页列出所有授权表的结构，不返回数据行。
+    可传 table_names 指定一组表。按 next_offset 取下一页，使用 describe_table 查看具体表的样本和画像。"""
+    try:
+        acc = _access(ctx)
+        _require_dataset(acc, dataset_id)
+        ds = repo.get_dataset(dataset_id)
+        scope = {table["table_name"]: table for table in ds["tables"]}
+        names = [name for name in scope if acc.can_table(dataset_id, name)]
+        if table_names is not None:
+            names = list(dict.fromkeys(table_names))
+            for name in names:
+                if name not in scope or not acc.can_table(dataset_id, name):
+                    raise PermissionDenied(f"数据表或视图不在授权的场景范围内：{name}")
+        offset = max(0, offset)
+        stop = offset + max(1, min(limit, 20))
+        tables = []
+        conn = services.get_connector(services.datasource_for_dataset(ds))
+        for name in names[offset:stop]:
+            item = {"table_name": name, "table_description": scope[name]["table_description"]}
+            try:
+                item["columns"] = conn.columns(name)
+            except ConnectorError as exc:
+                # 单表元数据失败时保留错误和其他表的结构，便于定位尚未覆盖的分析。
+                item["columns_error"] = str(exc)
+            tables.append(item)
+        return _ok({"ok": True, "tables": tables, "total": len(names),
+                    "next_offset": stop if stop < len(names) else None})
+    except _EXPECTED as e:
+        return _err(e)
+
+
+@mcp.tool()
 def describe_table(dataset_id: int, table_name: str, ctx: Context, sample_rows: int = 5) -> dict:
     """查看【有权限】的数据表结构与数据情况：字段名/类型/注释、总行数、样本行、列画像（类型、空值率、去重数、最值、高频取值）。"""
     try:
@@ -227,17 +262,31 @@ def describe_table(dataset_id: int, table_name: str, ctx: Context, sample_rows: 
 
 
 @mcp.tool()
-def run_query(dataset_id: int, sql: str, ctx: Context, limit: int = 200) -> dict:
+def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
+              snapshot: bool = False, sample_rows: int = 5) -> dict:
     """在业务场景上执行只读 SQL（单条 SELECT/WITH），只能引用该场景中当前员工有权限的表或视图。
     场景的逐表取值条件由服务端在 JOIN、聚合前自动应用。
-    SQL 方言与数据源类型一致（api 类型数据源使用 DuckDB 方言，表名为接口逻辑名）。结果列名统一转小写。"""
+    SQL 方言与数据源类型一致（API 使用 DuckDB）。返回实际引用的 tables_used，列名统一转小写。
+    普通模式默认返回至多 200 行。snapshot=true 将完整结果保存为 JSON，由报告使用 snapshot_id 引用，
+    MCP 仅返回行数和少量样本（sample_rows 0–20）。快照的默认行数上限由 QUERY_MAX_ROWS 决定。
+    truncated=true 表示超过上限，未创建快照；请调整聚合或分批查询。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
         ds = repo.get_dataset(dataset_id)
         ds_row = services.datasource_for_dataset(ds)
         allowed = None if acc.all else acc.tables.get(dataset_id, set())
-        return _ok({"ok": True, **services.run_query(ds_row, sql, limit, dataset=ds, allowed=allowed)})
+        result = services.run_query(ds_row, sql, limit, dataset=ds, allowed=allowed, snapshot=snapshot)
+        if snapshot:
+            rows = result.pop("rows")
+            if result["truncated"]:
+                # 截断结果不能以快照交付，防止联动指标把不完整的数据当成全量。
+                del result["columns"]
+                result["warning"] = "查询结果超过行数上限，未保存快照。请缩小范围、调整聚合粒度或分批查询。"
+            else:
+                result.update(report_data.save_query(acc.principal.emp_no, result["columns"], rows,
+                                                     max(0, min(sample_rows, 20))))
+        return _ok({"ok": True, **result})
     except _EXPECTED as e:
         return _err(e)
 
@@ -387,9 +436,38 @@ def render_report_html(template_id: int, ctx: Context, report_name: str = "") ->
 
 
 @mcp.tool()
+def preview_report_html(html: str, ctx: Context, report_id: int | None = None,
+                        base_version: int | None = None) -> dict:
+    """展开引用并校验单文件 HTML，返回仅本人可访问的预览及下载链接，响应不包含正文或全量数据。
+    预览修订时传 report_id 和读取到的 base_version，以复用该版本的嵌入数据。"""
+    try:
+        principal = _access(ctx).principal
+        if base_version is not None and report_id is None:
+            raise repo.Invalid("指定基准版本时须同时指定报告 ID")
+        base = None
+        if report_id is not None:
+            base = repo.get_report(report_id, principal, version=base_version)
+            if base["access_level"] not in ("manage", "edit"):
+                raise PermissionDenied("无权编辑该报告")
+        page = report_data.embed(html, principal.emp_no, base["html"] if base else "")
+        if base and not base["meta"].get("single_file"):
+            # 与保存修订版一致，旧版内置 ECharts 引用也可在预览中离线运行。
+            page = inline_legacy_echarts(page)
+        if error := report_document_error(page):
+            raise repo.Invalid(error)
+        ref = report_data.save_preview(principal.emp_no, page)
+        url = f"{settings.public_base_url}/reports/preview/{ref}"
+    except _EXPECTED as e:
+        return _err(e)
+    return _ok({"ok": True, "url": url, "download_url": f"{url}?download=true",
+                "html_bytes": len(page.encode("utf-8")), "expires_in_seconds": report_data.TTL_SECONDS})
+
+
+@mcp.tool()
 def save_report(name: str, html: str, ctx: Context, template_id: int | None = None,
                 template_version: int | None = None) -> dict:
-    """创建独立报告，保存已在浏览器验证的单文件 HTML，内联 CSS、JavaScript 和数据。
+    """创建独立报告，提交经预览验证的 HTML，服务端在保存前将快照引用展开为离线单文件。
+    引用格式：<script type="application/json" id="sales" data-srg-snapshot="快照ID"></script>。
     传 template_id 和 template_version 关联开发时使用的模板版本。修改现有报告时使用 revise_report。"""
     try:
         acc = _access(ctx)
@@ -429,12 +507,15 @@ def list_reports(ctx: Context, keyword: str = "", template_id: int | None = None
 
 @mcp.tool()
 def get_report(report_id: int, ctx: Context, include_html: bool = False, version: int | None = None,
-               include_source: bool = False) -> dict:
+               include_source: bool = False, omit_snapshot_data: bool = False) -> dict:
     """读取可访问的报告。显式 version 优先，省略时读取本账号的当前选择或最新版。
-    include_html 返回该版本的 HTML；include_source 返回有权限读取的版本 Markdown 源码。"""
+    include_html 返回该版本的 HTML；include_source 返回有权限读取的版本 Markdown 源码。
+    同时传 omit_snapshot_data=true 时，快照数据替换为可复用的基准引用，避免把它们读入模型。"""
     try:
         r = repo.get_report(report_id, _access(ctx).principal, with_html=include_html,
                             version=version, with_source=include_source)
+        if include_html and omit_snapshot_data:
+            r["html"] = report_data.for_edit(r["html"])
     except _EXPECTED as e:
         return _err(e)
     return _ok({"ok": True, **r, **repo.report_links(r["id"], r["revision"])})
@@ -464,7 +545,8 @@ def revise_report(report_id: int, name: str, ctx: Context, base_version: int | N
                   html: str | None = None, markdown: str | None = None, change_note: str = "",
                   expected_version: int | None = None) -> dict:
     """从指定基准保存同一报告的新版本。基准省略时使用当前选择或最新版。
-    读取基准后传回其 revision 作为 base_version，并提交已验证的单文件 HTML。markdown 仅供旧结构化报告重渲染。"""
+    读取基准后传回其 revision 作为 base_version。HTML 可包含新快照引用和基准数据块引用。
+    markdown 仅供旧结构化报告重渲染。"""
     try:
         acc = _access(ctx)
         r = services.revise_report(report_id, acc.principal, name, base_version=base_version,

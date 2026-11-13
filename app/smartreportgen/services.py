@@ -66,9 +66,12 @@ def describe_table(ds_row: dict, table: str, sample_rows: int = 5, profile_rows:
     return out
 
 
-def run_query(ds_row: dict, sql: str, limit: int = 200,
-              *, dataset: dict | None = None, allowed: set[str] | None = None) -> dict:
-    limit = max(1, min(int(limit or 200), 5000))
+def run_query(ds_row: dict, sql: str, limit: int | None = None,
+              *, dataset: dict | None = None, allowed: set[str] | None = None,
+              snapshot: bool = False) -> dict:
+    # 快照模式的行数上限适用于文件；普通查询继续使用原来的小结果集上限。
+    max_rows = max(1, settings.query_max_rows) if snapshot else 5000
+    limit = max(1, min(int(limit or (max_rows if snapshot else 200)), max_rows))
     conn = get_connector(ds_row)
     res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed) if dataset else conn.query(sql, limit)
     return {"datasource": ds_row["name"], "dialect": ds_row["type"], **res, "row_count": len(res["rows"])}

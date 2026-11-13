@@ -11,8 +11,8 @@
 2. 所有数据访问只通过 MCP 服务 **smartreportgen**（`http://localhost:18600/mcp`）。
    Codex CLI 可通过 `codex mcp login smartreportgen` 登录海尔 IAM 并自动携带 IAM access token。使用 Bearer 配置的客户端可传入 海尔 IAM access token。
    不要直连数据库，不要编造数据；遇到 `permission_denied` 不要尝试绕过，应告知用户申请权限。
-3. 整理分析、数据证据、筛选和样式，调用 `save_report_template(template_type="business", ...)` 保存面向业务的 Markdown 模板，再用 `get_report_template` 读取指定版本。Agent 直接编写单文件 HTML，内联 CSS、JavaScript、聚合数据及页面资源。在浏览器验证离线打开、筛选联动和结论指标着色后，用 `save_report` 提交完整文档，关联实际使用的模板 ID 和版本。
-4. 修改已有报告时，用 `get_report(include_html=true)` 读取用户选中的版本。用户明确指定版本时传入 `version`，没有选择时默认读取最新版。验证修改后的单文件，将读取的 `revision` 作为 `base_version` 传给 `revise_report`，在同一报告下追加新版本。维护已有结构化模板时可调用 `get_template_spec`。
+3. 多表场景先逐表探查和查询，核实每张表可用的指标、粒度及覆盖范围，再逐项将场景分析思路映射到指标、来源表、查询和支撑数值。用 `run_query` 的 `tables_used` 复核来源。业务 Markdown 模板必须记录逐表指标、各分析项的证据和缺口，以及筛选和样式。调用 `save_report_template(template_type="business", ...)` 保存，并通过 `get_report_template` 读取指定版本。用 `run_query(snapshot=true)` 获取各组报告数据的快照 ID。Agent 编写内联 CSS、JavaScript 与页面资源的 HTML，每组数据使用一个快照引用。通过 `preview_report_html` 下载展开后的 HTML，验证离线打开、筛选和着色后用 `save_report` 提交含引用的文档并关联模板版本，服务端保存展开的单文件。
+4. 修改已有报告时，用 `get_report(include_html=true, omit_snapshot_data=true)` 读取用户选中的版本。用户明确指定版本时传入 `version`，没有选择时默认读取最新版。预览和 `revise_report` 均使用读取的 `revision` 作为 `base_version`，以便复用原数据并在同一报告下追加版本。维护已有结构化模板时可调用 `get_template_spec`。
 
 各 agent 的 MCP 接入方式见 `docs/DEPLOYMENT.md` 的「接入 Agent」一节。管理台 HTTP 接入见 `docs/HTTP_API.md`。
 

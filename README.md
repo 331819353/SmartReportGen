@@ -7,18 +7,20 @@
               │  Authorization: Bearer <海尔 IAM access token>
               ▼ MCP（smartreportgen，Streamable HTTP）── 工号 → 权限表 → 可用业务场景/数据表（默认拒绝）
    a 混合检索业务场景 → 获取数据表      search_business_scenarios / get_dataset_tables
-   b 探查并获取授权数据                  describe_table / run_query
+   b 探查各表并获取证据与数据快照          describe_tables / describe_table / run_query
    c 全局筛选（级联 / 预设 / 图表点击联动）
    d 通用规则（设计令牌）+ 场景规则        get_style_rules
    d 与 e 之间 整理并保存业务 Markdown 模板  save_report_template / get_report_template
-   e Agent 编写单文件 HTML，验证筛选联动和结论着色  save_report（关联模板版本）
+   e Agent 编写引用快照的 HTML，预览验证后保存     preview_report_html / save_report（关联模板版本）
    f 查看或修订报告                     get_report / revise_report
               │
               ▼
    PostgreSQL + pgvector（按类型分 schema）  ◄──  管理台（数据源 / 数据集 / 报告模板 / 报告 / 样式规则 / 员工与授权）
 ```
 
-新报告把 CSS、JavaScript、聚合数据与页面资源内联到一个 `.html` 文件。验证离线打开和交互后保存。修改已有报告时，Agent 读取用户选中或明确指定的版本，把读取到的 `revision` 传给 `revise_report` 作为 `base_version`。
+`run_query(snapshot=true)` 把查询结果保存为服务端 JSON，只返回快照 ID、行数、来源表与少量样本。Agent 在 HTML 中用独立的 `<script type="application/json" id="sales" data-srg-snapshot="快照ID"></script>` 引用每组数据。预览和保存时，服务端将 JSON 内联到 `.html` 文件，下载后即可离线打开。修改快照报告时，Agent 可通过 `get_report(include_html=true, omit_snapshot_data=true)` 取得含基准引用的正文，把读取到的 `revision` 传给 `revise_report` 作为 `base_version`。
+
+多表场景先逐表核实可用指标和覆盖范围，再将分析思路逐项映射到指标、来源表、查询和支撑数值。业务模板记录证据缺口和每张表的用途。
 
 ## 快速开始
 

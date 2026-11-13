@@ -13,7 +13,7 @@ COPY app/smartreportgen ./smartreportgen
 COPY skills/smart-report ./smartreportgen/docs/skill
 COPY docs/HTTP_API.md ./smartreportgen/docs/HTTP_API.md
 
-RUN useradd -r -u 10001 -m app && chown -R app /srv
+RUN useradd -r -u 10001 -m app && mkdir -m 700 /srv/report-work && chown -R app /srv
 USER app
 # jieba 词典缓存预热（写入用户临时目录）
 RUN python -c "import jieba; jieba.initialize()"

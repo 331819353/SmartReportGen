@@ -56,6 +56,8 @@ services:
     image: smartreportgen:latest
     restart: unless-stopped
     environment: *app-env
+    volumes:
+      - report-work:/srv/report-work:ro
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       postgres: { condition: service_healthy }
@@ -73,6 +75,8 @@ services:
     environment:
       <<: *app-env
       MCP_PORT: "8001"
+    volumes:
+      - report-work:/srv/report-work
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       api: { condition: service_healthy }
@@ -101,3 +105,4 @@ services:
 
 volumes:
   pgdata:
+  report-work:
