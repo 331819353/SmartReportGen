@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>结论指标着色示例</title>
+  <title>报告默认布局与指标着色示例</title>
   <style>
     :root {
       font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -11,9 +11,39 @@
       background: #f5f7fa;
       --positive: #047857;
       --negative: #b91c1c;
+      --report-width: 1240px;
+      --page-pad: 14px;
+      --toc-width: 188px;
+      --toc-gap: 16px;
+      --section-gap: 14px;
     }
-    main { max-width: 48rem; margin: 3rem auto; padding: 0 1rem; }
-    h1 { font-size: 1.75rem; }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; container: report-viewport / inline-size; }
+    /* 标题背景和正文放在同一居中容器内，左右边缘始终对齐。 */
+    .report-layout { width: min(var(--report-width), calc(100% - 2 * var(--page-pad))); margin: var(--page-pad) auto 2rem; }
+    .report-title {
+      margin-block-end: var(--section-gap); padding: 24px; border-radius: 16px;
+      background: linear-gradient(120deg, #0b2641, #174a7c, #0f766e); color: white;
+    }
+    h1 { margin: 0; font-size: 1.75rem; }
+    .report-title p { margin: .5rem 0 0; }
+    main { min-width: 0; }
+    /* 窄屏的目录在标题下方，目录过长时在自身内部滚动。 */
+    .report-toc { margin-block-end: var(--section-gap); padding: 10px; border-radius: 10px; background: white; max-height: min(180px, 32dvh); overflow: auto; }
+    .report-toc a { display: block; padding: 6px 8px; color: #1e3a8a; }
+    /* 按实际可用宽度切换：1240 + 2 × (14 + 188 + 16) = 1676px。零宽轨道让目录向左伸入留白。 */
+    @media screen {
+      @container report-viewport (min-width: 1676px) {
+        .report-layout { display: grid; grid-template-columns: 0 minmax(0, 1fr); align-items: start; }
+        .report-title { grid-column: 2; grid-row: 1; }
+        main { grid-column: 2; grid-row: 2; }
+        .report-toc {
+          grid-column: 1; grid-row: 2; justify-self: end; width: var(--toc-width);
+          position: sticky; top: var(--page-pad); margin: 0; margin-inline-end: var(--toc-gap);
+          max-height: calc(100dvh - 2 * var(--page-pad));
+        }
+      }
+    }
     h2 { font-size: 1.2rem; }
     p { line-height: 1.65; }
     form { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; }
@@ -30,9 +60,17 @@
   </style>
 </head>
 <body>
-  <main>
+<div class="report-layout">
+  <header class="report-title">
     <h1>结论指标着色示例</h1>
     <p>示例数据。切换大区可查看同比和目标达成率的变化，达标阈值为 100%。</p>
+  </header>
+  <nav class="report-toc" aria-label="报告目录">
+    <strong>目录</strong>
+    <a href="#summary-title">销售结论</a>
+    <a href="#evidence-title">筛选后的数据</a>
+  </nav>
+  <main>
     <form id="filters">
       <label for="region">大区</label>
       <select id="region" name="region">
@@ -62,6 +100,7 @@
       </section>
     </div>
   </main>
+</div>
   <script type="application/json" id="report-data">
     [
       {"region":"华东","current":120,"prior":100,"target":110},

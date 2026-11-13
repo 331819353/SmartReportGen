@@ -1,11 +1,3 @@
 {
-  "mcpServers": {
-    "smartreportgen": {
-      "type": "http",
-      "url": "http://localhost:18600/mcp",
-      "headers": {
-        "Authorization": "Bearer ${SMARTREPORT_TOKEN}"
-      }
-    }
-  }
+  "mcpServers": {}
 }

@@ -12,12 +12,13 @@ async function api(path, opts = {}) {
   const init = { method: opts.method || 'GET', headers: {}, credentials: 'same-origin' };
   if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
   const r = await fetch(path, init);
+  if (r.ok && opts.download) return r.blob();
   const ct = r.headers.get('content-type') || '';
   const data = ct.includes('json') ? await r.json() : await r.text();
   if (!r.ok) {
     const msg = (data && data.detail) ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : String(data).slice(0, 300);
     if (r.status === 401 && !path.startsWith('/api/auth/')) state.needLogin = true;
-    throw new Error(msg);
+    throw Object.assign(new Error(msg), { status: r.status });
   }
   return data;
 }
@@ -29,11 +30,12 @@ const isAdmin = () => !!(state.me && state.me.is_admin);
 const creator = x => x.created_by ? `${x.creator_name || ''}${x.creator_name ? '（' + x.created_by + '）' : x.created_by}` : '系统';
 const fmtSize = n => n == null ? '' : n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : (n / 1024).toFixed(0) + ' KB';
 const DS_LABEL = { mysql: 'MySQL', postgresql: 'PostgreSQL', oracle: 'Oracle', starrocks: 'StarRocks', api: 'HTTP API' };
+const OBJECT_LABEL = { table: '表', view: '视图', materialized_view: '物化视图' };
 const DEFAULT_PORT = { mysql: 3306, postgresql: 5432, oracle: 1521, starrocks: 9030 };
 function jsonOrThrow(txt, what) {
   if (!txt || !txt.trim()) return {};
-  try { const v = JSON.parse(txt); if (typeof v !== 'object' || Array.isArray(v)) throw 0; return v; }
-  catch (e) { throw new Error(what + ' 不是合法的 JSON 对象'); }
+  try { const v = JSON.parse(txt); if (!v || typeof v !== 'object' || Array.isArray(v)) throw 0; return v; }
+  catch (e) { throw new Error(`${what}须为 JSON 对象，键名和字符串请使用英文双引号。`); }
 }
 const pretty = v => JSON.stringify(v || {}, null, 2);
 
@@ -44,6 +46,8 @@ window.addEventListener('hashchange', () => { state.page = location.hash.slice(1
 const reportDraft = ref(null);
 const reportRevision = ref(0);
 function startReport(template = null) { reportDraft.value = { template }; }
+const reportPath = r => '/reports/' + r.id;
+const reportVersionPath = (r, action = '') => reportPath(r) + action + '?version=' + r.revision;
 
 function matches(kw, ...fields) {
   const term = kw.trim().toLocaleLowerCase();
@@ -134,7 +138,7 @@ const Home = {
         </div>
         <ul v-else class="recent-list">
           <li v-for="r in list.slice(0,5)" :key="r.id">
-            <a :href="'/reports/'+r.id" target="_blank" rel="noopener">
+            <a :href="reportPath(r)" target="_blank" rel="noopener">
               <span class="resource-icon" v-html="icon('rep')"></span>
               <span class="recent-info"><b>{{r.name}}</b><small v-if="r.template_name && r.template_name !== r.name">{{r.template_name}}</small></span>
               <time :datetime="r.created_at">{{fmtTime(r.created_at)}}</time>
@@ -158,7 +162,8 @@ const Home = {
       { page: 'perms', label: '员工与授权', icon: 'perm', description: '维护员工和数据访问权限', visible: admin.value },
       { page: 'mine', label: '我的权限与接入', icon: 'key', description: '查看个人权限和接入指引', visible: canVisitMine() }
     ].filter(entry => entry.visible !== false));
-    return { ...reports, admin, entries, fmtTime, icon };
+    watch(reportRevision, reports.load);
+    return { ...reports, admin, entries, fmtTime, icon, reportPath };
   }
 };
 
@@ -178,11 +183,11 @@ const GenerateReport = {
       </details>
     </div>
     <form v-else id="generate-report-form" @submit.prevent="generate">
-      <p class="form-intro">报告会按生成时的数据保存，可在报告库中查看或下载。</p>
+      <p class="form-intro">选择可在管理台运行的结构化模板。业务模板可交给已接入的 AI 助手开发报告。</p>
       <div class="collection-state" v-if="loading" role="status">正在加载模板…</div>
       <div class="msg err" v-else-if="loadError" role="alert">模板加载失败。<button class="link" type="button" @click="load">重试</button></div>
       <div class="collection-state" v-else-if="!list.length">
-        还没有可用模板。先创建模板，或通过已接入的 AI 助手提交分析需求。
+        还没有可运行的结构化模板。
         <div class="actions"><a class="btn" href="#templates" @click="$emit('close')">前往报告模板</a></div>
       </div>
       <template v-else>
@@ -208,7 +213,10 @@ const GenerateReport = {
     </template>
   </Drawer>`,
   setup(props) {
-    const { list, loading, loadError, load } = useCollection('/api/templates', props.template ? [props.template] : []);
+    const templates = useCollection('/api/templates', props.template ? [props.template] : []);
+    const { loading, loadError, load } = templates;
+    // 此入口直接调用服务端渲染，只展示支持该流程的模板。
+    const list = computed(() => templates.list.value.filter(t => t.template_type !== 'business'));
     const selectedId = ref(props.template?.id ?? null), name = ref(''), busy = ref(false), error = ref(''), result = ref(null);
     const selected = computed(() => list.value.find(t => t.id === selectedId.value));
     watch(selectedId, () => { error.value = ''; });
@@ -229,7 +237,7 @@ const GenerateReport = {
 // ------------------------------------------------------------ 数据源
 function emptyDs() {
   return { id: null, name: '', type: 'mysql', description: '', enabled: true, secret: '', has_secret: false,
-    host: '', port: '', database: '', username: '', service_name: '', sid: '', base_url: '', records_path: '',
+    host: '', port: '', database: '', username: '', service_name: '', sid: '', schema: '', base_url: '', records_path: '',
     auth_header: 'Authorization', auth_scheme: 'Bearer', headersTxt: '{}', endpointsTxt: '{}', extraTxt: '{}' };
 }
 const DB_KEYS = ['host', 'port', 'database', 'username', 'service_name', 'sid'];
@@ -238,6 +246,8 @@ function dsToForm(d) {
   const f = emptyDs(), cfg = { ...(d.config || {}) };
   Object.assign(f, { id: d.id, name: d.name, type: d.type, description: d.description, enabled: d.enabled, has_secret: d.has_secret });
   [...DB_KEYS, ...API_KEYS].forEach(k => { if (cfg[k] != null) { f[k] = cfg[k]; delete cfg[k]; } });
+  // 已保存在高级配置中的 Oracle Schema 自动回填到独立输入框。
+  if (d.type === 'oracle') { f.schema = cfg.schema || ''; delete cfg.schema; }
   f.headersTxt = pretty(cfg.headers); delete cfg.headers;
   f.endpointsTxt = pretty(cfg.endpoints); delete cfg.endpoints;
   f.extraTxt = pretty(cfg);
@@ -251,6 +261,8 @@ function formToDs(f) {
     cfg.endpoints = jsonOrThrow(f.endpointsTxt, '接口定义');
   } else {
     DB_KEYS.forEach(k => { if (f[k] !== '' && f[k] != null) cfg[k] = k === 'port' ? Number(f[k]) : f[k]; });
+    // 专用字段优先，留空时仍允许通过旧的高级配置方式填写。
+    if (f.type === 'oracle' && f.schema) cfg.schema = f.schema;
   }
   const body = { name: f.name, type: f.type, description: f.description, enabled: f.enabled, config: cfg };
   if (f.secret) body.secret = f.secret;
@@ -259,13 +271,15 @@ function formToDs(f) {
 const DsBrowser = {
   components: { Drawer, DataTable }, props: ['ds'], emits: ['close'],
   template: `<Drawer :title="'浏览：' + ds.name" wide @close="$emit('close')">
-    <div class="subtabs"><button :class="{on:tab==='tables'}" @click="tab='tables'">数据表</button><button :class="{on:tab==='sql'}" @click="tab='sql'">SQL 查询</button></div>
-    <div v-if="tab==='tables'" style="display:grid;grid-template-columns:260px 1fr;gap:16px">
-      <div><input class="in" v-model="kw" placeholder="筛选表名…" style="margin-bottom:8px">
-        <div style="max-height:62vh;overflow:auto">
-          <div v-for="t in shown" class="hit" style="padding:8px 10px;cursor:pointer;margin-bottom:6px" :style="cur===t.name?'border-color:var(--primary)':''" @click="open(t.name)">
-            <div class="mono">{{t.name}}</div><div class="small muted" v-if="t.comment">{{t.comment}}</div></div>
-          <div v-if="!tables.length" class="muted small">{{loading ? '加载中…' : '无数据表'}}</div></div></div>
+    <div class="subtabs"><button :class="{on:tab==='tables'}" @click="tab='tables'">表和视图</button><button :class="{on:tab==='sql'}" @click="tab='sql'">SQL 查询</button></div>
+    <div v-if="tab==='tables'" class="source-browser">
+      <div><input class="in" v-model="kw" type="search" aria-label="搜索表或视图" placeholder="搜索表或视图">
+        <div class="source-object-list" :aria-busy="loading">
+          <button v-for="t in shown" :key="t.name" type="button" class="hit source-object" :aria-pressed="cur===t.name" @click="open(t.name)">
+            <span class="source-object-name"><span class="mono">{{t.name}}</span><span class="badge">{{OBJECT_LABEL[t.kind] || '表'}}</span></span>
+            <span class="small muted" v-if="t.comment">{{t.comment}}</span>
+          </button>
+          <div v-if="!shown.length" class="muted small" role="status">{{loading ? '正在加载…' : kw ? '没有匹配的表或视图' : '无可浏览的表或视图'}}</div></div></div>
       <div v-if="desc">
         <div class="actions" style="margin-bottom:10px"><b class="mono">{{desc.table}}</b><span class="badge">行数 {{desc.row_count ?? '未知'}}</span><span class="small muted">{{desc.profile_basis}}</span></div>
         <h4 style="margin:6px 0">字段画像</h4>
@@ -275,7 +289,7 @@ const DsBrowser = {
           <td class="small">{{p.min!=null ? p.min+' ~ '+p.max : ''}}{{p.top_values ? p.top_values.slice(0,5).map(x=>x.value).join('、') : ''}}</td></tr></tbody></table></div>
         <h4 style="margin:14px 0 6px">样本数据</h4><DataTable :columns="desc.sample_columns" :rows="desc.sample_rows" :max="260"/>
       </div>
-      <div v-else class="empty">选择左侧数据表查看结构与数据画像</div>
+      <div v-else class="empty">选择表或视图，查看字段和数据画像</div>
     </div>
     <div v-else>
       <textarea class="in code" v-model="sql" rows="8" placeholder="SELECT ..."></textarea>
@@ -287,16 +301,21 @@ const DsBrowser = {
   setup(props) {
     const tab = ref('tables'), tables = ref([]), kw = ref(''), desc = ref(null), cur = ref(''), loading = ref(false);
     const sql = ref(''), res = ref(null);
-    const shown = computed(() => tables.value.filter(t => !kw.value || t.name.toLowerCase().includes(kw.value.toLowerCase())));
+    const shown = computed(() => tables.value.filter(t => matches(kw.value, t.name, t.comment, OBJECT_LABEL[t.kind])));
     const profileRows = computed(() => {
       if (!desc.value) return [];
       const types = Object.fromEntries((desc.value.columns || []).map(c => [c.name, c]));
       return desc.value.profile.map(p => ({ ...p, type: (types[p.column] || {}).type || '', comment: p.comment || (types[p.column] || {}).comment || '' }));
     });
     onMounted(async () => { loading.value = true; try { tables.value = await run(() => api(`/api/datasources/${props.ds.id}/tables`)); } finally { loading.value = false; } });
-    async function open(name) { cur.value = name; desc.value = null; desc.value = await run(() => api(`/api/datasources/${props.ds.id}/describe?table=${encodeURIComponent(name)}&sample_rows=8`)); if (!sql.value) sql.value = `SELECT * FROM ${name}`; }
+    async function open(name) {
+      cur.value = name; desc.value = null;
+      const data = await run(() => api(`/api/datasources/${props.ds.id}/describe?table=${encodeURIComponent(name)}&sample_rows=8`));
+      // 快速切换时，较晚返回的旧画像不能覆盖当前选择。
+      if (cur.value === name) { desc.value = data; if (!sql.value) sql.value = `SELECT * FROM ${name}`; }
+    }
     async function query() { loading.value = true; try { res.value = await run(() => api(`/api/datasources/${props.ds.id}/query`, { method: 'POST', body: { sql: sql.value, limit: 500 } })); } finally { loading.value = false; } }
-    return { tab, tables, kw, shown, desc, cur, open, loading, sql, res, query, profileRows };
+    return { tab, kw, shown, desc, cur, open, loading, sql, res, query, profileRows, OBJECT_LABEL };
   }
 };
 const Datasources = {
@@ -319,10 +338,16 @@ const Datasources = {
           <div class="field"><label>端口</label><input class="in" v-model="form.port" :placeholder="String(DEFAULT_PORT[form.type])"></div>
           <div class="field" v-if="form.type!=='oracle'"><label>数据库</label><input class="in" v-model="form.database"></div>
           <div class="field" v-else><label>服务名 <small>或 SID</small></label><input class="in" v-model="form.service_name" placeholder="ORCLPDB1"></div></div>
-        <div class="row2" v-if="form.type==='oracle'"><div class="field"><label>SID <small>未填服务名时使用</small></label><input class="in" v-model="form.sid"></div><div></div></div>
+        <div class="row2" v-if="form.type==='oracle'">
+          <div class="field"><label>SID <small>未填服务名时使用</small></label><input class="in" v-model="form.sid"></div>
+          <div class="field"><label for="oracle-schema">Schema <small>选填</small></label>
+            <input id="oracle-schema" class="in" v-model.trim="form.schema" aria-describedby="oracle-schema-hint">
+            <div id="oracle-schema-hint" class="hint">留空时使用登录用户的默认 Schema。</div></div>
+        </div>
         <div class="row2"><div class="field"><label>用户名</label><input class="in" v-model="form.username"></div>
           <div class="field"><label>密码</label><input class="in" type="password" v-model="form.secret" :placeholder="form.has_secret?'已设置，留空则不修改':''" autocomplete="new-password"></div></div>
-        <div class="field"><label>高级配置 <small>JSON：charset / sslmode / search_path / schema 等</small></label><textarea class="in code" v-model="form.extraTxt" rows="3"></textarea></div>
+        <div class="field"><label for="datasource-extra">高级配置 <small>选填，JSON</small></label>
+          <textarea id="datasource-extra" class="in code" v-model="form.extraTxt" rows="3"></textarea></div>
       </template>
       <template v-else>
         <div class="field"><label>Base URL</label><input class="in" v-model="form.base_url" placeholder="https://api.example.com/v1"></div>
@@ -338,7 +363,7 @@ const Datasources = {
       </template>
       <div class="field"><label>描述</label><textarea class="in" v-model="form.description" rows="2"></textarea></div>
       <label class="check"><input type="checkbox" v-model="form.enabled"> 启用</label>
-      <div class="msg" :class="testRes.ok?'ok':'err'" v-if="testRes" style="margin-top:12px">{{testRes.text}}</div>
+      <div class="msg" :class="testRes.ok?'ok':'err'" :role="testRes.ok?'status':'alert'" v-if="testRes" style="margin-top:12px">{{testRes.text}}</div>
       <template #foot><button class="btn" @click="testForm" :disabled="busy">测试连接</button><span class="spacer"></span>
         <button class="btn" @click="form=null">取消</button><button class="btn primary" @click="save" :disabled="busy">保存</button></template>
     </Drawer>
@@ -352,13 +377,14 @@ const Datasources = {
     const addr = d => !d.config ? '' : d.type === 'api' ? (d.config.base_url || '') : `${d.config.host || ''}:${d.config.port || DEFAULT_PORT[d.type]}/${d.config.database || d.config.service_name || d.config.sid || ''}`;
     function edit(d) { testRes.value = null; form.value = d ? dsToForm(d) : emptyDs(); }
     async function save() {
-      busy.value = true;
+      busy.value = true; testRes.value = null;
       try {
-        const body = run(() => formToDs(form.value));
-        const b = await body;
-        await run(() => form.value.id ? api(`/api/datasources/${form.value.id}`, { method: 'PUT', body: b }) : api('/api/datasources', { method: 'POST', body: b }), '已保存');
+        const body = formToDs(form.value);
+        const id = form.value.id;
+        await api(id ? `/api/datasources/${id}` : '/api/datasources', { method: id ? 'PUT' : 'POST', body });
+        toast('已保存', 'ok');
         form.value = null; load();
-      } finally { busy.value = false; }
+      } catch (e) { testRes.value = { ok: false, text: e.message }; } finally { busy.value = false; }
     }
     async function testForm() {
       busy.value = true; testRes.value = null;
@@ -375,6 +401,16 @@ const Datasources = {
 };
 
 // ------------------------------------------------------------ 数据集
+let sceneTableKey = 0;
+function sceneTableDraft(table = {}) {
+  return { table_name: '', table_description: '', ...table, key: ++sceneTableKey, expanded: false,
+    columns: null, loadingColumns: false, columnError: '', row_filters: (table.row_filters || []).map(rule => ({
+      column: rule.column, values: rule.values, input: rule.values.filter(v => v !== null).join('\n'),
+      includeNull: rule.values.includes(null)
+    })) };
+}
+const filterValueLabel = value => value === null ? 'NULL（空值）' : value === '' ? '空字符串' : String(value);
+
 const Datasets = {
   components: { Drawer },
   template: `<div>
@@ -430,54 +466,103 @@ const Datasets = {
         <dt>分析思路</dt><dd class="business-copy">{{detail.analysis_approach || '暂未填写'}}</dd>
         <dt>标签</dt><dd>{{(detail.tags||[]).join('、') || '-'}}</dd>
         <dt>数据源</dt><dd>{{detail.datasource_name}}（{{DS_LABEL[detail.datasource_type]}}）</dd></dl>
-      <h4 style="margin:16px 0 8px">数据表 <small class="muted" v-if="!admin">（仅显示你有权限的表）</small></h4>
-      <table class="tbl card"><thead><tr><th scope="col">数据表名</th><th scope="col">数据表描述</th></tr></thead>
-        <tbody><tr v-for="t in detail.tables"><td class="mono">{{t.table_name}}</td><td>{{t.table_description}}</td></tr>
-        <tr v-if="!detail.tables.length"><td colspan="2" class="empty">无</td></tr></tbody></table>
+      <h4 style="margin:16px 0 8px">表和视图 <small class="muted" v-if="!admin">（仅显示你有权限的对象）</small></h4>
+      <div class="scroll-x"><table class="tbl card"><thead><tr><th scope="col">名称</th><th scope="col">描述</th><th scope="col">取值范围</th></tr></thead>
+        <tbody><tr v-for="t in detail.tables" :key="t.id"><td class="mono">{{t.table_name}}</td><td>{{t.table_description}}</td><td>
+          <div v-for="r in t.row_filters" :key="r.column" class="scene-filter-summary"><b>{{r.column}}</b>：{{r.values.map(filterValueLabel).join('、')}}</div>
+          <span v-if="!t.row_filters?.length" class="muted">不限制</span></td></tr>
+        <tr v-if="!detail.tables.length"><td colspan="3" class="empty">无</td></tr></tbody></table></div>
     </Drawer>
-    <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide @close="form=null">
+    <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide :busy="busy" @close="form=null">
       <div class="row2"><div class="field"><label>业务场景</label><input class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
-        <div class="field"><label>数据源</label><select class="in" v-model="form.datasource_id"><option :value="null" disabled>请选择</option><option v-for="s in sources" :value="s.id">{{s.name}}（{{DS_LABEL[s.type]}}）</option></select></div></div>
+        <div class="field"><label for="scene-source">数据源</label><select id="scene-source" class="in" v-model="form.datasource_id" @change="changeSource"><option :value="null" disabled>请选择</option><option v-for="s in sources" :value="s.id">{{s.name}}（{{DS_LABEL[s.type]}}）</option></select></div></div>
       <div class="field"><label for="scene-description">业务描述 <small>说明数据范围、指标及适用的分析问题</small></label><textarea id="scene-description" class="in" v-model="form.business_description" rows="4"></textarea></div>
       <div class="field"><label for="scene-approach">分析思路 <small>选填</small></label>
         <p class="field-help" id="scene-approach-help">说明先看什么、怎么比较、需要验证哪些假设。也可补充报告应回答的问题、适合的图表和需要切换的筛选条件。</p>
         <textarea id="scene-approach" class="in" v-model="form.analysis_approach" rows="4" aria-describedby="scene-approach-help" placeholder="例如：先比较各渠道的销售增速，再找出毛利下降的主要品类，核对促销前后的变化。"></textarea></div>
       <div class="field"><label>标签 <small>用逗号分隔，帮助同事查找场景</small></label><input class="in" v-model="form.tagsTxt"></div>
-      <div class="field"><label>数据表 <small>{{form.tables.length}} 张</small></label>
-        <table class="tbl tbl-editor card"><thead><tr><th style="width:36%">数据表名</th><th>数据表描述</th><th style="width:60px"></th></tr></thead>
-          <tbody><tr v-for="(t,i) in form.tables"><td><input class="in mono" v-model="t.table_name" placeholder="schema.table"></td>
-            <td><input class="in" v-model="t.table_description"></td><td><button class="link danger" @click="form.tables.splice(i,1)">移除</button></td></tr></tbody></table>
-        <div class="actions" style="margin-top:8px"><button class="btn sm" @click="form.tables.push({table_name:'',table_description:''})">+ 手动添加</button>
+      <section class="field" aria-labelledby="scene-tables-label"><h3 id="scene-tables-label" class="scene-tables-label">表和视图 <small class="muted">{{form.tables.length}} 项</small></h3>
+        <p class="field-help">按需设置各表的取值范围。场景取数时自动应用这些条件。</p>
+        <div v-for="(t,i) in form.tables" :key="t.key" class="scene-table-entry">
+          <div class="scene-table-fields">
+            <label>名称 <input class="in mono" v-model.trim="t.table_name" placeholder="schema.table" @change="changeTable(t)"></label>
+            <label>描述 <input class="in" v-model="t.table_description"></label>
+            <button class="link danger" type="button" @click="form.tables.splice(i,1)" :aria-label="'移除 ' + (t.table_name || '第 ' + (i+1) + ' 项')">移除</button>
+          </div>
+          <button class="link scene-filter-toggle" type="button" :aria-expanded="t.expanded" :aria-controls="'scene-filters-' + t.key"
+            :disabled="!form.datasource_id || !t.table_name" @click="toggleFilters(t)">数据过滤 · {{t.row_filters.length ? t.row_filters.length + ' 个字段' : '不限制'}}</button>
+          <div v-show="t.expanded" :id="'scene-filters-' + t.key" class="scene-filter-editor">
+            <p class="field-help">同一字段满足任一保留值即可；不同字段须同时满足。每行输入一个值。</p>
+            <p v-if="t.loadingColumns" class="small muted" role="status">正在读取字段…</p>
+            <div v-if="t.columnError" class="msg err" role="alert">{{t.columnError}} <button class="link" type="button" @click="loadColumns(t)">重试</button></div>
+            <div v-for="(rule,j) in t.row_filters" :key="rule" class="scene-filter-rule">
+              <div><label :for="'scene-column-' + t.key + '-' + j">字段</label>
+                <select :id="'scene-column-' + t.key + '-' + j" class="in" v-model="rule.column" :disabled="!t.columns?.length">
+                  <option value="" disabled>选择字段</option>
+                  <option v-if="rule.column && !t.columns?.some(c => (c.source_name || c.name) === rule.column)" :value="rule.column">{{rule.column}}</option>
+                  <option v-for="c in t.columns" :key="c.source_name || c.name" :value="c.source_name || c.name">{{c.source_name || c.name}}{{c.comment ? ' · ' + c.comment : ''}}</option>
+                </select>
+              </div>
+              <div>
+                <label>保留值<textarea class="in" v-model="rule.input" rows="2" placeholder="每行一个值"></textarea></label>
+                <label class="check small"><input type="checkbox" v-model="rule.includeNull"> 包含 NULL（空值）</label>
+              </div>
+              <button class="link danger" type="button" @click="t.row_filters.splice(j,1)" :aria-label="'移除筛选条件 ' + (rule.column || (j+1))">移除</button>
+            </div>
+            <button class="btn sm" type="button" @click="addRule(t)" :disabled="!t.columns?.some(c => !t.row_filters.some(r => r.column === (c.source_name || c.name))) || t.row_filters.length >= 20">添加字段条件</button>
+          </div>
+        </div>
+        <div class="actions scene-table-actions"><button class="btn sm" @click="addTable()">手动添加</button>
           <button class="btn sm" @click="pick" :disabled="!form.datasource_id">从数据源选择…</button></div>
-        <div v-if="picker" class="card card-pad" style="margin-top:10px;max-height:300px;overflow:auto">
-          <input class="in" v-model="pickKw" placeholder="筛选…" style="margin-bottom:8px">
-          <label v-for="t in pickShown" class="check" style="display:flex;padding:4px 0"><input type="checkbox" :checked="has(t.name)" @change="togglePick(t)"> <span class="mono">{{t.name}}</span> <span class="muted small">{{t.comment}}</span></label>
-          <div v-if="!picker.length" class="muted small">加载中或无表</div>
-        </div></div>
+        <div v-if="picker" class="scene-source-picker" :aria-busy="pickLoading">
+          <input class="in" v-model="pickKw" type="search" aria-label="搜索数据源中的表或视图" placeholder="搜索表名、视图名或描述">
+          <label v-for="t in pickShown" :key="t.name" class="check scene-pick-item"><input type="checkbox" :checked="has(t.name)" @change="togglePick(t)">
+            <span class="mono">{{t.name}}</span><span class="badge">{{OBJECT_LABEL[t.kind] || '表'}}</span><span class="muted small">{{t.comment}}</span></label>
+          <div v-if="pickError" class="msg err" role="alert">{{pickError}} <button class="link" @click="pick">重试</button></div>
+          <div v-else-if="!pickShown.length" class="small muted" role="status">{{pickLoading ? '正在加载…' : pickKw ? '没有匹配的表或视图' : '数据源没有可选的表或视图'}}</div>
+        </div>
+      </section>
       <label class="check"><input type="checkbox" v-model="form.enabled"> 启用（停用后不参与检索）</label>
-      <template #foot><button class="btn" @click="form=null">取消</button><button class="btn primary" @click="save" :disabled="busy">保存业务场景</button></template>
+      <div v-if="saveError" class="msg err" role="alert">{{saveError}}</div>
+      <template #foot><button class="btn" @click="form=null" :disabled="busy">取消</button><button class="btn primary" @click="save" :disabled="busy">{{busy ? '正在保存…' : '保存业务场景'}}</button></template>
     </Drawer>
   </div>`,
   setup() {
     const scenes = useCollection('/api/datasets');
     const { load } = scenes;
     const sources = ref([]), form = ref(null), busy = ref(false), q = ref(''), sr = ref(null), picker = ref(null), pickKw = ref(''), detail = ref(null);
-    const kw = ref(''), searching = ref(false), searchError = ref('');
+    const kw = ref(''), searching = ref(false), searchError = ref(''), saveError = ref('');
+    const pickLoading = ref(false), pickError = ref('');
     const shown = computed(() => scenes.list.value.filter(d => matches(kw.value, d.business_scenario, d.business_description, ...(d.tags || []))));
     const admin = computed(isAdmin);
     async function view(d) { detail.value = await run(() => api('/api/datasets/' + d.id)); }
     onMounted(async () => { if (admin.value) sources.value = await run(() => api('/api/datasources')); });
     async function edit(d) {
-      picker.value = null;
-      if (d) { const full = await run(() => api(`/api/datasets/${d.id}`)); form.value = { ...full, tagsTxt: (full.tags || []).join(', '), tables: full.tables.map(t => ({ ...t })) }; }
+      picker.value = null; pickKw.value = ''; saveError.value = '';
+      if (d) { const full = await run(() => api(`/api/datasets/${d.id}`)); form.value = { ...full, tagsTxt: (full.tags || []).join(', '), tables: full.tables.map(sceneTableDraft) }; }
       else form.value = { id: null, business_scenario: '', business_description: '', analysis_approach: '', datasource_id: null, tagsTxt: '', tables: [], enabled: true };
     }
     async function save() {
-      busy.value = true;
+      busy.value = true; saveError.value = '';
       const f = form.value;
-      const body = { business_scenario: f.business_scenario, business_description: f.business_description, analysis_approach: f.analysis_approach, datasource_id: f.datasource_id,
-        tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables: f.tables.filter(t => t.table_name.trim()) };
-      try { await run(() => f.id ? api(`/api/datasets/${f.id}`, { method: 'PUT', body }) : api('/api/datasets', { method: 'POST', body }), '已保存'); form.value = null; load(); }
+      try {
+        const tables = f.tables.map(t => {
+          if (!t.table_name.trim()) throw new Error('请为每个表或视图填写名称，或移除空白项。');
+          const row_filters = t.row_filters.map(r => {
+            // 原值未改动时保留 API 保存的数字、布尔及特殊文本，不因打开表单而转换类型。
+            const original = (r.values || []).filter(v => v !== null);
+            const values = r.values && r.input === original.join('\n') ? original : r.input.split(/\r?\n/).filter(v => v !== '');
+            if (r.includeNull) values.push(null);
+            if (!r.column || !values.length) throw new Error(`${t.table_name}：请选择字段并填写保留值，或移除这条条件。`);
+            return { column: r.column, values };
+          });
+          return { table_name: t.table_name, table_description: t.table_description, row_filters };
+        });
+        const body = { business_scenario: f.business_scenario, business_description: f.business_description, analysis_approach: f.analysis_approach,
+          datasource_id: f.datasource_id, tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables };
+        await api(f.id ? `/api/datasets/${f.id}` : '/api/datasets', { method: f.id ? 'PUT' : 'POST', body });
+        toast('已保存', 'ok'); form.value = null; load();
+      } catch (e) { saveError.value = e.message; }
       finally { busy.value = false; }
     }
     async function del(d) { if (!confirm(`删除数据集「${d.business_scenario}」？`)) return; await run(() => api(`/api/datasets/${d.id}`, { method: 'DELETE' }), '已删除'); load(); }
@@ -492,11 +577,45 @@ const Datasets = {
       finally { searching.value = false; }
     }
     async function reindex() { const r = await run(() => api('/api/datasets/reindex', { method: 'POST' })); toast(`已重建：数据集 ${r.datasets}，样式规则 ${r.style_rules}，未向量化 ${r.not_vectorized}`, 'ok'); load(); }
-    async function pick() { picker.value = []; picker.value = await run(() => api(`/api/datasources/${form.value.datasource_id}/tables`)); }
-    const pickShown = computed(() => (picker.value || []).filter(t => !pickKw.value || t.name.includes(pickKw.value)));
+    async function pick() {
+      const draft = form.value, source = draft.datasource_id;
+      picker.value = []; pickError.value = ''; pickLoading.value = true;
+      const current = () => draft === form.value && source === draft.datasource_id;
+      try { const data = await api(`/api/datasources/${source}/tables`); if (current()) picker.value = data; }
+      catch (e) { if (current()) pickError.value = e.message; }
+      finally { if (current()) pickLoading.value = false; }
+    }
+    const pickShown = computed(() => (picker.value || []).filter(t => matches(pickKw.value, t.name, t.comment, OBJECT_LABEL[t.kind])));
     const has = n => form.value.tables.some(t => t.table_name === n);
-    function togglePick(t) { const i = form.value.tables.findIndex(x => x.table_name === t.name); if (i >= 0) form.value.tables.splice(i, 1); else form.value.tables.push({ table_name: t.name, table_description: t.comment || '' }); }
-    return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, picker, pickKw, pickShown, edit, save, del, search, reindex, pick, has, togglePick, DS_LABEL, icon, hasMine: computed(canVisitMine) };
+    function addTable(table) { form.value.tables.push(sceneTableDraft(table)); }
+    function togglePick(t) { const i = form.value.tables.findIndex(x => x.table_name === t.name); if (i >= 0) form.value.tables.splice(i, 1); else addTable({ table_name: t.name, table_description: t.comment || '' }); }
+    function changeSource() { picker.value = null; pickKw.value = ''; form.value.tables.forEach(changeTable); }
+    function changeTable(t) {
+      t.columns = null; t.columnError = ''; t.loadingColumns = false;
+      if (t.expanded && t.table_name && form.value.datasource_id) loadColumns(t);
+    }
+    async function loadColumns(t) {
+      const draft = form.value, source = draft.datasource_id, table = t.table_name;
+      const current = () => draft === form.value && source === draft.datasource_id && table === t.table_name;
+      t.loadingColumns = true; t.columnError = '';
+      try {
+        const fields = await api(`/api/datasources/${source}/columns?table=${encodeURIComponent(table)}`);
+        if (current()) {
+          t.columns = fields;
+          if (!fields.length) t.columnError = '没有读到字段，请检查源表或视图。';
+        }
+      } catch (e) { if (current()) t.columnError = e.message; }
+      finally { if (current()) t.loadingColumns = false; }
+    }
+    function toggleFilters(t) {
+      t.expanded = !t.expanded;
+      if (t.expanded && !t.columns && !t.loadingColumns) loadColumns(t);
+    }
+    function addRule(t) { t.row_filters.push({ column: '', input: '', includeNull: false }); }
+    return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
+      picker, pickKw, pickShown, pickLoading, pickError, edit, save, del, search, reindex, pick, has, togglePick,
+      addTable, changeSource, changeTable, loadColumns, toggleFilters, addRule, filterValueLabel, DS_LABEL, OBJECT_LABEL,
+      icon, hasMine: computed(canVisitMine) };
   }
 };
 
@@ -562,7 +681,7 @@ const Templates = {
           <tbody><tr v-for="t in shown" :key="t.id">
             <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.business_summary || t.analysis_goal || t.user_requirement}}</div></td>
             <td data-label="业务场景">{{t.business_scenario || '—'}}</td><td v-if="admin" data-label="创建人">{{creator(t)}}</td><td data-label="更新时间"><time :datetime="t.updated_at">{{fmtTime(t.updated_at)}}</time></td>
-            <td><div class="links"><button class="link" @click="view(t)">查看</button><button class="link" @click="gen(t)">生成报告</button>
+            <td><div class="links"><button class="link" @click="view(t)">查看</button><button v-if="t.template_type !== 'business'" class="link" @click="gen(t)">生成报告</button>
               <button class="link danger" @click="del(t)">删除</button></div></td>
           </tr></tbody>
         </table></div>
@@ -572,7 +691,7 @@ const Templates = {
       <div class="page-head">
         <div><h1 ref="templateHeading" tabindex="-1">{{form.name}}</h1><p>{{form.business_scenario || '未关联业务场景'}} · v{{form.version}}</p></div>
         <div class="actions"><button class="btn ghost" @click="form=null">返回模板列表</button>
-          <button class="btn" @click="edit(form)">编辑模板</button><button class="btn primary" @click="gen(form)">生成报告</button></div>
+          <button class="btn" @click="edit(form)">编辑模板</button><button v-if="form.template_type !== 'business'" class="btn primary" @click="gen(form)">生成报告</button></div>
       </div>
       <div class="card card-pad template-brief">
         <h2>模板用途</h2>
@@ -580,7 +699,10 @@ const Templates = {
         <template v-if="form.business_summary && form.analysis_goal && form.analysis_goal !== form.business_summary">
           <h2>分析目标</h2><p class="business-copy">{{form.analysis_goal}}</p>
         </template>
-        <template v-if="form.summary?.sections?.some(Boolean)">
+        <template v-if="form.template_type === 'business'">
+          <h2>业务模板正文</h2><p class="business-copy">{{form.markdown}}</p>
+        </template>
+        <template v-else-if="form.summary?.sections?.some(Boolean)">
           <h2>报告章节</h2>
           <ol><li v-for="(title, i) in form.summary.sections.filter(Boolean)" :key="i">{{title}}</li></ol>
         </template>
@@ -589,10 +711,12 @@ const Templates = {
     <template v-else>
       <div class="page-head"><h1 ref="templateHeading" tabindex="-1">{{form.id ? '编辑模板' : '新建模板'}}</h1>
         <div class="actions"><button class="btn ghost" :disabled="busy" @click="cancelEdit">取消</button>
-          <button v-if="technical" class="btn" @click="save(true)" :disabled="busy || !form.markdown.trim()">保存并生成…</button>
+          <button v-if="technical && form.template_type !== 'business'" class="btn" @click="save(true)" :disabled="busy || !form.markdown.trim()">保存并生成…</button>
           <button class="btn primary" @click="save(false)" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
       <div class="card card-pad meta-bar">
         <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
+        <div v-if="!form.id" class="field"><label for="template-type">模板类型</label>
+          <select id="template-type" class="in" v-model="form.template_type" :disabled="busy"><option value="business">业务 Markdown</option><option value="structured">结构化模板</option></select></div>
         <div class="field"><label for="template-scenario">业务场景</label>
           <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">选择默认取数的业务场景</option>
             <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
@@ -601,6 +725,13 @@ const Templates = {
         <div class="field template-summary-field"><label for="template-business-summary">业务说明 <small>选填</small></label>
           <textarea id="template-business-summary" class="in" v-model="form.business_summary" rows="4" placeholder="例如：用于月度销售复盘，比较各渠道的销售额和毛利率，找出变化最大的区域和品类。"></textarea></div>
       </div>
+      <div v-if="form.template_type === 'business'" class="card card-pad template-brief">
+        <div class="field"><label for="business-markdown">业务模板正文（Markdown）</label>
+          <textarea id="business-markdown" class="in" v-model="form.markdown" rows="14" :disabled="busy"></textarea></div>
+        <div v-for="v in form.versions" :key="v.version" class="hit"><span>v{{v.version}} · {{fmtTime(v.created_at)}}</span>
+          <button class="link" @click="loadVer(v.version)" :disabled="busy">载入正文</button></div>
+      </div>
+      <template v-else>
       <div class="actions template-technical">
         <button class="btn" :aria-expanded="technical" aria-controls="template-source" :disabled="busy" @click="technical=!technical">{{technical ? '收起高级编辑' : form.id ? '高级编辑' : '编写模板源码'}}</button>
         <span v-if="!form.id && !technical" class="muted small">新建模板需要填写源码。</span>
@@ -629,6 +760,7 @@ const Templates = {
           <div class="body" v-show="side==='preview'" style="padding:0"><iframe v-if="previewHtml" title="报告模板预览" :srcdoc="previewHtml"></iframe><div v-else class="empty">点击“预览”渲染</div></div>
           <div class="body" v-show="side==='ver'"><div v-for="v in form.versions" class="hit" style="display:flex;justify-content:space-between;align-items:center"><span>v{{v.version}} · {{fmtTime(v.created_at)}} · {{fmtSize(v.size)}}</span><button class="link" @click="loadVer(v.version)">载入编辑器</button></div></div>
         </div></div></template></div>
+      </template>
     </template>
   </div>`,
   setup() {
@@ -651,7 +783,7 @@ const Templates = {
       editing.value = true;
       technical.value = false;
       vr.value = null; previewHtml.value = ''; side.value = 'check';
-      form.value = t ? { ...t } : { id: null, name: '', dataset_id: null, user_requirement: '', business_summary: '', markdown: '', version: 1 };
+      form.value = t ? { ...t } : { id: null, name: '', dataset_id: null, user_requirement: '', business_summary: '', markdown: '', version: 1, template_type: 'business' };
       await nextTick();
       templateHeading.value?.focus();
     }
@@ -672,7 +804,7 @@ const Templates = {
     async function save(andRender) {
       busy.value = true;
       const f = form.value, body = { name: f.name, markdown: f.markdown, dataset_id: f.dataset_id,
-        user_requirement: f.user_requirement, business_summary: f.business_summary };
+        user_requirement: f.user_requirement, business_summary: f.business_summary, template_type: f.template_type };
       try {
         const t = await run(() => f.id ? api(`/api/templates/${f.id}`, { method: 'PUT', body }) : api('/api/templates', { method: 'POST', body }), '模板已保存');
         await view(t);
@@ -690,14 +822,361 @@ const Templates = {
 };
 
 // ------------------------------------------------------------ 报告
+const ReportSharing = {
+  components: { Drawer }, props: ['report'], emits: ['close'],
+  template: `<Drawer title="分享报告" compact :busy="busy" @close="$emit('close')">
+    <p class="report-dialog-name">{{report.name}}</p>
+    <div v-if="!manual && !selectedRecipient" class="report-recipient-picker">
+      <div class="field">
+        <label for="share-recipient-search">选择接收人</label>
+        <input id="share-recipient-search" class="in" ref="searchInput" type="search" v-model="query"
+          maxlength="100" placeholder="搜索姓名或工号" :disabled="busy" aria-controls="share-recipient-results">
+      </div>
+      <div id="share-recipient-results" :aria-busy="searching">
+        <p v-if="searching" class="field-help" role="status">正在查找用户…</p>
+        <p v-else-if="searchError" class="field-help" role="alert">用户列表加载失败。<button type="button" class="link" @click="search(query)">重试</button></p>
+        <p v-else-if="!candidates.length" class="field-help" role="status">未找到可选用户。</p>
+        <ul v-else class="report-recipient-results" aria-label="可选用户">
+          <li v-for="person in candidates" :key="person.emp_no">
+            <button type="button" :disabled="busy" @click="choose(person)">
+              <b>{{person.name || person.emp_no}}</b><span v-if="person.name" class="small muted">{{person.emp_no}}</span>
+            </button>
+          </li>
+        </ul>
+      </div>
+      <button type="button" class="link report-recipient-switch" @click="useManual">手动输入工号</button>
+    </div>
+    <form class="report-share-form" @submit.prevent="save">
+      <div v-if="manual || selectedRecipient" class="field report-recipient-field">
+        <label for="share-emp-no">接收人工号</label>
+        <div class="report-recipient-input">
+          <input id="share-emp-no" class="in" ref="recipient" v-model.trim="empNo" maxlength="256" :disabled="busy" :readonly="!manual" required>
+          <button type="button" class="link report-recipient-switch" :disabled="busy" @click="useDirectory">{{manual ? '选择已有用户' : '更换'}}</button>
+        </div>
+        <p v-if="manual" class="field-help">未登记的工号可预先授权，账号启用后生效。</p>
+        <p v-else-if="selectedRecipient.name" class="field-help">{{selectedRecipient.name}}</p>
+      </div>
+      <template v-if="manual || selectedRecipient">
+        <div class="field"><label for="share-access">权限</label><select id="share-access" class="in" v-model="level" :disabled="busy">
+          <option value="view">可查看</option><option value="edit">可编辑</option></select></div>
+        <button class="btn primary" :disabled="busy || loading || loadFailed || !empNo">{{busy ? '处理中…' : '保存权限'}}</button>
+      </template>
+    </form>
+    <p class="field-help">接收人需用获授权的工号登录海尔 IAM 后打开链接。</p>
+    <p v-if="error" class="msg err" role="alert">{{error}}</p>
+    <section class="report-share-people" aria-labelledby="share-people-title" :aria-busy="loading || busy">
+      <h3 id="share-people-title">已分享的用户</h3>
+      <p v-if="loading" class="muted" role="status">正在加载…</p>
+      <button v-else-if="loadFailed" type="button" class="link" @click="load">重试加载</button>
+      <p v-else-if="!shares.length" class="muted">尚未分享给其他用户。</p>
+      <ul v-else>
+        <li v-for="s in shares" :key="s.emp_no">
+          <div><b>{{s.name ? s.name + '（' + s.emp_no + '）' : s.emp_no}}</b>
+            <div class="small muted">{{s.access_level === 'edit' ? '可编辑' : '可查看'}}{{!s.registered ? ' · 待登记' : s.enabled ? '' : ' · 已停用'}}</div></div>
+          <div class="links"><button class="link" :aria-label="'修改 ' + s.emp_no + ' 的权限'" :disabled="busy || (s.registered && !s.enabled)" @click="choose(s)">修改</button>
+            <button class="link danger" :aria-label="'撤销 ' + s.emp_no + ' 的权限'" :disabled="busy" @click="revoke(s)">撤销</button></div>
+        </li>
+      </ul>
+    </section>
+    <div v-if="url" class="field"><label for="share-url">报告链接</label>
+      <input id="share-url" class="in" ref="link" :value="url" readonly @focus="$event.target.select()"></div>
+    <template #foot>
+      <button class="btn" :disabled="busy" @click="$emit('close')">关闭</button>
+      <button class="btn" :disabled="!url || busy" @click="copyLink">复制链接</button>
+    </template>
+  </Drawer>`,
+  setup(props) {
+    const path = '/api/reports/' + props.report.id;
+    const shares = ref([]), empNo = ref(''), level = ref('view'), url = ref('');
+    const busy = ref(false), loading = ref(true), loadFailed = ref(false), error = ref('');
+    const recipient = ref(null), link = ref(null), searchInput = ref(null);
+    const manual = ref(false), selectedRecipient = ref(null), query = ref('');
+    const candidates = ref([]), searching = ref(true), searchError = ref(false);
+    let searchTimer, searchRevision = 0;
+    // 较慢的旧请求不能覆盖新关键词的结果，手动输入也不依赖目录请求成功。
+    async function search(term, revision = ++searchRevision) {
+      searching.value = true;
+      searchError.value = false;
+      try {
+        const people = await api(path + '/share-recipients?' + new URLSearchParams({ q: term.trim() }));
+        if (revision === searchRevision) candidates.value = people;
+      } catch {
+        if (revision === searchRevision) searchError.value = true;
+      } finally {
+        if (revision === searchRevision) searching.value = false;
+      }
+    }
+    watch(query, term => {
+      clearTimeout(searchTimer);
+      const revision = ++searchRevision;
+      searching.value = true;
+      searchTimer = setTimeout(() => search(term, revision), 250);
+    });
+    onBeforeUnmount(() => { clearTimeout(searchTimer); searchRevision++; });
+    async function load() {
+      loading.value = true;
+      error.value = '';
+      loadFailed.value = false;
+      try {
+        const [info, people] = await Promise.all([api(path + '?version=' + props.report.revision), api(path + '/shares')]);
+        url.value = info.url;
+        shares.value = people;
+      } catch (e) { loadFailed.value = true; error.value = e.message; }
+      finally { loading.value = false; }
+    }
+    onMounted(() => { load(); search(''); });
+    function useManual() {
+      manual.value = true;
+      selectedRecipient.value = null;
+      empNo.value = query.value.trim();
+      level.value = 'view';
+      nextTick(() => recipient.value?.focus());
+    }
+    function useDirectory() {
+      manual.value = false;
+      selectedRecipient.value = null;
+      empNo.value = '';
+      level.value = 'view';
+      nextTick(() => searchInput.value?.focus());
+    }
+    function choose(person) {
+      manual.value = false;
+      selectedRecipient.value = person;
+      empNo.value = person.emp_no;
+      level.value = shares.value.find(s => s.emp_no === person.emp_no)?.access_level || 'view';
+      nextTick(() => recipient.value?.focus());
+    }
+    async function save() {
+      if (busy.value || loading.value || loadFailed.value || !empNo.value) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        const saved = await api(path + '/shares', { method: 'POST', body: { emp_no: empNo.value, access_level: level.value } });
+        shares.value = [...shares.value.filter(s => s.emp_no !== saved.emp_no), saved].sort((a, b) => a.emp_no.localeCompare(b.emp_no));
+        query.value = '';
+        useDirectory();
+        toast(saved.registered ? '权限已保存' : '已按工号预授权，账号启用后生效', 'ok');
+      } catch (e) { error.value = e.message; }
+      finally { busy.value = false; }
+    }
+    async function revoke(share) {
+      if (busy.value || !confirm('撤销 ' + share.emp_no + ' 的报告权限？')) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        await api(path + '/shares/' + encodeURIComponent(share.emp_no), { method: 'DELETE' });
+        shares.value = shares.value.filter(s => s.emp_no !== share.emp_no);
+        if (empNo.value === share.emp_no) useDirectory();
+        toast('权限已撤销', 'ok');
+      } catch (e) { error.value = e.message; }
+      finally { busy.value = false; }
+    }
+    async function copyLink() {
+      try { await navigator.clipboard.writeText(url.value); toast('链接已复制', 'ok'); }
+      catch { link.value?.focus(); link.value?.select(); toast('链接已选中，可以手动复制'); }
+    }
+    return { shares, empNo, level, url, busy, loading, loadFailed, error, recipient, link, load, choose, save, revoke, copyLink,
+      searchInput, manual, selectedRecipient, query, candidates, searching, searchError, search, useManual, useDirectory };
+  }
+};
+
+const ReportEditor = {
+  components: { Drawer }, props: ['report'], emits: ['close', 'saved'],
+  template: `<Drawer title="编辑报告" wide :busy="busy" @close="close">
+    <p v-if="error" class="msg err" role="alert">{{error}}</p>
+    <p v-if="loading" class="muted" role="status">正在加载报告…</p>
+    <button v-else-if="!form" class="link" @click="load">重试加载</button>
+    <form v-else id="report-edit-form" @submit.prevent="save">
+      <p class="form-intro">基于版本 {{form.base_version}} 编辑。保存后生成新版本。</p>
+      <div class="field"><label for="report-edit-name">报告名称</label>
+        <input id="report-edit-name" class="in" v-model.trim="form.name" required :disabled="busy"></div>
+      <div class="field"><label for="report-edit-note">修改说明 <small>选填</small></label>
+        <input id="report-edit-note" class="in" v-model.trim="form.change_note" maxlength="500" :disabled="busy"></div>
+      <div class="editor report-source-editor">
+        <div class="pane"><label class="editor-label" for="report-edit-html">HTML 内容</label>
+          <textarea id="report-edit-html" class="in mono" v-model="form.html" spellcheck="false" required :disabled="busy"></textarea></div>
+        <div class="pane"><div class="report-preview-head"><b>预览</b>
+          <button type="button" class="link" @click="preview = form.html">刷新预览</button></div>
+          <iframe title="报告预览" sandbox="allow-scripts" referrerpolicy="no-referrer" :srcdoc="preview"></iframe></div>
+      </div>
+    </form>
+    <template #foot>
+      <button class="btn" :disabled="busy" @click="close">取消</button>
+      <button type="submit" class="btn primary" form="report-edit-form" :disabled="busy || !form || !dirty">{{busy ? '保存中…' : '保存为新版本'}}</button>
+    </template>
+  </Drawer>`,
+  setup(props, { emit }) {
+    const path = '/api/reports/' + props.report.id;
+    const form = ref(null), original = ref(null), preview = ref('');
+    const loading = ref(true), busy = ref(false), error = ref('');
+    const dirty = computed(() => !!form.value && (form.value.name !== original.value.name || form.value.html !== original.value.html || !!form.value.change_note));
+    async function load() {
+      loading.value = true;
+      error.value = '';
+      try {
+        // 抽屉打开后锁定基准，即使另一个页面切换了版本也不会误编辑。
+        const { name, html, revision, access_level } = await api(path + '?include_html=true&version=' + props.report.revision);
+        if (access_level === 'view') throw new Error('当前账号无权编辑该报告');
+        original.value = { name, html, base_version: revision, change_note: '' };
+        form.value = { ...original.value };
+        // 只在打开或手动刷新时运行预览，避免每次键入都重新执行报告脚本。
+        preview.value = html;
+      } catch (e) { error.value = e.message; }
+      finally { loading.value = false; }
+    }
+    onMounted(load);
+    function close() {
+      if (!dirty.value || confirm('放弃未保存的报告修改？')) emit('close');
+    }
+    async function save() {
+      if (!dirty.value || busy.value) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        const saved = await api(path, { method: 'PUT', body: form.value });
+        toast('已保存版本 ' + saved.revision, 'ok');
+        emit('saved', saved);
+      } catch (e) { error.value = e.message; }
+      finally { busy.value = false; }
+    }
+    return { form, preview, loading, busy, error, dirty, load, close, save };
+  }
+};
+
+const ReportVersions = {
+  components: { Drawer }, props: ['report'], emits: ['close', 'selected'],
+  template: `<Drawer title="报告版本" compact :busy="busy" @close="$emit('close')">
+    <p class="report-dialog-name">{{report.name}}</p>
+    <p v-if="error" class="msg err" role="alert">{{error}}</p>
+    <p v-if="loading" class="muted" role="status">正在加载版本…</p>
+    <button v-else-if="!history" type="button" class="link" @click="load">重试加载</button>
+    <template v-else>
+      <p class="form-intro">切换后，查看和编辑默认使用所选版本。</p>
+      <ul class="report-versions-list" aria-label="版本历史">
+        <li v-for="v in history.versions" :key="v.version">
+          <div>
+            <div class="report-version-label"><b>版本 {{v.version}}</b>
+              <span v-if="v.version === report.revision" class="badge">正在查看</span>
+              <span v-if="v.version === history.current_version && v.version !== report.revision" class="badge">当前选择</span>
+              <span v-if="v.version === history.latest_version" class="small muted">最新</span></div>
+            <div class="small muted"><time :datetime="v.created_at">{{fmtTime(v.created_at)}}</time> · {{creator(v)}}<span v-if="v.base_version"> · 基于版本 {{v.base_version}}</span></div>
+            <div v-if="v.name !== report.name || v.change_note" class="report-version-note">
+              <span v-if="v.name !== report.name">{{v.name}}</span><span v-if="v.name !== report.name && v.change_note"> · </span>{{v.change_note}}</div>
+          </div>
+          <button v-if="v.version !== history.current_version || v.version !== report.revision" type="button" class="link"
+            :aria-label="'切换到版本 ' + v.version" :disabled="busy" @click="select(v.version)">切换</button>
+        </li>
+      </ul>
+    </template>
+    <template #foot>
+      <button type="button" class="btn" :disabled="busy" @click="$emit('close')">关闭</button>
+      <button v-if="history && (history.version_selected || report.revision !== history.latest_version)" type="button" class="btn primary" :disabled="busy" @click="select(null)">跟随最新版</button>
+    </template>
+  </Drawer>`,
+  setup(props, { emit }) {
+    const path = '/api/reports/' + props.report.id;
+    const { list: history, loading, loadError, load } = useCollection(path + '/versions', null);
+    const busy = ref(false), selectionError = ref('');
+    const error = computed(() => selectionError.value || loadError.value);
+    async function select(version) {
+      if (busy.value) return;
+      busy.value = true;
+      selectionError.value = '';
+      try {
+        const selected = await api(path + '/selection', { method: 'PUT', body: { version } });
+        toast(version === null ? '已切回最新版' : '已切换到版本 ' + selected.revision, 'ok');
+        emit('selected', selected);
+      } catch (e) { selectionError.value = e.message; }
+      finally { busy.value = false; }
+    }
+    return { history, loading, busy, error, load, select, fmtTime, creator };
+  }
+};
+
+const ReportMerge = {
+  components: { Drawer }, props: ['reports'], emits: ['close', 'downloaded', 'update:reports'],
+  template: `<Drawer title="调整合并顺序" compact :busy="busy" @close="$emit('close')">
+    <form id="report-merge-form" @submit.prevent="download">
+      <div class="field">
+        <label for="report-merge-name">文件名称</label>
+        <input id="report-merge-name" class="in" v-model.trim="name" :disabled="busy" required>
+      </div>
+      <p class="field-help">各份报告的标题和正文将按以下顺序从上到下拼接。</p>
+      <ol class="report-merge-order" aria-label="合并顺序">
+        <li v-for="(r, i) in reports" :key="r.id">
+          <div class="report-merge-row">
+            <div><b>{{r.name}}</b><div class="small muted">版本 {{r.revision}}</div></div>
+            <div class="actions">
+              <button type="button" class="btn" :id="'merge-up-' + r.id" :disabled="busy || i === 0"
+                :aria-label="'上移 ' + r.name" @click="move(i, -1)">上移</button>
+              <button type="button" class="btn" :id="'merge-down-' + r.id" :disabled="busy || i === reports.length - 1"
+                :aria-label="'下移 ' + r.name" @click="move(i, 1)">下移</button>
+            </div>
+          </div>
+        </li>
+      </ol>
+      <span class="report-merge-position" role="status">{{position}}</span>
+      <p v-if="error" class="msg err" role="alert">{{error}}</p>
+    </form>
+    <template #foot>
+      <button type="button" class="btn" :disabled="busy" @click="$emit('close')">返回选择</button>
+      <button type="submit" class="btn primary" form="report-merge-form" :disabled="busy || !name">{{busy ? '正在合并…' : '合并并下载 HTML'}}</button>
+    </template>
+  </Drawer>`,
+  setup(props, { emit }) {
+    const name = ref('合并报告');
+    const busy = ref(false), error = ref(''), position = ref('');
+    function move(index, direction) {
+      const target = index + direction;
+      const ordered = [...props.reports];
+      const [moved] = ordered.splice(index, 1);
+      ordered.splice(target, 0, moved);
+      // 用户返回列表增减勾选项时，保留已经调整的相对顺序。
+      emit('update:reports', ordered);
+      position.value = moved.name + ' 已移至第 ' + (target + 1) + ' 位';
+      // 重排后保持焦点在同一份报告，到达边界时聚焦另一个可用方向。
+      const focusUp = direction < 0 ? target > 0 : target === ordered.length - 1;
+      nextTick(() => document.getElementById((focusUp ? 'merge-up-' : 'merge-down-') + moved.id)?.focus());
+    }
+    async function download() {
+      if (busy.value || !name.value) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        const reports = props.reports.map(r => ({ id: r.id, version: r.revision }));
+        const file = await api('/api/reports/merge', { method: 'POST', body: { name: name.value, reports }, download: true });
+        const url = URL.createObjectURL(file);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name.value + '.html';
+        link.click();
+        // 下载由浏览器异步接管，延迟释放临时 URL。
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        emit('downloaded');
+      } catch (e) { error.value = e.message; }
+      finally { busy.value = false; }
+    }
+    return { name, busy, error, position, move, download };
+  }
+};
+
 const Reports = {
+  components: { ReportSharing, ReportEditor, ReportVersions, ReportMerge },
   template: `<div>
-    <div class="page-head"><div><h1>报告库</h1><p>{{admin ? '查看所有用户已生成的报告。' : '查看你已生成的报告。'}}下载 HTML 文件后可离线打开。</p></div>
-      <button class="btn primary" @click="create"><span class="ico" v-html="icon('plus')"></span>生成报告</button></div>
+    <div class="page-head"><div><h1>报告库</h1><p>{{admin ? '查看所有用户已生成的报告。' : '查看自己生成的报告和他人分享给你的报告。'}}</p></div>
+      <div class="actions">
+        <button type="button" class="btn" ref="mergeButton" :disabled="!selecting && (loading || !!loadError || list.length < 2)"
+          @click="toggleMerge">{{selecting ? '取消选择' : '合并报告'}}</button>
+        <button class="btn primary" @click="create"><span class="ico" v-html="icon('plus')"></span>生成报告</button>
+      </div></div>
     <section class="card list-panel" aria-label="报告列表" :aria-busy="loading">
       <div class="list-tools">
         <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索报告名称或来源模板" aria-label="搜索报告"></label>
-        <span v-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 份报告</span>
+        <div v-if="selecting" class="actions report-merge-tools">
+          <span class="list-count" role="status">已选 {{picked.length}} 份<span v-if="picked.length < 2">，请至少选择 2 份</span></span>
+          <button type="button" class="btn primary" :disabled="picked.length < 2 || loading || !!loadError" @click="merging=true">调整合并顺序</button>
+        </div>
+        <span v-else-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 份报告</span>
       </div>
       <div v-if="loading" class="collection-state" role="status">正在加载报告…</div>
       <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button class="link" @click="load">重试</button></div>
@@ -709,32 +1188,124 @@ const Reports = {
         <button v-else class="btn" @click="create">选择模板</button>
       </div>
       <div v-else class="scroll-x" tabindex="0" aria-label="报告表格"><table class="tbl report-table" role="table">
-        <thead><tr><th scope="col">报告名称</th><th scope="col">来源模板</th><th scope="col" v-if="admin">创建人</th><th scope="col">生成时间</th><th scope="col">操作</th></tr></thead>
-        <tbody><tr v-for="r in shown" :key="r.id">
-          <td><a class="record-name" :href="'/reports/'+r.id" target="_blank" rel="noopener">{{r.name}}</a>
+        <thead><tr><th scope="col">报告名称</th><th scope="col">版本</th><th scope="col">来源模板</th><th scope="col" v-if="admin">创建人</th><th scope="col">版本时间</th><th scope="col">操作</th></tr></thead>
+        <tbody><tr v-for="r in shown" :key="r.id" :class="{'report-picked': selecting && pickedIds.has(r.id)}">
+          <td><div class="report-record">
+            <label v-if="selecting" class="report-pick"><input type="checkbox" :checked="pickedIds.has(r.id)"
+              :aria-label="'选择 ' + r.name" @change="pick(r, $event.target.checked)"></label>
+            <div><a class="record-name" :href="reportVersionPath(r)" target="_blank" rel="noopener">{{r.name}}</a>
+            <div v-if="r.access_level !== 'manage'" class="small muted">{{creator(r)}}分享 · {{r.access_level === 'edit' ? '可编辑' : '可查看'}}</div>
             <div class="small muted">{{fmtSize(r.size)}}<span v-if="r.meta?.queries"> · 查询结果 {{queryRows(r)}} 行</span></div>
             <details v-if="r.meta?.warnings?.length" class="small report-warnings"><summary>{{r.meta.warnings.length}} 条生成提示</summary>
-              <ul><li v-for="(w,i) in r.meta.warnings" :key="i">{{w}}</li></ul></details></td>
+              <ul><li v-for="(w,i) in r.meta.warnings" :key="i">{{w}}</li></ul></details></div></div></td>
+          <td><button type="button" class="btn report-version-button" :aria-label="r.name + '，当前版本 ' + r.revision + '，切换版本'" @click="versions=r">版本 {{r.revision}}</button></td>
           <td data-label="来源模板">{{r.template_name || '—'}} <span class="badge" v-if="r.template_version">v{{r.template_version}}</span></td>
-          <td v-if="admin" data-label="创建人">{{creator(r)}}</td><td data-label="生成时间"><time :datetime="r.created_at">{{fmtTime(r.created_at)}}</time></td>
-          <td><div class="links"><a :href="'/reports/'+r.id" target="_blank" rel="noopener">查看</a><a :href="'/reports/'+r.id+'/download'">下载 HTML</a>
-            <button class="link danger" @click="del(r)">删除</button></div></td>
+          <td v-if="admin" data-label="创建人">{{creator(r)}}</td><td data-label="版本时间"><time :datetime="r.version_created_at">{{fmtTime(r.version_created_at)}}</time></td>
+          <td><div class="links"><a :href="reportVersionPath(r)" target="_blank" rel="noopener">查看</a><a :href="reportVersionPath(r, '/download')">下载 HTML</a>
+            <button v-if="r.access_level !== 'view'" class="link" @click="editing=r">编辑</button>
+            <button v-if="r.access_level === 'manage'" class="link" @click="sharing=r">分享</button>
+            <button v-if="r.access_level === 'manage'" class="link danger" @click="del(r)">删除</button></div></td>
         </tr></tbody>
       </table></div>
     </section>
+    <ReportSharing v-if="sharing" :report="sharing" @close="sharing=null"/>
+    <ReportEditor v-if="editing" :report="editing" @close="editing=null" @saved="saved"/>
+    <ReportVersions v-if="versions" :report="versions" @close="versions=null" @selected="selected"/>
+    <ReportMerge v-if="merging" v-model:reports="picked" @close="merging=false" @downloaded="merged"/>
   </div>`,
   setup() {
     const reports = useCollection('/api/reports');
-    const kw = ref('');
+    const kw = ref(''), sharing = ref(null), editing = ref(null), versions = ref(null);
+    const selecting = ref(false), picked = ref([]), merging = ref(false), mergeButton = ref(null);
+    const pickedIds = computed(() => new Set(picked.value.map(r => r.id)));
     const shown = computed(() => reports.list.value.filter(r => matches(kw.value, r.name, r.template_name, r.creator_name, r.created_by)));
     const queryRows = r => Object.values(r.meta.queries).reduce((total, q) => total + (q.rows || 0), 0);
     watch(reportRevision, reports.load);
     async function del(r) {
-      if (!confirm('删除报告「' + r.name + '」？')) return;
+      if (!confirm('删除报告「' + r.name + '」及其所有版本？')) return;
       await run(() => api('/api/reports/' + r.id, { method: 'DELETE' }), '已删除');
       reports.load();
     }
-    return { ...reports, admin: computed(isAdmin), creator, shown, kw, del, create: () => startReport(), fmtTime, fmtSize, queryRows, icon };
+    function saved() { editing.value = null; reportRevision.value++; }
+    function selected() { versions.value = null; reportRevision.value++; }
+    function toggleMerge() {
+      selecting.value = !selecting.value;
+      if (!selecting.value) picked.value = [];
+    }
+    function pick(report, checked) {
+      // 固定勾选时的版本，搜索和列表刷新不会静默换成另一个版本。
+      if (checked) picked.value.push(report);
+      else picked.value = picked.value.filter(r => r.id !== report.id);
+    }
+    function merged() {
+      merging.value = false;
+      toggleMerge();
+      nextTick(() => mergeButton.value?.focus());
+      toast('合并报告已生成', 'ok');
+    }
+    // 从独立的报告页返回时刷新该账号刚切换或保存的版本。
+    onMounted(() => window.addEventListener('focus', reports.load));
+    onBeforeUnmount(() => window.removeEventListener('focus', reports.load));
+    return { ...reports, admin: computed(isAdmin), creator, shown, kw, sharing, editing, versions, saved, selected, del,
+      selecting, picked, pickedIds, merging, mergeButton, toggleMerge, pick, merged,
+      create: () => startReport(), fmtTime, fmtSize, queryRows, icon, reportVersionPath };
+  }
+};
+
+const ReportViewer = {
+  components: { ReportEditor, ReportVersions }, props: ['reportId', 'initialVersion'],
+  template: `<main class="report-viewer" :aria-busy="loading">
+    <header class="report-viewer-bar">
+      <div class="report-viewer-heading"><a class="link" href="/#reports">报告库</a><h1>{{report?.name || '报告'}}</h1></div>
+      <div v-if="report" class="links">
+        <button type="button" class="btn report-version-button" :aria-label="'当前版本 ' + report.revision + '，切换版本'" @click="versions=true">版本 {{report.revision}}</button>
+        <a class="btn" :href="reportVersionPath(report, '/download')">下载 HTML</a>
+        <button v-if="report.access_level !== 'view'" type="button" class="btn primary" @click="editing=true">编辑报告</button>
+      </div>
+    </header>
+    <p v-if="loading" class="collection-state" role="status">正在加载报告…</p>
+    <div v-else-if="error" class="collection-state" role="alert">{{error}} <button class="link" @click="load">重试</button></div>
+    <iframe v-else-if="report" :key="report.revision" class="report-viewer-frame" :title="report.name + ' · 版本 ' + report.revision"
+      :src="reportVersionPath(report, '/content')" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+    <ReportVersions v-if="versions" :report="report" @close="versions=false" @selected="selected"/>
+    <ReportEditor v-if="editing" :report="report" @close="editing=false" @saved="saved"/>
+  </main>
+  <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>`,
+  setup(props) {
+    const path = '/api/reports/' + props.reportId;
+    const report = ref(null), loading = ref(true), error = ref(''), versions = ref(false), editing = ref(false);
+    const displayedVersion = ref(props.initialVersion);
+    function apply(next) {
+      report.value = next;
+      document.title = next.name + ' · 版本 ' + next.revision;
+    }
+    async function load() {
+      loading.value = true;
+      error.value = '';
+      try { apply(await api(path + (displayedVersion.value ? '?version=' + displayedVersion.value : ''))); }
+      catch (e) {
+        if (e.status === 401) {
+          location.replace('/auth/iam/login?next=' + encodeURIComponent(location.pathname + location.search));
+          return;
+        }
+        error.value = e.message;
+      } finally { loading.value = false; }
+    }
+    onMounted(load);
+    function selected(next) {
+      versions.value = false;
+      apply(next);
+      displayedVersion.value = next.version_selected ? next.revision : null;
+      // 跟随最新版时保留动态链接，固定选择及编辑结果可直接分享具体版本。
+      history.replaceState(null, '', next.version_selected ? reportVersionPath(next) : reportPath(next));
+    }
+    function saved(next) {
+      editing.value = false;
+      apply(next);
+      displayedVersion.value = next.revision;
+      history.replaceState(null, '', reportVersionPath(next));
+    }
+    return { report, loading, error, versions, editing, load, selected, saved, reportVersionPath, toasts };
   }
 };
 
@@ -1094,12 +1665,12 @@ const Styles = {
 const Perms = {
   components: { Drawer },
   template: `<div>
-    <div class="page-head"><div><h1>员工与授权</h1><p>为员工或角色开放业务场景和数据表，并查询有效权限。</p></div></div>
+    <div class="page-head"><div><h1>员工与授权</h1><p>管理普通用户和管理员，为员工或数据角色授权，并查询有效权限。</p></div></div>
     <div class="subtabs"><button v-for="t in tabs" :class="{on:tab===t[0]}" @click="tab=t[0]">{{t[1]}}</button></div>
 
     <template v-if="tab==='emp'">
       <div class="actions" style="margin-bottom:12px"><button class="btn primary" @click="editEmp()">新增员工</button></div>
-      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>工号</th><th>姓名</th><th>部门</th><th>角色</th><th>类型</th><th>注册来源</th><th>状态</th><th>操作</th></tr></thead>
+      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>工号</th><th>姓名</th><th>部门</th><th>数据授权角色</th><th>系统身份</th><th>注册来源</th><th>状态</th><th>操作</th></tr></thead>
         <tbody><tr v-for="e in emps"><td class="mono">{{e.emp_no}}</td><td>{{e.name}}</td><td>{{e.department}}</td>
           <td><span v-for="r in e.roles" class="badge" style="margin-right:4px">{{r}}</span><span v-if="e.direct_grants" class="small muted">+{{e.direct_grants}} 项直授</span></td>
           <td><span class="badge" :class="e.is_admin?'red':''">{{e.is_admin?'管理员（全部数据）':'普通用户'}}</span></td>
@@ -1116,7 +1687,7 @@ const Perms = {
         <div class="row3" style="grid-template-columns:150px 1fr 1.4fr">
           <div class="field"><label>授权对象</label><div class="seg"><button :class="{on:g.subject_type==='role'}" @click="g.subject_type='role'">角色</button><button :class="{on:g.subject_type==='employee'}" @click="g.subject_type='employee'">员工</button></div></div>
           <div class="field"><label>{{g.subject_type==='role'?'角色编码':'员工工号'}}</label>
-            <input v-if="g.subject_type==='role'" class="in" v-model="g.subject" list="role-list" placeholder="如 user（全体普通用户）">
+            <input v-if="g.subject_type==='role'" class="in" v-model="g.subject" list="role-list" placeholder="如 user（默认数据角色）">
             <select v-else class="in" v-model="g.subject"><option value="" disabled>选择员工</option><option v-for="e in emps" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select>
             <datalist id="role-list"><option v-for="r in roles" :value="r"></option></datalist></div>
           <div class="field"><label>业务场景（数据集）</label><select class="in" v-model="g.dataset_id" @change="g.tables=['*']"><option :value="null" disabled>选择</option><option v-for="d in datasets" :value="d.id">{{d.business_scenario}}</option></select></div>
@@ -1148,19 +1719,30 @@ const Perms = {
       </div>
     </template>
 
-    <Drawer v-if="emp" :title="emp._new ? '新增员工' : '编辑员工 ' + emp.emp_no" @close="emp=null">
-      <div class="row2"><div class="field"><label>工号</label><input class="in mono" v-model="emp.emp_no" :disabled="!emp._new"></div>
-        <div class="field"><label>姓名</label><input class="in" v-model="emp.name"></div></div>
-      <div class="row2"><div class="field"><label>部门</label><input class="in" v-model="emp.department"></div>
-        <div class="field"><label>角色 <small>逗号分隔，按角色授权时使用</small></label><input class="in" v-model="emp.rolesTxt"></div></div>
-      <label class="check" style="margin-right:20px"><input type="checkbox" v-model="emp.is_admin"> 管理员（可访问全部数据；不勾选即普通用户）</label>
-      <label class="check"><input type="checkbox" v-model="emp.enabled"> 启用</label>
-      <template #foot><button class="btn" @click="emp=null">取消</button><button class="btn primary" @click="saveEmp">保存</button></template>
+    <Drawer v-if="emp" :title="emp._new ? '新增员工' : '编辑员工 ' + emp.emp_no" :busy="empSaving" @close="emp=null">
+      <fieldset class="plain-fs" :disabled="empSaving">
+        <div class="row2"><div class="field"><label for="emp-no">工号</label><input id="emp-no" class="in mono" v-model.trim="emp.emp_no" :disabled="!emp._new"></div>
+          <div class="field"><label for="emp-name">姓名</label><input id="emp-name" class="in" v-model="emp.name"></div></div>
+        <div class="field"><label for="emp-identity">系统身份</label>
+          <select id="emp-identity" class="in" v-model="emp.is_admin" aria-describedby="emp-identity-hint">
+            <option :value="false">普通用户</option><option :value="true">管理员</option>
+          </select>
+          <div id="emp-identity-hint" class="hint">启用的管理员可访问全部数据，并管理系统设置和员工授权。</div>
+        </div>
+        <div class="row2"><div class="field"><label for="emp-dept">部门</label><input id="emp-dept" class="in" v-model="emp.department"></div>
+          <div class="field"><label for="emp-roles">数据授权角色</label><input id="emp-roles" class="in" v-model="emp.rolesTxt" aria-describedby="emp-roles-hint">
+            <div id="emp-roles-hint" class="hint">用于分配数据表权限，多个角色用逗号分隔。</div></div></div>
+        <label class="check"><input type="checkbox" v-model="emp.enabled"> 启用账号</label>
+      </fieldset>
+      <div v-if="empSaveError" class="msg err" role="alert" style="margin-top:12px">保存失败：{{empSaveError}}</div>
+      <template #foot><button class="btn" :disabled="empSaving" @click="emp=null">取消</button>
+        <button class="btn primary" :disabled="empSaving" @click="saveEmp">{{empSaving ? '保存中…' : '保存'}}</button></template>
     </Drawer>
   </div>`,
   setup() {
     const tabs = [['emp', '员工'], ['grant', '表授权'], ['check', '权限查询']];
     const tab = ref('emp'), emps = ref([]), grants = ref([]), datasets = ref([]), emp = ref(null);
+    const empSaving = ref(false), empSaveError = ref('');
     const g = reactive({ subject_type: 'role', subject: '', dataset_id: null, tables: ['*'] });
     const chk = ref(''), chkRes = ref(null), dsDetail = ref(null);
     const roles = computed(() => Array.from(new Set(emps.value.flatMap(e => e.roles || []))));
@@ -1170,18 +1752,42 @@ const Perms = {
       [emps.value, grants.value, datasets.value] = await Promise.all([api('/api/employees'), api('/api/grants'), api('/api/datasets')]);
     };
     onMounted(load);
-    function editEmp(e) { emp.value = e ? { ...e, rolesTxt: (e.roles || []).join(', ') } : { _new: true, emp_no: '', name: '', department: '', rolesTxt: '', is_admin: false, enabled: true }; }
+    function editEmp(e) {
+      empSaveError.value = '';
+      emp.value = e ? { ...e, rolesTxt: (e.roles || []).join(', ') } : { _new: true, emp_no: '', name: '', department: '', rolesTxt: '', is_admin: false, enabled: true };
+    }
     async function saveEmp() {
-      const e = emp.value, body = { emp_no: e.emp_no, name: e.name, department: e.department, roles: e.rolesTxt.split(/[,，\s]+/).filter(Boolean), is_admin: e.is_admin, enabled: e.enabled };
-      await run(() => e._new ? api('/api/employees', { method: 'POST', body }) : api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'PUT', body }), '已保存');
-      emp.value = null; load();
+      if (empSaving.value) return;
+      const e = emp.value, previous = emps.value.find(row => row.emp_no === e.emp_no);
+      const rolesTxt = (previous?.roles || []).join(', ');
+      const body = { emp_no: e.emp_no };
+      // 系统身份独立提交；未编辑的数据角色和员工资料由服务端保留。
+      for (const key of ['name', 'department', 'is_admin', 'enabled']) {
+        if (e._new || e[key] !== previous?.[key]) body[key] = e[key];
+      }
+      if (e._new || e.rolesTxt !== rolesTxt) body.roles = e.rolesTxt.split(/[,，\s]+/).filter(Boolean);
+      empSaving.value = true; empSaveError.value = '';
+      try {
+        const path = e._new ? '/api/employees' : '/api/employees/' + encodeURIComponent(e.emp_no);
+        const saved = await api(path, { method: e._new ? 'POST' : 'PUT', body });
+        // 用保存结果更新列表，保留更新接口不返回的直授计数。
+        if (previous) Object.assign(previous, saved);
+        const identityChanged = !e._new && 'is_admin' in body;
+        toast(identityChanged ? (saved.is_admin ? '已设为管理员' : '已设为普通用户') : '已保存', 'ok');
+        emp.value = null;
+        if (saved.emp_no === state.me.emp_no) {
+          Object.assign(state.me, { is_admin: saved.enabled && saved.is_admin, registered: saved.enabled, roles: saved.roles });
+        }
+        if (e._new) load().catch(err => toast(err.message, 'err'));
+      } catch (err) { empSaveError.value = err.message; }
+      finally { empSaving.value = false; }
     }
     async function delEmp(e) { if (!confirm(`删除员工 ${e.emp_no}？其直接授权和管理台会话会删除。`)) return; await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load(); }
     function toggleT(t) { const i = g.tables.indexOf(t); if (i >= 0) g.tables.splice(i, 1); else g.tables.push(t); }
     async function addGrant() { const r = await run(() => api('/api/grants', { method: 'POST', body: { ...g } })); toast(`新增 ${r.added} 条授权`, 'ok'); load(); }
     async function delGrant(x) { if (!confirm('撤销该授权？')) return; await run(() => api('/api/grants/' + x.id, { method: 'DELETE' }), '已撤销'); load(); }
     async function checkEmp(no) { tab.value = 'check'; chk.value = no; chkRes.value = await run(() => api('/api/permissions/check?emp_no=' + encodeURIComponent(no))); }
-    return { tabs, tab, emps, grants, datasets, emp, g, chk, chkRes, roles, dsTables,
+    return { tabs, tab, emps, grants, datasets, emp, empSaving, empSaveError, g, chk, chkRes, roles, dsTables,
       editEmp, saveEmp, delEmp, toggleT, addGrant, delGrant, checkEmp, fmtTime };
   }
 };
@@ -1251,7 +1857,10 @@ const NAV_GROUPS = [
 ];
 function canVisitMine() { return !!state.me?.emp_no; }
 
-createApp({
+const appRoot = document.getElementById('app');
+if (appRoot.dataset.reportId) {
+  createApp(ReportViewer, { reportId: appRoot.dataset.reportId, initialVersion: appRoot.dataset.reportVersion }).mount(appRoot);
+} else createApp({
   components: { Login, GenerateReport },
   template: `<Login v-if="state.needLogin"/>
   <div class="shell" v-else-if="state.me">
@@ -1278,7 +1887,7 @@ createApp({
           <button type="button" class="btn ghost logout" @click="logout">退出登录</button>
         </div>
       </header>
-      <main id="main-content" ref="main" class="main" tabindex="-1"><component :is="page" :key="current[0]"/></main>
+      <main id="main-content" ref="main" class="main" tabindex="-1"><component :is="page" :key="pageKey"/></main>
     </div>
     <GenerateReport v-if="reportDraft" :template="reportDraft.template" @close="reportDraft=null"/>
   </div>
@@ -1299,6 +1908,8 @@ createApp({
       || (state.page === 'datasources' ? { title: '资源', items: [legacySource] } : groups.value[0]));
     const current = computed(() => currentGroup.value.items.find(n => n[0] === state.page) || groups.value[0].items[0]);
     const page = computed(() => PAGES[current.value[0]]);
+    // 身份变化后重新查询当前用户的权限详情，其他页面保留原有编辑状态。
+    const pageKey = computed(() => current.value[0] === 'mine' ? `mine:${isAdmin()}:${state.me?.registered}` : current.value[0]);
     const person = computed(() => state.me?.name || state.me?.emp_no || '管理员');
     watch(() => current.value[0], async () => {
       menuOpen.value = false;
@@ -1320,7 +1931,21 @@ createApp({
         loadMeta().catch(e => toast(e.message, 'err'));
       } catch (e) { bootError.value = e.message; }
     }
-    onMounted(init);
-    return { state, page, groups, currentGroup, current, person, menuOpen, main, reportDraft, bootError, init, icon, toasts, logout };
+    let refreshingIdentity = false;
+    async function refreshIdentity() {
+      if (!state.me || state.needLogin || refreshingIdentity) return;
+      refreshingIdentity = true;
+      try {
+        // 管理员可能在另一个会话改过此账号的身份；回到窗口时用现有会话刷新导航。
+        const me = await api('/api/me');
+        const changed = me.is_admin !== state.me.is_admin || me.registered !== state.me.registered;
+        state.me = me;
+        if (changed && me.registered) loadMeta().catch(e => toast(e.message, 'err'));
+      } catch { /* 暂时无法核验时保留界面；会话过期由 api() 统一处理。 */ }
+      finally { refreshingIdentity = false; }
+    }
+    onMounted(() => { init(); window.addEventListener('focus', refreshIdentity); });
+    onBeforeUnmount(() => window.removeEventListener('focus', refreshIdentity));
+    return { state, page, pageKey, groups, currentGroup, current, person, menuOpen, main, reportDraft, bootError, init, icon, toasts, logout };
   }
 }).mount('#app');

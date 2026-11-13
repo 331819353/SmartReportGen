@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 from functools import cache
 from hashlib import sha256
 from pathlib import Path
-from urllib.parse import quote
+from typing import Literal
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -18,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from . import auth, db, design, embedding, iam, mcp_oauth, permission, repo, seed, services
@@ -107,7 +109,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     if not principal:
         # 点击报告链接时引导浏览器完成 IAM 登录，程序调用继续收到标准 401。
-        if (authorization is None and request.method == "GET" and re.fullmatch(r"/reports/\d+(/download)?", path)
+        if (authorization is None and request.method == "GET" and re.fullmatch(r"/reports/\d+(/download|/content)?", path)
                 and "text/html" in request.headers.get("accept", "")):
             target = path + (f"?{request.url.query}" if request.url.query else "")
             return RedirectResponse("/auth/iam/login?next=" + quote(target, safe=""), status_code=302)
@@ -118,7 +120,11 @@ async def auth_middleware(request: Request, call_next):
     if not principal.registered:
         return JSONResponse({"detail": "工号未登记或已停用"}, status_code=403)
     if principal.is_admin or path.startswith("/reports/") or _user_allowed(request.method, path):
-        return await call_next(request)
+        response = await call_next(request)
+        # 每次打开报告都重新校验分享权限，避免撤销后浏览器继续使用缓存。
+        if path.startswith(("/reports/", "/api/reports")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
     return JSONResponse({"detail": "需要管理员权限；如需开通请联系管理员"}, status_code=403)
 
 
@@ -132,7 +138,8 @@ USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("DELETE", r"^/api/style-rules/\d+$"),
     ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates(/validate|/preview|/\d+/render)?$"),
     ("PUT", r"^/api/templates/\d+$"), ("DELETE", r"^/api/templates/\d+$"),
-    ("GET", r"^/api/reports(/\d+)?$"), ("DELETE", r"^/api/reports/\d+$"),
+    ("GET", r"^/api/reports(/\d+(/shares|/share-recipients|/versions)?)?$"), ("PUT", r"^/api/reports/\d+(/selection)?$"),
+    ("POST", r"^/api/reports/(merge|\d+/shares)$"), ("DELETE", r"^/api/reports/\d+(/shares/[^/]+)?$"),
 ]]
 
 
@@ -152,6 +159,11 @@ for _exc in (repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeEr
 @app.exception_handler(permission.PermissionDenied)
 async def _denied(_r, exc):
     return JSONResponse({"detail": str(exc)}, status_code=403)
+
+
+@app.exception_handler(repo.ReportConflict)
+async def _report_conflict(_r, exc):
+    return JSONResponse({"detail": str(exc)}, status_code=409)
 
 
 @app.exception_handler(UniqueViolation)
@@ -219,6 +231,9 @@ def api_template_spec():
     return Response(spec.read_text(encoding="utf-8"), media_type="text/plain")
 
 
+IAM_BROWSER_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+
+
 def _cookie_secure() -> bool:
     return settings.public_base_url.startswith("https://")
 
@@ -244,13 +259,20 @@ def auth_check(request: Request):
 
 
 @app.get("/auth/iam/login", response_class=HTMLResponse, responses={302: {"description": "跳转到海尔 IAM"}})
-def iam_login(next: str = "/"):
+def iam_login(request: Request, next: str = "/"):
     if not iam.configured():
         return HTMLResponse(_auth_page("海尔 IAM 暂不可用", "请联系系统管理员。"), status_code=503)
+    next_path = iam.safe_next(next)
+    callback = urlsplit(iam.redirect_uri())
+    # 登录 Cookie 仅属于签发它的主机。先切换到配置中的回调主机，例如从 127.0.0.1 切换到 localhost。
+    if callback.hostname and request.url.hostname != callback.hostname:
+        query = urlencode({"next": next_path})
+        return RedirectResponse(f"{callback.scheme}://{callback.netloc}/auth/iam/login?{query}",
+                                status_code=302, headers=IAM_BROWSER_HEADERS)
     # 用独立的短时 Cookie 绑定此次登录，避免其他浏览器的 IAM 回调替换当前用户会话。
     browser = secrets.token_urlsafe(32)
-    state = iam.pack_state(browser, iam.safe_next(next))
-    response = RedirectResponse(iam.authorize_url(state), status_code=302, headers={"Cache-Control": "no-store"})
+    state = iam.pack_state(browser, next_path)
+    response = RedirectResponse(iam.authorize_url(state), status_code=302, headers=IAM_BROWSER_HEADERS)
     response.set_cookie(auth.LOGIN_COOKIE, browser, path="/auth/iam/callback", httponly=True,
                         samesite="lax", secure=_cookie_secure(), max_age=600)
     return response
@@ -262,25 +284,32 @@ def iam_callback(request: Request, code: str = "", state: str = "", error: str =
         return mcp_oauth.complete_iam(request, code, state, error)
     browser = request.cookies.get(auth.LOGIN_COOKIE)
     try:
-        if error or not code or not browser:
-            raise iam.IamError("登录未完成，请从管理台重新登录")
+        # 单独识别未带回 Cookie 的回调，便于区分浏览器会话丢失和 IAM 授权失败。
+        if error or not code:
+            log.info("IAM 管理台回调未完成：IAM 返回错误或缺少授权码")
+            raise iam.IamError("海尔 IAM 授权未完成，请从管理台重新登录")
+        if not browser:
+            log.info("IAM 管理台回调未完成：缺少登录 Cookie")
+            raise iam.IamError("浏览器未带回登录凭据，请从管理台重新登录")
         nxt = iam.unpack_state(browser, state)
         token, ticket = iam.exchange_code(code)
         account = iam.resolve_account(token)
         principal = auth.principal_for(account.emp_no, account.name, via="session", register="iam_login")
     except iam.IamError as exc:
-        return HTMLResponse(_auth_page("单点登录失败", str(exc)), status_code=400)
+        return HTMLResponse(_auth_page("单点登录失败", str(exc)), status_code=400, headers=IAM_BROWSER_HEADERS)
     except iam.IamUnavailable as exc:
         log.warning("IAM 回调失败：%s", exc)
-        return HTMLResponse(_auth_page("单点登录失败", "IAM 暂时无法核实，请稍后重试"), status_code=503)
+        return HTMLResponse(_auth_page("单点登录失败", "IAM 暂时无法核实，请稍后重试"),
+                            status_code=503, headers=IAM_BROWSER_HEADERS)
     if not principal.registered:
-        return HTMLResponse(_auth_page("工号未登记或已停用", "请联系系统管理员。"), status_code=403)
+        return HTMLResponse(_auth_page("工号未登记或已停用", "请联系系统管理员。"),
+                            status_code=403, headers=IAM_BROWSER_HEADERS)
     seconds = settings.session_hours * 3600
     if lifetime := iam.expires_in(ticket):
         seconds = min(seconds, lifetime)
     session_id = auth.start_session(principal.emp_no, token, seconds)
     auth.end_session(request.cookies.get(auth.SESSION_COOKIE))
-    response = RedirectResponse(nxt, status_code=302, headers={"Cache-Control": "no-store"})
+    response = RedirectResponse(nxt, status_code=302, headers=IAM_BROWSER_HEADERS)
     response.delete_cookie(auth.LOGIN_COOKIE, path="/auth/iam/callback")
     response.set_cookie(auth.SESSION_COOKIE, session_id, httponly=True, samesite="lax",
                         secure=_cookie_secure(), max_age=seconds)
@@ -351,7 +380,16 @@ def _guard(request: Request):
     if _is_admin(request):
         return None
     acc = _access(request)
-    return lambda ds_row, sql: permission.check_sql(acc, ds_row, sql)
+
+    def guard(dataset):
+        # 普通用户的取数权限来自场景；直填数据源不能绕过场景的逐表条件。
+        if not dataset:
+            raise permission.PermissionDenied("请为查询关联有权限的业务场景，并使用该场景的数据源")
+        if not acc.can_dataset(dataset["id"]):
+            raise permission.PermissionDenied("无权使用该业务场景（数据集）")
+        return acc.tables.get(dataset["id"], set())
+
+    return guard
 
 
 def _require_dataset(request: Request, dataset_id) -> None:
@@ -372,7 +410,7 @@ def meta(request: Request):
         me_no = _p(request).emp_no or ""
         ds = [d for d in repo.list_datasets() if d["enabled"] and acc.can_dataset(d["id"])]
         stats = {"datasources": len({d["datasource_id"] for d in ds}), "datasets": len(ds),
-                 "templates": len(repo.list_templates(owner=me_no)), "reports": len(repo.list_reports(owner=me_no)),
+                 "templates": len(repo.list_templates(owner=me_no)), "reports": len(repo.list_reports(_p(request))),
                  "style_rules": len(repo.list_rules(owner=me_no, all_owners=False)), "employees": 0}
     return J({
         "datasource_types": [
@@ -470,6 +508,13 @@ def ds_tables(request: Request, ds_id: int, schema: str | None = None):
 def ds_describe(request: Request, ds_id: int, table: str, sample_rows: int = 10):
     _require_admin(request)
     return J(services.describe_table(repo.get_datasource(ds_id, with_secret=True), table, sample_rows))
+
+
+@app.get("/api/datasources/{ds_id}/columns")
+def ds_columns(request: Request, ds_id: int, table: str):
+    """场景过滤编辑器只读取字段，不必扫描行数或数据画像。"""
+    _require_admin(request)
+    return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).columns(table))
 
 
 @app.post("/api/datasources/{ds_id}/query")
@@ -701,64 +746,159 @@ def tpl_delete(request: Request, tpl_id: int):
 @app.get("/api/templates/{tpl_id}/versions/{version}")
 def tpl_version(request: Request, tpl_id: int, version: int):
     _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
-    row = db.fetchone(
-        "SELECT version, markdown, created_at FROM report_template.report_template_version WHERE template_id=%s AND version=%s",
-        (tpl_id, version),
-    )
-    if not row:
-        raise repo.NotFound("版本不存在")
-    return J(row)
+    return J(repo.get_template_version(tpl_id, version))
 
 
 @app.post("/api/templates/{tpl_id}/render")
 def tpl_render(request: Request, tpl_id: int, data: dict = Body(default={})):
-    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
-    return J(services.render_template_to_report(tpl_id, (data or {}).get("name"), guard=_guard(request)))
+    tpl = repo.get_template(tpl_id)
+    _check_owner(request, tpl.get("created_by"), "报告模板")
+    return J(services.render_template_to_report(tpl, (data or {}).get("name"), guard=_guard(request)))
 
 
-# ------------------------------------------------------------------ 报告（每人只看自己的，管理员看全部）
+# ------------------------------------------------------------------ 报告（创建人、管理员及被分享的员工）
+class ReportUpdate(BaseModel):
+    name: str
+    html: str | None = None
+    markdown: str | None = None
+    base_version: int | None = Field(default=None, ge=1, strict=True)
+    expected_version: int | None = Field(default=None, ge=1, strict=True)
+    revision: int | None = Field(default=None, ge=1, strict=True)
+    change_note: str = Field(default="", max_length=500)
+
+
+class ReportSelection(BaseModel):
+    version: int | None = Field(ge=1, strict=True)
+
+
+class ReportShare(BaseModel):
+    emp_no: str = Field(min_length=1, max_length=256)
+    access_level: Literal["view", "edit"]
+
+
+class ReportMergeSource(BaseModel):
+    id: int = Field(ge=1, strict=True)
+    version: int = Field(ge=1, strict=True)
+
+
+class ReportMerge(BaseModel):
+    name: str = Field(default="合并报告", min_length=1)
+    reports: list[ReportMergeSource] = Field(min_length=2)
+
+
 @app.get("/api/reports")
 def report_list(request: Request, template_id: int | None = None, q: str | None = None):
-    return J(repo.list_reports(template_id, owner=_owner_filter(request), q=q))
+    return J(repo.list_reports(_p(request), template_id, q))
+
+
+@app.post("/api/reports/merge", response_class=HTMLResponse)
+def report_merge(request: Request, data: ReportMerge):
+    name = data.name.strip()
+    content = services.merge_reports(_p(request), name, [(r.id, r.version) for r in data.reports])
+    return _report_attachment(content, name)
 
 
 @app.get("/api/reports/{report_id}")
-def report_get(request: Request, report_id: int):
-    r = repo.get_report(report_id, with_html=False)
-    _check_owner(request, r.get("created_by"), "报告")
-    r["url"] = f"{settings.public_base_url}/reports/{report_id}"
-    return J(r)
+def report_get(request: Request, report_id: int, include_html: bool = False, include_source: bool = False,
+               version: int | None = Query(default=None, ge=1)):
+    r = repo.get_report(report_id, _p(request), with_html=include_html, version=version, with_source=include_source)
+    return J({**r, **repo.report_links(r["id"], r["revision"])})
+
+
+@app.put("/api/reports/{report_id}")
+def report_update(request: Request, report_id: int, data: ReportUpdate):
+    # 旧客户端的 revision 同时锁定读取的正文与最新版本，新客户端可以从历史版本分支。
+    if data.revision is not None and (data.base_version is not None or data.expected_version is not None):
+        raise repo.Invalid("请使用 revision，或使用 base_version 和 expected_version")
+    return J(services.revise_report(report_id, _p(request), data.name, html=data.html, markdown=data.markdown,
+                                  base_version=data.base_version or data.revision, change_note=data.change_note,
+                                  expected_version=data.expected_version or data.revision,
+                                  guard=_guard(request) if data.markdown is not None else None))
+
+
+@app.get("/api/reports/{report_id}/versions")
+def report_versions(request: Request, report_id: int):
+    return J(repo.list_report_versions(report_id, _p(request)))
+
+
+@app.put("/api/reports/{report_id}/selection")
+def report_selection(request: Request, report_id: int, data: ReportSelection):
+    r = repo.select_report_version(report_id, _p(request), data.version)
+    return J({**r, **repo.report_links(r["id"], r["revision"])})
 
 
 @app.delete("/api/reports/{report_id}")
 def report_delete(request: Request, report_id: int):
-    _check_owner(request, repo.get_report(report_id, with_html=False).get("created_by"), "报告")
-    repo.delete_report(report_id)
+    repo.delete_report(report_id, _p(request))
     return {"ok": True}
 
 
-def _can_view_report(request: Request, r: dict) -> bool:
-    p = request.state.principal
-    return bool(p and (p.is_admin or (p.emp_no and r.get("created_by") == p.emp_no)))
+@app.get("/api/reports/{report_id}/shares")
+def report_shares(request: Request, report_id: int):
+    return J(repo.list_report_shares(report_id, _p(request)))
+
+
+@app.get("/api/reports/{report_id}/share-recipients")
+def report_share_recipients(request: Request, report_id: int, q: str = Query(default="", max_length=100)):
+    return J(repo.search_report_recipients(report_id, _p(request), q))
+
+
+@app.post("/api/reports/{report_id}/shares")
+def report_share(request: Request, report_id: int, data: ReportShare):
+    return J(repo.set_report_share(report_id, _p(request), data.emp_no, data.access_level))
+
+
+@app.delete("/api/reports/{report_id}/shares/{emp_no}")
+def report_unshare(request: Request, report_id: int, emp_no: str):
+    repo.revoke_report_share(report_id, _p(request), emp_no)
+    return {"ok": True}
+
+
+# 报告包含图表脚本，也可能包含协作者提交的 HTML。用不透明源隔离管理台会话。
+REPORT_HTML_HEADERS = {"Content-Security-Policy": "sandbox allow-scripts", "Referrer-Policy": "no-referrer"}
+
+
+def _report_attachment(content: str, name: str) -> Response:
+    # 普通下载和合并下载使用一致的 UTF-8 文件名及隔离策略。
+    fname = quote(f"{name}.html", safe="")
+    return HTMLResponse(content, headers={**REPORT_HTML_HEADERS, "Content-Disposition": f"attachment; filename*=UTF-8''{fname}"})
 
 
 @app.get("/reports/{report_id}", response_class=HTMLResponse)
-def report_view(request: Request, report_id: int):
-    r = repo.get_report(report_id)
-    if not _can_view_report(request, r):
-        return HTMLResponse(_auth_page("无权查看该报告", "只有报告创建人与管理员可以查看。"), status_code=403)
-    return HTMLResponse(r["html"])
+def report_view(request: Request, report_id: int, version: int | None = Query(default=None, ge=1)):
+    # 浏览器打开带版本操作的外层页面；现有 HTTP 客户端仍可直接获取报告 HTML。
+    if "text/html" not in request.headers.get("accept", ""):
+        return report_content(request, report_id, version)
+    try:
+        r = repo.get_report(report_id, _p(request), with_html=False, version=version)
+    except permission.PermissionDenied:
+        return HTMLResponse(_auth_page("无权查看该报告", "请使用获授权的海尔账号登录，或联系报告创建人。"), status_code=403)
+    # 固定版本链接和历史链接只改变本页预览，用户在页面上切换时才保存自己的选择。
+    initial = r["revision"] if version is not None or report_id != r["id"] else ""
+    page = _admin_index_html().replace('<div id="app"></div>',
+        f'<div id="app" data-report-id="{r["id"]}" data-report-version="{initial}"></div>')
+    return HTMLResponse(page, headers={"Vary": "Accept", "Referrer-Policy": "no-referrer"})
+
+
+@app.get("/reports/{report_id}/content", response_class=HTMLResponse)
+def report_content(request: Request, report_id: int, version: int | None = Query(default=None, ge=1)):
+    try:
+        r = repo.get_report(report_id, _p(request), version=version)
+    except permission.PermissionDenied:
+        return HTMLResponse(_auth_page("无权查看该报告", "请使用获授权的海尔账号登录，或联系报告创建人。"), status_code=403)
+    return HTMLResponse(r["html"], headers={**REPORT_HTML_HEADERS, "Vary": "Accept"})
 
 
 @app.get("/reports/{report_id}/download", response_class=HTMLResponse)
-def report_download(request: Request, report_id: int, standalone_file: bool = Query(True, alias="standalone")):
-    r = repo.get_report(report_id)
-    if not _can_view_report(request, r):
-        return HTMLResponse(_auth_page("无权下载该报告", "只有报告创建人与管理员可以下载。"), status_code=403)
-    html = standalone(r["html"]) if standalone_file else r["html"]
-    fname = quote(f"{r['name']}.html")
-    return Response(html, media_type="text/html; charset=utf-8",
-                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"})
+def report_download(request: Request, report_id: int, standalone_file: bool = Query(True, alias="standalone"),
+                    version: int | None = Query(default=None, ge=1)):
+    try:
+        r = repo.get_report(report_id, _p(request), version=version)
+    except permission.PermissionDenied:
+        return HTMLResponse(_auth_page("无权下载该报告", "请使用获授权的海尔账号登录，或联系报告创建人。"), status_code=403)
+    # 新报告下载与保存正文一致，旧报告才需要把站内图表库转换为内联脚本。
+    html = standalone(r["html"]) if standalone_file and not r["meta"].get("single_file") else r["html"]
+    return _report_attachment(html, r["name"])
 
 
 # ------------------------------------------------------------------ 权限：员工 / 表授权

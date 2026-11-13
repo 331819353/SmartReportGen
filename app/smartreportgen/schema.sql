@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS dataset.dataset_table (
     dataset_id        bigint NOT NULL REFERENCES dataset.dataset(id) ON DELETE CASCADE,
     table_name        text NOT NULL,
     table_description text NOT NULL DEFAULT '',
+    row_filters       jsonb NOT NULL DEFAULT '[]'::jsonb, -- 同字段多值取其一，不同字段同时满足
     sort              int NOT NULL DEFAULT 0,
     UNIQUE (dataset_id, table_name)
 );
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS report_template.report_template (
     user_requirement text NOT NULL DEFAULT '',
     analysis_goal    text NOT NULL DEFAULT '',
     business_summary text NOT NULL DEFAULT '',  -- 展示给业务人员的模板说明
+    template_type    text NOT NULL DEFAULT 'structured' CHECK (template_type IN ('structured', 'business')),  -- 结构化源码或业务 Markdown
     markdown         text NOT NULL,
     summary          jsonb NOT NULL DEFAULT '{}'::jsonb,  -- 解析摘要：章节/图表/筛选数量
     version          int NOT NULL DEFAULT 1,
@@ -130,6 +132,17 @@ CREATE TABLE IF NOT EXISTS permission.employee (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- 共享权限绑定单份报告与 IAM 工号，允许在接收人登记前预先授权。
+CREATE TABLE IF NOT EXISTS report.report_share (
+    report_id    bigint NOT NULL REFERENCES report.report(id) ON DELETE CASCADE,
+    emp_no       text NOT NULL,
+    access_level text NOT NULL CHECK (access_level IN ('view', 'edit')),
+    PRIMARY KEY (report_id, emp_no)
+);
+-- 兼容已有授权记录。删除已登记员工时由管理台在同一事务撤销其报告权限。
+ALTER TABLE report.report_share DROP CONSTRAINT IF EXISTS report_share_emp_no_fkey;
+CREATE INDEX IF NOT EXISTS report_share_employee_idx ON report.report_share (emp_no, report_id);
+
 CREATE TABLE IF NOT EXISTS permission.table_grant (
     id           bigserial PRIMARY KEY,
     subject_type text NOT NULL CHECK (subject_type IN ('employee', 'role')),
@@ -166,7 +179,10 @@ CREATE INDEX IF NOT EXISTS mcp_oauth_flow_expiry ON permission.mcp_oauth_flow(ex
 
 -- 兼容已有库，旧记录可以在管理台补充说明。
 ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_approach text NOT NULL DEFAULT '';
+ALTER TABLE dataset.dataset_table ADD COLUMN IF NOT EXISTS row_filters jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS business_summary text NOT NULL DEFAULT '';
+ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS template_type text NOT NULL DEFAULT 'structured'
+    CHECK (template_type IN ('structured', 'business'));
 ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS created_by text;
 -- 样式规则的结构化条目 [{category, text}]；content 由条目生成，供模型阅读
 ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS items jsonb NOT NULL DEFAULT '[]'::jsonb;
@@ -175,3 +191,89 @@ ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS created_by text;
 -- 员工来源：manual（管理员登记）/ iam_login（IAM 登录管理台）/ mcp（IAM Bearer 接入）
 ALTER TABLE permission.employee ADD COLUMN IF NOT EXISTS registered_via text NOT NULL DEFAULT 'manual';
 ALTER TABLE report.report ADD COLUMN IF NOT EXISTS created_by text;
+-- 报告主记录保留最新版本号，写入新版本时锁定该行分配下一个号码。
+ALTER TABLE report.report ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS report.report_version (
+    report_id        bigint NOT NULL REFERENCES report.report(id) ON DELETE CASCADE,
+    version          bigint NOT NULL CHECK (version > 0),
+    base_version     bigint,
+    name             text NOT NULL,
+    html             text NOT NULL,
+    meta             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    template_id      bigint REFERENCES report_template.report_template(id) ON DELETE SET NULL,
+    template_version int,
+    markdown         text,
+    dataset_id       bigint,
+    source_owner     text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    created_by       text,
+    change_note      text NOT NULL DEFAULT '',
+    PRIMARY KEY (report_id, version),
+    FOREIGN KEY (report_id, base_version) REFERENCES report.report_version(report_id, version),
+    CHECK (base_version < version)
+);
+
+-- 选择随员工账号保存，历史选择不影响其他员工；没有记录表示跟随最新版。
+CREATE TABLE IF NOT EXISTS report.report_selection (
+    report_id bigint NOT NULL,
+    emp_no    text NOT NULL REFERENCES permission.employee(emp_no) ON DELETE CASCADE,
+    version   bigint NOT NULL,
+    PRIMARY KEY (report_id, emp_no),
+    FOREIGN KEY (report_id, version) REFERENCES report.report_version(report_id, version) ON DELETE CASCADE
+);
+
+-- 合并前发出的报告链接仍指向原来的快照。
+CREATE TABLE IF NOT EXISTS report.report_alias (
+    old_id    bigint PRIMARY KEY,
+    report_id bigint NOT NULL,
+    version   bigint NOT NULL,
+    FOREIGN KEY (report_id, version) REFERENCES report.report_version(report_id, version) ON DELETE CASCADE
+);
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.setting WHERE key='report_version_migration_v1') THEN
+        RETURN;
+    END IF;
+
+    -- 仅合并同一创建人、同一模板、同名且有连续模板版本的历史渲染记录。
+    -- 授权名单必须完全一致；曾单独编辑、重复渲染或来源不明的记录保留独立入口。
+    CREATE TEMP TABLE legacy_report_versions ON COMMIT DROP AS
+    WITH candidates AS (
+        SELECT r.*, COALESCE((SELECT jsonb_object_agg(s.emp_no, s.access_level)
+                              FROM report.report_share s WHERE s.report_id=r.id), '{}'::jsonb) AS shares
+        FROM report.report r WHERE r.template_id IS NOT NULL AND r.created_by IS NOT NULL
+    ), groups AS (
+        SELECT template_id, created_by, name, max(id) AS report_id
+        FROM candidates GROUP BY template_id, created_by, name
+        HAVING count(*) > 1 AND bool_and(revision=1 AND meta ? 'queries')
+            AND count(DISTINCT shares)=1 AND count(DISTINCT template_version)=count(*)
+            AND max(template_version)-min(template_version)+1=count(*)
+            AND (array_agg(template_version ORDER BY id))=(array_agg(template_version ORDER BY template_version))
+    )
+    SELECT r.id, g.report_id, row_number() OVER (PARTITION BY g.report_id ORDER BY r.id) AS version
+    FROM candidates r JOIN groups g USING (template_id, created_by, name);
+
+    -- 旧编辑器曾覆盖正文。已有修订号照常保留，无法恢复的快照不补造。
+    INSERT INTO report.report_version(report_id, version, base_version, name, html, meta,
+        template_id, template_version, markdown, dataset_id, source_owner, created_at, created_by)
+    SELECT COALESCE(m.report_id,r.id), COALESCE(m.version,r.revision), NULLIF(m.version-1,0),
+        r.name, r.html, r.meta, r.template_id, r.template_version,
+        CASE WHEN r.revision=1 AND r.meta ? 'queries' THEN tv.markdown END,
+        t.dataset_id, t.created_by, r.created_at, r.created_by
+    FROM report.report r LEFT JOIN legacy_report_versions m ON m.id=r.id
+    LEFT JOIN report_template.report_template t ON t.id=r.template_id
+    LEFT JOIN report_template.report_template_version tv ON tv.template_id=r.template_id AND tv.version=r.template_version;
+
+    INSERT INTO report.report_alias(old_id, report_id, version)
+    SELECT id, report_id, version FROM legacy_report_versions WHERE id<>report_id;
+
+    UPDATE report.report r SET revision=v.version, name=v.name, html=v.html, meta=v.meta,
+        template_id=v.template_id, template_version=v.template_version
+    FROM (SELECT DISTINCT ON (report_id) * FROM report.report_version ORDER BY report_id, version DESC) v
+    WHERE r.id=v.report_id AND r.revision<>v.version;
+
+    DELETE FROM report.report r USING legacy_report_versions m WHERE r.id=m.id AND m.id<>m.report_id;
+    INSERT INTO sys.setting(key, value) VALUES ('report_version_migration_v1','done');
+END $$;

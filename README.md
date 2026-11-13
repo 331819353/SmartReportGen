@@ -7,15 +7,18 @@
               │  Authorization: Bearer <海尔 IAM access token>
               ▼ MCP（smartreportgen，Streamable HTTP）── 工号 → 权限表 → 可用业务场景/数据表（默认拒绝）
    a 混合检索业务场景 → 获取数据表      search_business_scenarios / get_dataset_tables
-   b 探查数据 → 设计章节/结论/图表/布局   describe_table / run_query / get_template_spec
+   b 探查并获取授权数据                  describe_table / run_query
    c 全局筛选（级联 / 预设 / 图表点击联动）
-   d 通用规则（设计令牌）+ 场景规则        get_style_rules（渲染时自动生效）
-   e 校验 → 存储模板（markdown）→ 生成 HTML   validate_report_template / save_report_template / render_report_html
-   f 存储 HTML                          render_report_html（自动）/ save_report
+   d 通用规则（设计令牌）+ 场景规则        get_style_rules
+   d 与 e 之间 整理并保存业务 Markdown 模板  save_report_template / get_report_template
+   e Agent 编写单文件 HTML，验证筛选联动和结论着色  save_report（关联模板版本）
+   f 查看或修订报告                     get_report / revise_report
               │
               ▼
    PostgreSQL + pgvector（按类型分 schema）  ◄──  管理台（数据源 / 数据集 / 报告模板 / 报告 / 样式规则 / 员工与授权）
 ```
+
+新报告把 CSS、JavaScript、聚合数据与页面资源内联到一个 `.html` 文件。验证离线打开和交互后保存。修改已有报告时，Agent 读取用户选中或明确指定的版本，把读取到的 `revision` 传给 `revise_report` 作为 `base_version`。
 
 ## 快速开始
 
@@ -73,11 +76,11 @@ export SMARTREPORT_TOKEN=<客户端取得的海尔 IAM access token>
   工号未登记或停用 → 无任何数据权限。
 - **管控点**：
   - 检索只在有权限的业务场景内进行，返回的表只包含有权限的表。
-  - `describe_table` 与 `run_query` 校验表权限：SQL 用 sqlglot 按数据源方言解析出全部引用表（排除 CTE），任何一张未授权即拒绝。
+  - `describe_table` 与 `run_query` 仅使用当前场景中已授权的表和视图。场景可以为每张表或视图配置字段保留值；服务端在 JOIN 和聚合前自动过滤，画像使用相同的数据范围。
   - 无法解析的 SQL、FROM 中的表函数、能在字符串里执行 SQL 或读外部数据的函数（`query_to_xml`、`dblink`、`DBMS_XMLGEN`、`read_csv` 等）一律拒绝。API 数据源的 DuckDB 在载入数据后关闭外部访问。
   - 模板校验与渲染时，每条查询同样按权限校验。
-  - 模板与报告按创建人隔离：非管理员只能读写、渲染本人创建的。
-- **报告查看**：报告创建人和管理员可登录后查看或下载。HTTP 客户端可在请求中传入 IAM Bearer。
+  - 报告模板由创建人和管理员管理，渲染仍按调用人的数据权限校验。
+- **报告分享**：在报告库点击「分享」，按已启用的员工工号授予「可查看」或「可编辑」。接收人用海尔 IAM 登录后，可通过分享链接查看，或在报告库编辑报告名称和 HTML。创建人和管理员可以更改或撤销分享权限。
 
 ## 样式：设计令牌
 
@@ -97,7 +100,7 @@ export SMARTREPORT_TOKEN=<客户端取得的海尔 IAM access token>
 ## 目录结构
 
 ```
-skills/smart-report/        技能（唯一来源）：SKILL.md、references/template-spec.md、references/example-retail.md
+skills/smart-report/        技能（唯一来源）：SKILL.md、单文件 HTML 示例与结构化模板参考
   ↑ .claude/skills/smart-report、.agents/skills/smart-report 为指向它的软链接（Claude Code / Codex 等自动发现）
 AGENTS.md                   通用 agent 指引（Codex、Cursor、Copilot 等读取）
 .mcp.json / .codex/config.toml   Claude Code / Codex 的项目级 MCP 配置（海尔 IAM 认证）
@@ -139,6 +142,6 @@ scripts/mcp_call.py         MCP 调试客户端
 - **向量模型**：当前 `.env` 接入 AI 网关的 `Qwen3-Embedding-4B`（`AI_BASE_URL` / `AI_API_KEY`），通过 `dimensions` 截断为 1024 维以使用 HNSW 索引，查询侧加指令前缀 `EMBEDDING_QUERY_INSTRUCTION`。
   在 8 条口语化需求上，场景检索命中率由离线哈希向量的 4/8 提升到 8/8。未配置时回退为 `EMBEDDING_PROVIDER=hash`（离线特征哈希，没有语义理解能力）；改模型或维度后重启会自动重建向量。
   向量接口不可用时检索自动降级为纯关键词，并在结果 `warnings` 中说明。
-- **报告数据**：查询在服务端执行，结果作为数据包嵌入 HTML，筛选联动在浏览器端完成；报告是数据快照，需要最新数据时重新渲染。
+- **报告数据**：Agent 通过 MCP 取数，将聚合结果嵌入 HTML，筛选联动在浏览器端完成。刷新数据时重新查询并保存报告新版本。
 - **安全**：数据源请使用只读账号（系统的只读 SQL 校验是第二道防线）；对外暴露前设置 `SECRET_KEY` 和海尔 IAM 应用凭证，并通过 HTTPS 提供服务。
 - **已验证**：PostgreSQL、MySQL 8.4、Oracle 23ai、HTTP API 连接器；StarRocks 仅按 MySQL 协议路径验证。权限越权用例见验证记录（JOIN、子查询、同名 CTE、带引号的标识符、information_schema、query_to_xml、read_csv 均被拒绝）。

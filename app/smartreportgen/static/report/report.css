@@ -3,7 +3,8 @@
 [hidden]{display:none!important}
 html{scroll-behavior:smooth;scroll-padding-top:var(--rf-scroll-inset,14px)}
 body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);font-family:var(--font-family);
-  font-size:var(--rre-card-font-prose-size);font-weight:var(--rre-card-font-prose-weight);line-height:var(--rre-prose-line-height);-webkit-font-smoothing:antialiased}
+  font-size:var(--rre-card-font-prose-size);font-weight:var(--rre-card-font-prose-weight);line-height:var(--rre-prose-line-height);-webkit-font-smoothing:antialiased;
+  container:rf-viewport / inline-size}
 .rf-wrap{width:min(var(--rf-max),calc(100% - 2 * var(--rre-page-pad)));margin:0 auto}
 :focus-visible{outline:2px solid var(--color-brand);outline-offset:2px}
 
@@ -63,9 +64,9 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 
 /* 主体 */
 .rf-layout{padding:14px 0 28px}
-.rf-has-toc{display:grid;grid-template-columns:var(--rre-toc-width) minmax(0,1fr);gap:var(--rre-toc-gap);align-items:start}
-.rf-toc{position:sticky;top:14px;height:calc(100dvh - 28px);display:flex;align-items:center;min-width:0}
-.rf-toc-card{width:100%;max-height:calc(100dvh - 56px);overflow:auto;padding:10px;background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
+/* 源码顺序即窄屏阅读顺序。目录较长时只滚动目录卡片。 */
+.rf-toc{min-width:0;margin-block-end:var(--rre-section-gap)}
+.rf-toc-card{width:100%;max-height:min(180px,32dvh);overflow:auto;padding:10px;background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
 .rf-toc-title{padding:0 2px 6px;color:var(--color-heading);font-size:var(--rre-card-font-prose-size);font-weight:800}
 .rf-toc-group{border-top:1px solid var(--color-border-card);padding:4px 0}
 .rf-toc a{display:block;padding:4px 7px;border-radius:5px;color:var(--color-text-primary);font-size:var(--rre-card-font-table-size);line-height:1.35;text-decoration:none;overflow-wrap:anywhere}
@@ -75,6 +76,18 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-toc a:hover,.rf-toc a.on{color:var(--color-heading);background:color-mix(in srgb,var(--color-brand) 8%,var(--color-bg-card))}
 .rf-main{min-width:0}
 .rf-intro{margin-bottom:8px;color:var(--color-text-secondary)}
+
+/* 宽屏目录与正文同一行。用零宽轨道把目录放进左侧留白，不改变标题和正文的宽度。 */
+@media screen{
+  @container rf-viewport (min-width:__RF_TOC_MIN_WIDTH__){
+    .rf-has-toc{display:grid;grid-template-columns:0 minmax(0,1fr);align-items:start}
+    .rf-has-toc>.rf-header{grid-column:2;grid-row:1}
+    .rf-has-toc>.rf-main{grid-column:2;grid-row:2}
+    .rf-has-toc>.rf-toc{grid-column:1;grid-row:2;justify-self:end;position:sticky;top:14px;
+      width:var(--rre-toc-width);margin:0;margin-inline-end:var(--rre-toc-gap)}
+    .rf-has-toc>.rf-toc .rf-toc-card{max-height:calc(100dvh - 28px)}
+  }
+}
 
 .rf-section{margin:0 0 var(--rre-section-gap);padding:var(--rre-section-pad);background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
 .rf-section:last-child{margin-bottom:0}
@@ -147,14 +160,11 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-footer{border-top:1px solid var(--color-border-card);color:var(--color-text-secondary);font-size:var(--rre-card-font-label-size);padding:18px 0 28px}
 
 @media (max-width:980px){
-  .rf-has-toc{grid-template-columns:minmax(0,1fr)}
-  .rf-toc{position:static;height:auto}
-  .rf-toc-card{max-height:min(180px,32dvh)}
   .rf-filter-in-header{width:100%}
   .rf-card.rf-narrow{--w:30}
 }
 @media (max-width:640px){
-  .rf-wrap{width:min(var(--rf-max),calc(100% - 16px))}
+  .rf-wrap{width:min(var(--rf-max),calc(100% - 2 * min(var(--rre-page-pad),8px)))}
   .rf-header{padding:min(var(--rre-header-pad),16px)}
   .rf-section{padding:min(var(--rre-section-pad),12px)}
   .rf-grid .rf-card{--w:60}

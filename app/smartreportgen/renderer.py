@@ -14,6 +14,8 @@ from markdown_it import MarkdownIt
 from . import design, repo
 from .config import settings
 from .connectors import ConnectorError, get_connector
+from .report_document import inline_legacy_echarts
+from .scenario_filters import has_filters, query_in_scenario
 from .template_parser import (
     DEFAULT_HEIGHT, DEFAULT_SPAN, METRIC_TOKEN_RE, Template, check_against_data, parse_template,
 )
@@ -53,34 +55,37 @@ def resolve_theme(tpl: Template, dataset_id: int | None = None, owner: str | Non
 
 
 # ------------------------------------------------------------ 数据
-def _default_datasource(tpl: Template, dataset_id: int | None) -> dict | None:
-    ref = tpl.meta.get("datasource")
-    if ref:
-        return repo.find_datasource(ref)
+def _query_dataset(tpl: Template, dataset_id: int | None) -> dict | None:
     ds_id = dataset_id or tpl.meta.get("dataset_id")
     if not ds_id and tpl.meta.get("scenario"):
         from . import db
 
         row = db.fetchone("SELECT id FROM dataset.dataset WHERE business_scenario=%s", (tpl.meta["scenario"],))
         ds_id = row["id"] if row else None
-    if ds_id:
-        d = repo.get_dataset(int(ds_id))
-        if d.get("datasource_id"):
-            return repo.get_datasource(d["datasource_id"], with_secret=True)
-    return None
+    return repo.get_dataset(int(ds_id)) if ds_id else None
+
+
+QueryGuard = Callable[[dict | None], set[str] | None]
 
 
 def run_queries(tpl: Template, dataset_id: int | None = None, max_rows: int | None = None,
-                guard: Callable[[dict, str], None] | None = None) -> tuple[dict, dict, list[str]]:
-    """返回 (data{qid:{columns,rows}}, stats{qid:{...}}, errors)。guard(ds_row, sql) 用于数据权限校验，不通过时抛异常。"""
+                guard: QueryGuard | None = None) -> tuple[dict, dict, list[str]]:
+    """返回数据、统计及错误；guard 校验权限并返回场景中授权的表，None 表示不限。"""
     max_rows = max_rows or settings.query_max_rows
     data: dict[str, dict] = {}
     stats: dict[str, dict] = {}
     errors: list[str] = []
-    default_ds = None
+    dataset, default_ds = None, None
     default_err = None
     try:
-        default_ds = _default_datasource(tpl, dataset_id)
+        dataset = _query_dataset(tpl, dataset_id)
+    except repo.NotFound as e:
+        return data, stats, [f"查询 {qid} 执行失败：{e}" for qid in tpl.queries]
+    try:
+        if ref := tpl.meta.get("datasource"):
+            default_ds = repo.find_datasource(ref)
+        elif dataset and dataset.get("datasource_id"):
+            default_ds = repo.get_datasource(dataset["datasource_id"], with_secret=True)
     except repo.NotFound as e:
         default_err = str(e)
     for qid, q in tpl.queries.items():
@@ -89,9 +94,14 @@ def run_queries(tpl: Template, dataset_id: int | None = None, max_rows: int | No
             ds = repo.find_datasource(q["datasource"]) if q.get("datasource") else default_ds
             if not ds:
                 raise ConnectorError(default_err or "未指定数据源：请在 front matter 设置 datasource，或关联数据集")
-            if guard:
-                guard(ds, q["sql"])
-            res = get_connector(ds).query(q["sql"], max_rows)
+            query_dataset = dataset if dataset and dataset["datasource_id"] == ds["id"] else None
+            # 模板可以指定数据源，但不能通过覆盖数据源跳过当前场景的固定取值范围。
+            if not query_dataset and has_filters(dataset):
+                raise ConnectorError("设有数据过滤的业务场景只能查询其关联的数据源")
+            allowed = guard(query_dataset) if guard else None
+            conn = get_connector(ds)
+            res = (query_in_scenario(ds, query_dataset, q["sql"], max_rows, conn, allowed)
+                   if query_dataset else conn.query(q["sql"], max_rows))
         except (ConnectorError, repo.NotFound, RuntimeError, PermissionError) as e:
             errors.append(f"查询 {qid} 执行失败：{e}")
             continue
@@ -294,7 +304,9 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
         "theme": design.runtime_tokens(theme),
         "filters": tpl.filters, "presets": tpl.presets, "measures": measures, "charts": charts, "data": data,
     }
-    css = (STATIC / "report" / "report.css").read_text(encoding="utf-8")
+    # 容器查询不能读取 CSS 自定义属性；使用合并后的主题计算断点，确保目录始终放得进留白。
+    css = (STATIC / "report" / "report.css").read_text(encoding="utf-8").replace(
+        "__RF_TOC_MIN_WIDTH__", f"{design.toc_min_width(theme)}px")
     js = (STATIC / "report" / "runtime.js").read_text(encoding="utf-8")
     if inline_echarts:
         ech = "<script>" + (STATIC / "vendor" / "echarts.min.js").read_text(encoding="utf-8") + "</script>"
@@ -322,15 +334,15 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
 </head>
 <body class="{'rf-zebra' if theme['table_zebra'] else ''}">
 <div class="rf-wrap rf-layout{' rf-has-toc' if toc_html else ''}">
+  <header class="{header_cls}">
+    <h1 class="rf-title">{html.escape(tpl.title)}</h1>
+    {f'<p class="rf-subtitle">{sub}</p>' if sub else ''}
+    {f'<p class="rf-goal"><b>分析目标</b>{goal}</p>' if goal else ''}
+    {f'<div class="rf-chips"><span class="rf-chip">业务场景 · {scenario}</span></div>' if scenario else ''}
+    {filters if not sticky else ''}
+  </header>
   {toc_html}
   <main class="rf-main">
-    <header class="{header_cls}">
-      <h1 class="rf-title">{html.escape(tpl.title)}</h1>
-      {f'<p class="rf-subtitle">{sub}</p>' if sub else ''}
-      {f'<p class="rf-goal"><b>分析目标</b>{goal}</p>' if goal else ''}
-      {f'<div class="rf-chips"><span class="rf-chip">业务场景 · {scenario}</span></div>' if scenario else ''}
-      {filters if not sticky else ''}
-    </header>
     {filters if sticky else ''}
     {body}
   </main>
@@ -344,7 +356,7 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
 
 
 def render(markdown: str, dataset_id: int | None = None, inline_echarts: bool = False,
-           guard: Callable[[dict, str], None] | None = None, owner: str | None = None) -> tuple[str, dict]:
+           guard: QueryGuard | None = None, owner: str | None = None) -> tuple[str, dict]:
     t0 = time.time()
     tpl, errors, warnings = parse_template(markdown)
     if errors:
@@ -365,7 +377,7 @@ def render(markdown: str, dataset_id: int | None = None, inline_echarts: bool = 
 
 
 def validate(markdown: str, dataset_id: int | None = None, execute: bool = True,
-             guard: Callable[[dict, str], None] | None = None, owner: str | None = None) -> dict:
+             guard: QueryGuard | None = None, owner: str | None = None) -> dict:
     tpl, errors, warnings = parse_template(markdown)
     res: dict[str, Any] = {"ok": False, "errors": list(errors), "warnings": list(warnings), "summary": tpl.summary()}
     if errors or not execute:
@@ -399,5 +411,4 @@ def validate(markdown: str, dataset_id: int | None = None, execute: bool = True,
 
 def standalone(html_text: str) -> str:
     """把外链的 echarts 替换为内联脚本，得到可离线打开的单文件 HTML。"""
-    ech = (STATIC / "vendor" / "echarts.min.js").read_text(encoding="utf-8")
-    return re.sub(r'<script src="[^"]*echarts\.min\.js"></script>', lambda _m: f"<script>{ech}</script>", html_text, count=1)
+    return inline_legacy_echarts(html_text)

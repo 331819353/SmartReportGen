@@ -145,7 +145,7 @@ class Connector:
     def columns(self, table: str) -> list[dict]:
         raise NotImplementedError
 
-    def query(self, sql: str, limit: int) -> dict:
+    def query(self, sql: str, limit: int, *, params: dict | None = None, tables: list[str] | None = None) -> dict:
         """返回 {columns, rows, truncated}"""
         raise NotImplementedError
 

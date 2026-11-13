@@ -77,7 +77,7 @@ OTHER_TOKENS = {
 LAYOUT_OPTIONS = {  # 非 CSS 变量的页面选项
     "header_style": "banner",   # banner：主题色横幅 + 反白文字；plain：白色卡片
     "toc": True,
-    "max_width": 1240,
+    "max_width": 1240,         # 标题块与正文的最大宽度，不含侧边目录与页边距
     "filter_sticky": False,     # 默认筛选位于封面；开启后移到封面下方并吸顶
     "chart_grid": "solid",      # 图表网格线：dashed / solid / none
     "table_zebra": True,        # 表格斑马纹
@@ -257,10 +257,18 @@ def runtime_tokens(t: dict) -> dict:
     return {k: t[k] for k in KNOWN_KEYS if k != "custom_css"}
 
 
+def toc_min_width(t: dict) -> int:
+    """正文居中时，两侧都要为目录宽度、目录间距和页面边距留足空间。"""
+    return t["max_width"] + 2 * (t["rre-page-pad"] + t["rre-toc-width"] + t["rre-toc-gap"])
+
+
 # ============================================================ 业务人员可读的元数据（样式规则编辑器使用）
 PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式：后三者合并为一份“指定样式”（视觉样式与展示要求），"
               "同一项以优先级高者为准，作为约束交给智能体；智能体可以按自己的判断调整，没有指定的由智能体自由决定")
 # 内置样式同时约束布局和同类卡片的视觉表现。
+BUILTIN_PAGE_LAYOUT = ("标题背景与正文共用 max_width 和页面边距，等宽居中。"
+                       "只有两侧留白都能容纳目录宽度、目录间距和页面边距时，目录才放在左侧留白；"
+                       "空间不足时目录放在标题下方、正文之前。目录不占正文宽度。")
 BUILTIN_CARD_LAYOUT = "同一行的卡片等高并铺满可用宽度，单张卡片占满所在行。"
 BUILTIN_CARD_STYLE = ("同一报告内同类卡片跨章节共用组件样式。表格统一表头、行高、隔行底色和列对齐。"
                       "同类图表统一图形、坐标轴、网格、图例、标签和配色规则。")
@@ -289,13 +297,13 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "rre-card-font-prose", "label": "正文", "type": "font", "sample": "本月收入高于目标。"},
         {"key": "rre-prose-line-height", "label": "正文行距", "type": "number", "step": 0.05, "min": 1.2, "max": 2.4, "desc": "行高是字号的倍数"},
     ]},
-    {"key": "layout", "label": "页面布局", "desc": BUILTIN_CARD_LAYOUT, "tokens": [
-        {"key": "max_width", "label": "页面最大宽度", "type": "px"},
+    {"key": "layout", "label": "页面布局", "desc": BUILTIN_PAGE_LAYOUT + BUILTIN_CARD_LAYOUT, "tokens": [
+        {"key": "max_width", "label": "标题与正文最大宽度", "type": "px"},
         {"key": "rre-page-pad", "label": "页面左右边距", "type": "px"},
         {"key": "rre-section-gap", "label": "章节之间的间距", "type": "px"},
         {"key": "rre-card-gap", "label": "卡片之间的间距", "type": "px"},
-        {"key": "toc", "label": "显示左侧目录", "type": "bool"},
-        {"key": "rre-toc-width", "label": "目录宽度", "type": "px"},
+        {"key": "toc", "label": "显示目录", "type": "bool"},
+        {"key": "rre-toc-width", "label": "侧栏目录宽度", "type": "px"},
         {"key": "rre-toc-gap", "label": "目录与正文间距", "type": "px"},
     ]},
     {"key": "header", "label": "报告头部", "desc": "报告最上方的标题区域", "tokens": [

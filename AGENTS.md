@@ -11,13 +11,14 @@
 2. 所有数据访问只通过 MCP 服务 **smartreportgen**（`http://localhost:18600/mcp`）。
    Codex CLI 可通过 `codex mcp login smartreportgen` 登录海尔 IAM 并自动携带 IAM access token。使用 Bearer 配置的客户端可传入 海尔 IAM access token。
    不要直连数据库，不要编造数据；遇到 `permission_denied` 不要尝试绕过，应告知用户申请权限。
-3. 模板语法：MCP 工具 `get_template_spec`，或 `skills/smart-report/references/template-spec.md`。
+3. 整理分析、数据证据、筛选和样式，调用 `save_report_template(template_type="business", ...)` 保存面向业务的 Markdown 模板，再用 `get_report_template` 读取指定版本。Agent 直接编写单文件 HTML，内联 CSS、JavaScript、聚合数据及页面资源。在浏览器验证离线打开、筛选联动和结论指标着色后，用 `save_report` 提交完整文档，关联实际使用的模板 ID 和版本。
+4. 修改已有报告时，用 `get_report(include_html=true)` 读取用户选中的版本。用户明确指定版本时传入 `version`，没有选择时默认读取最新版。验证修改后的单文件，将读取的 `revision` 作为 `base_version` 传给 `revise_report`，在同一报告下追加新版本。维护已有结构化模板时可调用 `get_template_spec`。
 
 各 agent 的 MCP 接入方式见 `docs/DEPLOYMENT.md` 的「接入 Agent」一节。管理台 HTTP 接入见 `docs/HTTP_API.md`。
 
 ## 开发本仓库
 
 - 服务代码：`app/smartreportgen/`（FastAPI 管理 API + MCP 服务）。部署与配置：`docs/DEPLOYMENT.md`。
-- 修改后执行 `docker compose build && docker compose up -d`。报告的 CSS/JS 在渲染时内联，旧报告需重新渲染才生效。
+- 修改后执行 `docker compose build && docker compose up -d`。已保存的报告是快照，变更报告内容时保存新版本。
 - 技能只维护 `skills/smart-report/` 这一份；镜像构建时会被复制进 MCP 服务，修改后需要重新构建。
 - 调试 MCP：`docker compose exec -T -e MCP_TOKEN=<令牌> mcp python - call <tool> '<json参数>' < scripts/mcp_call.py`

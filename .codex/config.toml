@@ -1,6 +1,1 @@
-# 信任本项目后，在终端运行 codex mcp login smartreportgen，通过浏览器完成海尔 IAM 登录。
-[mcp_servers.smartreportgen]
-url = "http://localhost:18600/mcp"
-
-[mcp_servers.smartreportgen.oauth]
-client_id = "smartreportgen-cli"
+# 本机已移除 smartreportgen 的 Codex 接入配置。

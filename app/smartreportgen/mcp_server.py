@@ -4,16 +4,17 @@
       决定可检索的业务场景与可访问的数据表。数据访问一律默认拒绝。
 工具按智能报告生成流程组织：
   a. search_business_scenarios → get_dataset_tables
-  b. describe_table / run_query → get_template_spec
+  b. describe_table / run_query
   d. get_style_rules
-  e. validate_report_template → save_report_template → render_report_html（生成并存储 HTML）
-  f. save_report / get_report
+  d 与 e 之间. save_report_template → get_report_template
+  e. agent 按已保存的业务模板开发并验证完整 HTML → save_report
+  f. get_report / revise_report
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from fastapi.encoders import jsonable_encoder
@@ -25,8 +26,8 @@ from . import auth, db, design, mcp_oauth, repo, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
-from .permission import Access, PermissionDenied, access_for, check_sql
-from .renderer import RenderError, render, validate as validate_md
+from .permission import Access, PermissionDenied, access_for
+from .renderer import RenderError, validate as validate_md
 from .template_parser import TemplateError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -35,7 +36,7 @@ log = logging.getLogger("smartreportgen.mcp")
 SKILL_DIR = Path(__file__).with_name("docs") / "skill"
 SKILL_FILE = SKILL_DIR / "SKILL.md"
 SPEC_FILE = SKILL_DIR / "references" / "template-spec.md"
-EXAMPLE_FILE = SKILL_DIR / "references" / "example-retail.md"
+EXAMPLE_FILE = SKILL_DIR / "references" / "example-report.html"
 
 
 def _skill_body() -> str:
@@ -50,10 +51,12 @@ def _skill_body() -> str:
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP（使用海尔 IAM access token；数据按员工工号做表级权限控制）。
 若你所在的 agent 没有加载 smart-report 技能（Skill），请先调用 get_skill_guide 获取完整的生成流程与方法，再按流程执行。推荐流程：
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
-2) 结合用户需求和场景的 analysis_approach，用 describe_table / run_query 验证数据与分析假设，确定分析目标；调用 get_template_spec 了解模板语法；
+2) 结合用户需求和场景的 analysis_approach，用 describe_table / run_query 验证数据与分析假设，获取供筛选重新计算的聚合数据；
 3) 根据用户需求、场景分析思路和查询证据，决定报告的章节、结论、图表、布局及筛选；
 4) get_style_rules(业务场景) 获取视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，未指定的项由你决定；
-5) validate_report_template 校验直至无错误 → save_report_template 存储模板 → render_report_html 生成并存储 HTML。
+5) 将前面步骤整理成业务人员可读的 Markdown 报告模板，包含目标、分析口径、主要证据、章节、筛选和展示规则。用 save_report_template(template_type="business", ...) 保存，并用 get_report_template 读取指定版本。
+6) Agent 直接编写单文件 HTML，内联 CSS、JavaScript、聚合数据与页面资源。在浏览器验证离线打开、筛选联动和结论指标着色后，用 save_report 提交完整文件并关联实际使用的模板 ID 和版本。
+修改已有报告时用 get_report(include_html=true) 读取选中的版本，显式指定的 version 优先。验证修改后的单文件，再把读取的 revision 作为 base_version 传给 revise_report，在同一份报告下保存新版本。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
 mcp = FastMCP("smartreportgen", instructions=INSTRUCTIONS, stateless_http=True, json_response=True)
@@ -70,6 +73,8 @@ def _err(e: Exception) -> dict:
     out = {"ok": False, "error": str(e)}
     if isinstance(e, PermissionDenied):
         out["error_type"] = "permission_denied"
+    if isinstance(e, repo.ReportConflict):
+        out["error_type"] = "conflict"
     return out
 
 
@@ -96,8 +101,13 @@ def _require_dataset(acc: Access, dataset_id: int) -> None:
 
 
 def _guard(acc: Access):
-    def g(ds_row: dict, sql: str) -> None:
-        check_sql(acc, ds_row, sql)
+    def g(dataset: dict | None) -> set[str] | None:
+        if dataset:
+            _require_dataset(acc, dataset["id"])
+            return None if acc.all else acc.tables.get(dataset["id"], set())
+        if not acc.all:
+            raise PermissionDenied("请为查询关联有权限的业务场景，并使用该场景的数据源")
+        return None
     return g
 
 
@@ -119,7 +129,8 @@ def _dataset_brief(ds: dict, acc: Access) -> dict:
         "business_description": ds["business_description"], "analysis_approach": ds["analysis_approach"],
         "tags": ds.get("tags") or [],
         "datasource": {"id": ds.get("datasource_id"), "name": ds.get("datasource_name"), "type": ds.get("datasource_type")},
-        "tables": [{"table_name": t["table_name"], "table_description": t["table_description"]} for t in tables],
+        "tables": [{"table_name": t["table_name"], "table_description": t["table_description"],
+                    "row_filters": t["row_filters"]} for t in tables],
     }
     if hidden:
         out["unauthorized_table_count"] = hidden
@@ -172,7 +183,7 @@ def search_business_scenarios(query: str, ctx: Context, top_k: int = 3) -> dict:
 
 @mcp.tool()
 def get_dataset_tables(dataset_id: int, ctx: Context) -> dict:
-    """获取某业务场景的业务描述、分析思路、当前员工有权限的数据表及数据源信息（类型决定 SQL 方言）。"""
+    """获取业务场景的描述、分析思路、已授权的表或视图、各表取值范围及数据源信息。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
@@ -207,22 +218,26 @@ def describe_table(dataset_id: int, table_name: str, ctx: Context, sample_rows: 
             raise repo.Invalid(f"表 {table_name} 不属于业务场景「{ds['business_scenario']}」")
         if not acc.can_table(dataset_id, table_name):
             raise PermissionDenied(f"{acc.principal.label} 无权访问数据表：{table_name}")
-        ds_row = services.datasource_for_dataset(dataset_id)
-        return _ok({"ok": True, **services.describe_table(ds_row, table_name, max(0, min(sample_rows, 50)))})
+        ds_row = services.datasource_for_dataset(ds)
+        allowed = None if acc.all else acc.tables.get(dataset_id, set())
+        return _ok({"ok": True, **services.describe_table(ds_row, table_name, max(0, min(sample_rows, 50)),
+                                                          dataset=ds, allowed=allowed)})
     except _EXPECTED as e:
         return _err(e)
 
 
 @mcp.tool()
 def run_query(dataset_id: int, sql: str, ctx: Context, limit: int = 200) -> dict:
-    """在业务场景对应的数据源上执行只读 SQL（单条 SELECT/WITH），只能引用当前员工有权限的表（含跨表 JOIN 的每一张表）。
+    """在业务场景上执行只读 SQL（单条 SELECT/WITH），只能引用该场景中当前员工有权限的表或视图。
+    场景的逐表取值条件由服务端在 JOIN、聚合前自动应用。
     SQL 方言与数据源类型一致（api 类型数据源使用 DuckDB 方言，表名为接口逻辑名）。结果列名统一转小写。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
-        ds_row = services.datasource_for_dataset(dataset_id)
-        check_sql(acc, ds_row, sql)
-        return _ok({"ok": True, **services.run_query(ds_row, sql, limit)})
+        ds = repo.get_dataset(dataset_id)
+        ds_row = services.datasource_for_dataset(ds)
+        allowed = None if acc.all else acc.tables.get(dataset_id, set())
+        return _ok({"ok": True, **services.run_query(ds_row, sql, limit, dataset=ds, allowed=allowed)})
     except _EXPECTED as e:
         return _err(e)
 
@@ -230,10 +245,10 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int = 200) -> dict
 @mcp.tool()
 def get_skill_guide(include_example: bool = False) -> str:
     """返回 smart-report 技能全文：报告生成的完整流程（a-f）、分析与设计方法、权限处理与最终回复格式。
-    适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带完整示例模板。"""
-    text = _skill_body() + "\n\n> 模板语法请调用 get_template_spec 获取。\n"
+    适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。"""
+    text = _skill_body()
     if include_example:
-        text += "\n\n## 附：完整示例模板（零售销售经营分析）\n\n" + EXAMPLE_FILE.read_text(encoding="utf-8")
+        text += "\n\n## 附：默认布局与结论动态着色的 HTML 示例\n\n```html\n" + EXAMPLE_FILE.read_text(encoding="utf-8") + "```\n"
     return text
 
 
@@ -245,8 +260,7 @@ def smart_report_prompt(requirement: str) -> str:
 
 @mcp.tool()
 def get_template_spec() -> str:
-    """返回报告模板（markdown）完整语法：front matter（queries/measures/filters/presets/theme）、
-    章节/汇总结论/子结论结构、chart 图表块全部类型与参数、健康度与升降色、布局规则。编写模板前必须阅读。"""
+    """返回服务端结构化报告模板的 Markdown 语法。维护结构化模板时使用。直接编写 HTML 报告时参考 get_skill_guide。"""
     return SPEC_FILE.read_text(encoding="utf-8")
 
 
@@ -256,7 +270,7 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
     """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置经营报告主题，合并为一份 specified，
     作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
     文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
-    最终生效顺序：你的决定（模板 theme 与模板写法）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式——默认遵守约束，确有理由时可按自己的判断调整。"""
+    最终生效顺序：你的决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。将适用的样式和展示要求落实到生成的 HTML 中。"""
     try:
         p = _principal(ctx)
         res = repo.style_rules_for(business_scenario, query or None, owner=p.emp_no)
@@ -271,13 +285,12 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
         "precedence": res["precedence"],
         "specified": res["specified"],
         "rules": rules,
-        "note": ("specified 是检索出的样式约束（业务场景规则 ≥ 通用规则 ≥ 内置样式 合并的结果）：theme 在渲染时自动生效，"
-                 "模板中无需重复；items 是展示要求，各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
-                 f"内置页面布局要求：{design.BUILTIN_CARD_LAYOUT}窄屏换行后也按实际行计算。"
+        "note": ("specified 合并了业务场景、通用及内置样式。直接编写 HTML 时，请将适用的 theme 和 items 落实到 CSS、图表配置与脚本。"
+                 f"内置页面布局要求：{design.BUILTIN_PAGE_LAYOUT}{design.BUILTIN_CARD_LAYOUT}窄屏换行后也按实际行计算。"
                  f"{design.BUILTIN_CARD_STYLE}自编 HTML 时请复用同类卡片的 CSS 与图表配置。"
-                 "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。默认遵守展示约束，"
-                 "确有理由时（如用户明确要求、报告内容需要）可在模板 theme 中覆盖或不采纳某条要求，并在最终回复中说明。"
-                 "未指定的视觉样式与展示要求由你自由决定（可用样式项见 get_template_spec「主题」）。"),
+                 "items 各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
+                 "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。确有理由时可调整展示要求并在回复中说明。"
+                 "使用服务端结构化模板渲染时，theme 会自动应用。"),
         "warnings": res["warnings"],
     })
 
@@ -285,8 +298,8 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
 # ============================== e/f. 模板与报告 ==============================
 @mcp.tool()
 def validate_report_template(markdown: str, ctx: Context, dataset_id: int | None = None, execute: bool = True) -> dict:
-    """校验报告模板：语法、图表参数、度量表达式，并（execute=true）实际执行全部查询（按权限校验每条 SQL），
-    检查字段引用、返回每个查询的行数/列/样本与筛选器取值预览。保存前应校验到 errors 为空。"""
+    """校验旧结构化模板的语法、图表参数、度量表达式。execute=true 时按权限执行查询并检查字段引用。
+    新报告的业务 Markdown 与单文件 HTML 使用 get_skill_guide 中的编写和浏览器验收流程。"""
     try:
         acc = _access(ctx)
         if dataset_id:
@@ -299,9 +312,11 @@ def validate_report_template(markdown: str, ctx: Context, dataset_id: int | None
 @mcp.tool()
 def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int | None = None,
                          user_requirement: str = "", analysis_goal: str = "", template_id: int | None = None,
-                         business_summary: str | None = None) -> dict:
-    """存储报告模板（markdown）。business_summary 用通俗语言说明模板适用的问题、分析内容和对比口径，供业务人员在管理台阅读。
-    传 template_id 则更新已有模板，源码变化时递增版本号。"""
+                         business_summary: str | None = None,
+                         template_type: Literal["business", "structured"] | None = None) -> dict:
+    """保存报告模板。新报告的业务 Markdown 请传 template_type='business'，原文可用普通标题、段落和表格。
+    旧结构化模板传 structured 或沿用旧客户端默认值。传 template_id 更新既有模板，类型沿用原值，正文变化时增加版本。
+    business_summary 是管理台显示的简短用途说明，完整业务文档放在 markdown。"""
     try:
         acc = _access(ctx)
         if dataset_id:
@@ -316,19 +331,25 @@ def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int
         # 省略时兼容旧客户端，显式传空字符串可以清除说明。
         if business_summary is not None:
             data["business_summary"] = business_summary
+        if template_type is not None:
+            data["template_type"] = template_type
         t = repo.save_template(data, template_id)
     except _EXPECTED as e:
         return _err(e)
-    return _ok({"ok": True, "template_id": t["id"], "version": t["version"], "name": t["name"], "summary": t["summary"]})
+    return _ok({"ok": True, "template_id": t["id"], "version": t["version"], "name": t["name"],
+                "template_type": t["template_type"], "summary": t["summary"]})
 
 
 @mcp.tool()
-def get_report_template(template_id: int, ctx: Context) -> dict:
-    """读取本人创建的报告模板（含 markdown 全文），用于复用或修改。"""
+def get_report_template(template_id: int, ctx: Context, version: int | None = None) -> dict:
+    """读取有权限的报告模板及 Markdown 全文。指定 version 时读取对应正文，用于编写或复现该版报告。"""
     try:
         acc = _access(ctx)
         t = repo.get_template(template_id)
         _check_owner(acc, t.get("created_by"), "报告模板")
+        if version is not None:
+            # 历史版本只记录正文，当前模板的摘要和其他可变元数据不代表历史版本。
+            t = {**{key: t[key] for key in ("id", "template_type")}, **repo.get_template_version(template_id, version)}
         return _ok({"ok": True, **t})
     except _EXPECTED as e:
         return _err(e)
@@ -344,58 +365,114 @@ def list_report_templates(ctx: Context, keyword: str = "") -> dict:
     rows = repo.list_templates(keyword or None, owner=_owner(acc))
     return _ok({"ok": True, "templates": [
         {"template_id": r["id"], "name": r["name"], "business_scenario": r["business_scenario"], "version": r["version"],
+         "template_type": r["template_type"],
          "user_requirement": r["user_requirement"], "updated_at": r["updated_at"], "summary": r["summary"]} for r in rows[:50]]})
-
-
-def _report_links(report_id: int) -> dict:
-    base = f"{settings.public_base_url}/reports/{report_id}"
-    return {"url": base, "download_url": f"{base}/download"}
 
 
 @mcp.tool()
 def render_report_html(template_id: int, ctx: Context, report_name: str = "") -> dict:
     """基于本人创建的报告模板执行查询（按权限校验每条 SQL）并生成 HTML 报告页面，同时存储到报告库。
-    返回 report_id 与 IAM 登录后可访问的 URL。"""
+    用于结构化模板渲染。直接编写的完整 HTML 请使用 save_report 保存。"""
     try:
         acc = _access(ctx)
         tpl = repo.get_template(template_id)
         _check_owner(acc, tpl.get("created_by"), "报告模板")
-        html, meta = render(tpl["markdown"], dataset_id=tpl.get("dataset_id"), guard=_guard(acc),
-                            owner=tpl.get("created_by"))
-        r = repo.save_report(report_name or tpl["name"], html, template_id, tpl["version"], meta,
+        r = services.render_template_to_report(tpl, report_name, guard=_guard(acc),
+                                               created_by=acc.principal.emp_no)
+    except _EXPECTED as e:
+        return _err(e)
+    return _ok({"ok": True, "report_id": r["id"], "name": r["name"], "version": r["revision"],
+                **repo.report_links(r["id"], r["revision"]), "html_bytes": r["meta"]["html_bytes"],
+                "warnings": r["warnings"], "queries": r["meta"].get("queries")})
+
+
+@mcp.tool()
+def save_report(name: str, html: str, ctx: Context, template_id: int | None = None,
+                template_version: int | None = None) -> dict:
+    """创建独立报告，保存已在浏览器验证的单文件 HTML，内联 CSS、JavaScript 和数据。
+    传 template_id 和 template_version 关联开发时使用的模板版本。修改现有报告时使用 revise_report。"""
+    try:
+        acc = _access(ctx)
+        if template_version is not None and template_id is None:
+            raise repo.Invalid("指定模板版本时须同时指定模板 ID")
+        ver = template_version
+        if template_id is not None:
+            t = repo.get_template(template_id)
+            _check_owner(acc, t.get("created_by"), "报告模板")
+            if ver is None:
+                ver = t["version"]
+            elif ver != t["version"]:
+                repo.get_template_version(template_id, ver)
+        r = repo.save_report(name, html, template_id, ver, {"source": "mcp.save_report"},
                              created_by=acc.principal.emp_no)
     except _EXPECTED as e:
         return _err(e)
-    return _ok({"ok": True, "report_id": r["id"], "name": r["name"], **_report_links(r["id"]),
-                "html_bytes": r["size"], "warnings": meta.get("warnings", []), "queries": meta.get("queries")})
+    return _ok({"ok": True, "report_id": r["id"], "version": r["revision"],
+                "template_id": template_id, "template_version": ver,
+                **repo.report_links(r["id"], r["revision"]), "html_bytes": r["meta"]["html_bytes"]})
 
 
 @mcp.tool()
-def save_report(name: str, html: str, ctx: Context, template_id: int | None = None) -> dict:
-    """存储一份完整的 HTML 报告页面（例如对 render_report_html 的结果做了改写后）。"""
+def list_reports(ctx: Context, keyword: str = "", template_id: int | None = None) -> dict:
+    """查找可访问的报告，每份报告返回一项，含当前版本及最新版本号。"""
     try:
-        acc = _access(ctx)
-        ver = None
-        if template_id:
-            t = repo.get_template(template_id)
-            _check_owner(acc, t.get("created_by"), "报告模板")
-            ver = t["version"]
-        r = repo.save_report(name, html, template_id, ver, {"source": "mcp.save_report"}, created_by=acc.principal.emp_no)
+        rows = repo.list_reports(_access(ctx).principal, template_id, keyword)
     except _EXPECTED as e:
         return _err(e)
-    return _ok({"ok": True, "report_id": r["id"], **_report_links(r["id"]), "html_bytes": r["size"]})
+    return _ok({"ok": True, "reports": [
+        {"report_id": r["id"], "name": r["name"], "current_version": r["current_version"],
+         "latest_version": r["latest_version"], "access_level": r["access_level"],
+         "template_id": r["template_id"], "template_name": r["template_name"], "created_by": r["created_by"],
+         **repo.report_links(r["id"])} for r in rows[:50]
+    ], "total": len(rows)})
 
 
 @mcp.tool()
-def get_report(report_id: int, ctx: Context, include_html: bool = False) -> dict:
-    """读取本人生成的报告信息；include_html=true 时返回 HTML 全文（可能较大）。"""
+def get_report(report_id: int, ctx: Context, include_html: bool = False, version: int | None = None,
+               include_source: bool = False) -> dict:
+    """读取可访问的报告。显式 version 优先，省略时读取本账号的当前选择或最新版。
+    include_html 返回该版本的 HTML；include_source 返回有权限读取的版本 Markdown 源码。"""
     try:
-        acc = _access(ctx)
-        r = repo.get_report(report_id, with_html=include_html)
-        _check_owner(acc, r.get("created_by"), "报告")
+        r = repo.get_report(report_id, _access(ctx).principal, with_html=include_html,
+                            version=version, with_source=include_source)
     except _EXPECTED as e:
         return _err(e)
-    return _ok({"ok": True, **r, **_report_links(report_id)})
+    return _ok({"ok": True, **r, **repo.report_links(r["id"], r["revision"])})
+
+
+@mcp.tool()
+def list_report_versions(report_id: int, ctx: Context) -> dict:
+    """列出报告版本、基准版本、修改人、修改说明及当前选择。"""
+    try:
+        return _ok({"ok": True, **repo.list_report_versions(report_id, _access(ctx).principal)})
+    except _EXPECTED as e:
+        return _err(e)
+
+
+@mcp.tool()
+def select_report_version(report_id: int, ctx: Context, version: int | None = None) -> dict:
+    """确认本账号后续查看和修改使用的版本。version 留空恢复跟随最新版本。"""
+    try:
+        r = repo.select_report_version(report_id, _access(ctx).principal, version)
+    except _EXPECTED as e:
+        return _err(e)
+    return _ok({"ok": True, **r, **repo.report_links(r["id"], r["revision"])})
+
+
+@mcp.tool()
+def revise_report(report_id: int, name: str, ctx: Context, base_version: int | None = None,
+                  html: str | None = None, markdown: str | None = None, change_note: str = "",
+                  expected_version: int | None = None) -> dict:
+    """从指定基准保存同一报告的新版本。基准省略时使用当前选择或最新版。
+    读取基准后传回其 revision 作为 base_version，并提交已验证的单文件 HTML。markdown 仅供旧结构化报告重渲染。"""
+    try:
+        acc = _access(ctx)
+        r = services.revise_report(report_id, acc.principal, name, base_version=base_version,
+                                   html=html, markdown=markdown, change_note=change_note,
+                                   expected_version=expected_version, guard=_guard(acc))
+    except _EXPECTED as e:
+        return _err(e)
+    return _ok({"ok": True, "report_id": r["id"], **r})
 
 
 # ============================== 启动 ==============================
@@ -408,6 +485,8 @@ class TokenAuth:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["path"].startswith("/mcp"):
             headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            # 只记录 Authorization 请求头是否存在，避免把 IAM 令牌写入日志。
+            log.info("MCP authorization_present=%s", "authorization" in headers)
             try:
                 principal = await run_in_threadpool(auth.verify_bearer, headers.get("authorization"),
                                                     headers.get("x-iam-access-token") or headers.get("access-token"))

@@ -218,12 +218,85 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .report-table td:first-child,.scene-table td:first-child{min-width:155px}
 .report-table time{white-space:nowrap;font-variant-numeric:tabular-nums}
 .report-table .links,.scene-table .links{min-width:102px}
+/* 分享表单和授权列表在窄屏下允许操作区自然换行。 */
+.report-dialog-name{margin:0 0 14px;font-weight:600;overflow-wrap:anywhere}
+.report-share-form{display:flex;align-items:end;gap:8px 12px;flex-wrap:wrap;margin-bottom:8px}
+.report-share-form .field{margin:0}
+.report-share-form .report-recipient-field{flex:1 1 100%}
+.report-recipient-picker{margin-bottom:12px}
+.report-recipient-picker .field{margin-bottom:6px}
+.report-recipient-results{list-style:none;margin:0;padding:0;max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:8px}
+.report-recipient-results li+li{border-top:1px solid var(--border)}
+.report-recipient-results button{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;min-height:44px;padding:6px 10px;border:0;background:var(--surface);color:var(--text);text-align:left;overflow-wrap:anywhere;cursor:pointer}
+.report-recipient-results button:hover,.report-recipient-results button:focus-visible{background:var(--surface-2)}
+.report-recipient-results button:focus-visible{outline-offset:-3px}
+.report-recipient-input{display:flex;align-items:center;gap:10px}
+.report-recipient-input .in{min-width:0;flex:1}
+.report-recipient-switch{min-height:44px;flex:none}
+.report-share-people{margin:16px 0}
+.report-share-people h3{margin:0 0 6px;font-size:14px}
+.report-share-people ul{list-style:none;padding:0;margin:0}
+.report-share-people li{display:flex;justify-content:space-between;align-items:center;gap:8px 16px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+/* 勾选控件放在名称列，手机端继续使用现有的分行布局。 */
+.report-record{display:flex;align-items:flex-start;gap:6px}
+.report-record>div{min-width:0}
+.report-pick{display:grid;place-items:center;flex:none;width:44px;height:44px;cursor:pointer}
+.report-pick input{width:18px;height:18px;margin:0;accent-color:var(--primary);cursor:pointer}
+.report-table .report-picked td,.report-table .report-picked:hover td{background:var(--primary-weak)}
+.report-merge-order{margin:6px 0 0;padding-left:1.55rem}
+.report-merge-order li{padding:8px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.report-merge-order li::marker{color:var(--muted);font-variant-numeric:tabular-nums}
+.report-merge-row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.report-merge-row>div:first-child{min-width:0}
+.report-merge-order .actions{flex:none;gap:6px}
+.report-merge-order .btn{min-height:44px;padding-inline:10px}
+.report-merge-position{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.report-source-editor iframe{border:1px solid var(--border);border-radius:var(--radius)}
+.report-preview-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+/* 版本操作留在报告外层，正文 iframe 继续隔离协作者的 HTML。 */
+.report-viewer{display:grid;grid-template-rows:auto minmax(0,1fr);min-height:100vh;height:100dvh}
+.report-viewer-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 20px;padding:10px clamp(14px,3vw,32px);border-bottom:1px solid var(--border);background:var(--surface)}
+.report-viewer-heading{min-width:0;flex:1 1 280px}
+.report-viewer-heading h1{margin:1px 0 0;font-size:20px;overflow-wrap:anywhere}
+.report-viewer-frame{display:block;width:100%;height:100%;border:0;background:var(--surface)}
+.report-version-button{white-space:nowrap;font-variant-numeric:tabular-nums}
+.report-versions-list{list-style:none;padding:0;margin:0}
+.report-versions-list li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.report-versions-list li:last-child{border-bottom:0}
+.report-versions-list .link{min-height:44px;flex:none;padding-inline:6px}
+.report-version-label{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px}
+.report-version-note{font-size:13px;margin-top:3px}
 .record-name{color:var(--text);font-weight:700}
 .record-details{color:var(--muted)}
 .record-details p{margin:4px 0}
 /* 业务说明按段落显示，长文本也可在窄屏换行。 */
 .business-copy,.kv dd.business-copy{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal}
 .field-help{color:var(--muted);font-size:13px;margin:0 0 8px}
+/* 场景内逐表展开过滤配置，窄屏按字段、取值、操作的顺序堆叠。 */
+.source-browser{display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:16px}
+.source-object-list{max-height:62vh;overflow:auto;margin-top:8px;padding:2px}
+.source-object{display:block;width:100%;text-align:left;padding:8px 10px;margin-bottom:6px;color:inherit;cursor:pointer}
+.source-object:hover,.source-object[aria-pressed=true]{border-color:var(--primary)}
+.source-object-name{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.source-object-name .mono,.scene-filter-summary,.scene-pick-item .mono{overflow-wrap:anywhere;min-width:0}
+.scene-tables-label{font-size:14px;margin:0 0 4px}
+.scene-table-entry{padding:10px 0;border-top:1px solid var(--border)}
+.scene-table-fields,.scene-filter-rule{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto;gap:8px 12px;align-items:start}
+.scene-table-fields label,.scene-filter-rule label{font-size:13px}
+.scene-table-fields .in,.scene-filter-rule .in{display:block;width:100%;margin-top:4px}
+.scene-table-fields .link,.scene-filter-rule .link{margin-top:22px;min-height:34px}
+.scene-filter-toggle{min-height:34px;margin-top:4px}
+.scene-filter-editor{background:var(--bg);border-radius:8px;padding:12px;margin-top:4px}
+.scene-filter-rule{margin-bottom:10px}
+.scene-filter-rule .check{margin-top:6px;min-height:28px}
+.scene-table-actions{margin-top:8px}
+.scene-source-picker{max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:10px}
+.scene-pick-item{display:flex;flex-wrap:wrap;min-height:36px;padding:4px 0}
+@media(max-width:620px){
+  .source-browser,.scene-table-fields,.scene-filter-rule{grid-template-columns:minmax(0,1fr)}
+  .source-object-list{max-height:220px}
+  .scene-table-fields .link,.scene-filter-rule .link{margin-top:0;justify-self:start}
+}
 .template-brief{padding:20px 24px}
 .template-brief h2{margin-bottom:6px}
 .template-brief h2:not(:first-child){margin-top:20px}
@@ -342,6 +415,7 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
   :is(.report-table,.scene-table) tbody tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 12px;padding:13px 14px;border-bottom:1px solid var(--border)}
   :is(.report-table,.scene-table) tbody tr:last-child{border-bottom:0}
   :is(.report-table,.scene-table) tbody td{display:block;min-width:0;padding:0;border:0;background:transparent}
+  .report-table tbody tr.report-picked,.report-table .report-picked td,.report-table .report-picked:hover td{background:var(--primary-weak)}
   :is(.report-table,.scene-table) tbody td:is(:first-child,:last-child,.scene-description){grid-column:1/-1}
   :is(.report-table,.scene-table) td[data-label]::before{content:attr(data-label);display:block;color:var(--muted);font-size:12px}
   :is(.report-table,.scene-table) .links{padding-top:3px}

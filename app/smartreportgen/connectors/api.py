@@ -122,7 +122,8 @@ class APIConnector(Connector):
                 for rec in recs:
                     f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
                 f.flush()
-                safe = t.replace('"', "")
+                # 双写引号以保留逻辑表名，同时禁止把接口名解释成 SQL。
+                safe = t.replace('"', '""')
                 if recs:
                     con.execute(f"CREATE TABLE \"{safe}\" AS SELECT * FROM read_json_auto('{f.name}', format='newline_delimited')")
                 else:
@@ -142,27 +143,31 @@ class APIConnector(Connector):
 
     def list_tables(self, schema: str | None = None) -> list[dict]:
         eps = self.cfg.get("endpoints") or {}
-        return [{"schema": None, "table": k, "name": k, "comment": v.get("description", "")} for k, v in eps.items()]
+        return [{"schema": None, "table": k, "name": k, "comment": v.get("description", ""), "kind": "table"}
+                for k, v in eps.items()]
 
     def columns(self, table: str) -> list[dict]:
-        con = self._duck([table])
-        rows = con.execute(f'DESCRIBE "{table}"').fetchall()
-        return [{"name": r[0].lower(), "type": r[1], "nullable": True, "comment": ""} for r in rows]
+        with self._duck([table]) as con:
+            name = table.replace('"', '""')
+            rows = con.execute(f'DESCRIBE "{name}"').fetchall()
+        return [{"name": r[0].lower(), "source_name": r[0], "type": r[1], "nullable": True, "comment": ""} for r in rows]
 
-    def query(self, sql: str, limit: int) -> dict:
-        s = ensure_readonly(sql)
-        tables = list(dict.fromkeys(m.group(2) for m in _TABLE_REF.finditer(s)))
-        # 排除 CTE 名称
-        ctes = {m.group(1).lower() for m in re.finditer(r"(\w+)\s+as\s*\(", s, re.I)}
-        tables = [t for t in tables if t.lower() not in ctes]
+    def query(self, sql: str, limit: int, *, params: dict | None = None, tables: list[str] | None = None) -> dict:
+        s = sql
+        if tables is None:
+            s = ensure_readonly(sql)
+            tables = list(dict.fromkeys(m.group(2) for m in _TABLE_REF.finditer(s)))
+            # 数据源调试保留原取表逻辑；场景查询直接使用作用域解析后的物理表。
+            ctes = {m.group(1).lower() for m in re.finditer(r"(\w+)\s+as\s*\(", s, re.I)}
+            tables = [t for t in tables if t.lower() not in ctes]
         eps = self.cfg.get("endpoints") or {}
         if eps:  # 已声明接口时只加载声明过的逻辑表（避免把 EXTRACT(x FROM col) 误判为表）
             tables = [t for t in tables if t in eps]
         try:
-            con = self._duck(tables)
-            cur = con.execute(f"SELECT * FROM ({s}) _rq LIMIT {int(limit) + 1}")
-            cols = [d[0] for d in cur.description]
-            rows = [[norm_value(v) for v in r] for r in cur.fetchall()]
+            with self._duck(tables) as con:
+                cur = con.execute(f"SELECT * FROM ({s}) _rq LIMIT {int(limit) + 1}", params or {})
+                cols = [d[0] for d in cur.description]
+                rows = [[norm_value(v) for v in r] for r in cur.fetchall()]
         except ConnectorError:
             raise
         except Exception as e:  # noqa: BLE001

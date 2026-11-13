@@ -15,6 +15,7 @@ from sqlglot import exp
 
 from . import db
 from .auth import Principal
+from .connectors.sql import oracle_schema
 
 DIALECT = {"postgresql": "postgres", "mysql": "mysql", "starrocks": "starrocks", "oracle": "oracle", "api": "duckdb"}
 
@@ -140,7 +141,7 @@ def _default_schema(ds_row: dict) -> str | None:
     if t == "postgresql":
         return (cfg.get("search_path") or "public").split(",")[0].strip().lower()
     if t == "oracle":
-        return (cfg.get("schema") or cfg.get("username") or "").lower() or None
+        return (oracle_schema(cfg) or cfg.get("username") or "").lower() or None
     return None
 
 
