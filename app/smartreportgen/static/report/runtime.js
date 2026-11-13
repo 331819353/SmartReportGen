@@ -477,13 +477,29 @@
       if (isBar) {
         var rr = T['rre-data-radius'];
         o.barMaxWidth = SZ('bar-max');
-        o.itemStyle = { borderRadius: horiz ? [0, rr, rr, 0] : [rr, rr, 0, 0] };
+        var positiveRadius = horiz ? [0, rr, rr, 0] : [rr, rr, 0, 0];
+        var negativeRadius = horiz ? [rr, 0, 0, rr] : [0, 0, rr, rr];
+        o.itemStyle = { borderRadius: stack ? 0 : positiveRadius };
+        if (!stack) {
+          var values = data.map(function (d) { return d && typeof d === 'object' ? d.value : d; });
+          // 圆角始终位于离开零轴的一端。正负色阶继续用于含正负值的单系列柱图。
+          var diverging = !s.series && s.y.length === 1 && values.some(function (v) { return v < 0; }) &&
+            values.some(function (v) { return v > 0; });
+          o.data = data.map(function (d, i) {
+            var v = values[i], negative = v < 0;
+            if (!negative && !diverging) return d;
+            var style = { borderRadius: negative ? negativeRadius : positiveRadius };
+            if (diverging) style.color = negative ? DIV[0] : DIV[DIV.length - 1];
+            // 联动产生的透明度与柱体样式一起保留。
+            return { value: v, itemStyle: Object.assign(style, d && d.itemStyle) };
+          });
+        }
       } else {
         o.smooth = s.smooth; o.symbolSize = cats.length > 24 ? 4 : 6; o.showSymbol = cats.length <= 36;
         o.lineStyle = { width: T['rre-chart-line-width'] || 2.4 };
         if (areaish) o.areaStyle = { opacity: stack ? 0.55 : 0.14 };
       }
-      if (stack && (isBar || areaish)) { o.stack = 'total'; if (isBar) o.itemStyle.borderRadius = 0; }
+      if (stack && (isBar || areaish)) o.stack = 'total';
       var showLabel = s.labels != null ? !!s.labels : isBar && !stack && cats.length <= 12 && (s.series ? false : s.y.length === 1);
       if (showLabel) {
         o.label = {
@@ -565,19 +581,6 @@
     if (s.zoom || (!horiz && cats.length > 40)) {
       opt.dataZoom = [{ type: 'inside' }, { type: 'slider', height: 16, bottom: legend ? 28 : 4, borderColor: C.border, fillerColor: 'rgba(0,0,0,.05)' }];
       opt.grid.bottom += 24;
-    }
-    // 有正有负的单系列柱：按正负使用发散色阶两端着色，负值柱圆角翻转
-    if (!s.series && series.length === 1 && series[0].type === 'bar' && !stack) {
-      var vals = series[0].data.map(function (d) { return d && typeof d === 'object' ? d.value : d; });
-      if (vals.some(function (v) { return v < 0; }) && vals.some(function (v) { return v > 0; })) {
-        var r2 = T['rre-data-radius'];
-        series[0].data = series[0].data.map(function (d, i) {
-          var v = vals[i], neg = v < 0;
-          var st = { color: neg ? DIV[0] : DIV[DIV.length - 1], borderRadius: neg ? (horiz ? [r2, 0, 0, r2] : [0, 0, r2, r2]) : (horiz ? [0, r2, r2, 0] : [r2, r2, 0, 0]) };
-          if (d && typeof d === 'object') { d.itemStyle = Object.assign({}, st, d.itemStyle); return d; }
-          return { value: d, itemStyle: st };
-        });
-      }
     }
     opt.series = series;
     return opt;
@@ -866,7 +869,22 @@
       return flt ? flt.label : f;
     }
     if (s.columns.length && !s.y.length) {
-      cols = s.columns.map(function (f) { return { label: label(f), get: function (r) { return r[f]; }, num: false }; });
+      if (!c.detailColumns) {
+        var allRows = Q[s.query] ? Q[s.query].rows : [];
+        // 从未筛选的数据判定明细列类型并缓存，空值忽略，文本编号仍按文字列排版。
+        c.detailColumns = s.columns.map(function (f) {
+          var hasNumber = false;
+          var numeric = allRows.every(function (r) {
+            var v = r[f];
+            if (v == null || v === '') return true;
+            if (typeof v !== 'number') return false;
+            hasNumber = true;
+            return true;
+          });
+          return { label: label(f), get: function (r) { return r[f]; }, num: numeric && hasNumber };
+        });
+      }
+      cols = c.detailColumns;
       out = rows.slice(0, s.page_size || s.top || 200);
     } else {
       var dims = s.dims.length ? s.dims : s.x ? [s.x] : [];
@@ -902,7 +920,9 @@
         var v = col.get(r);
         if (!col.num) return '<td>' + esc(v == null ? '–' : v) + '</td>';
         var bar = col.bar && maxBar ? '<i class="rf-cellbar" style="width:' + (Math.abs(v || 0) / maxBar * 100).toFixed(1) + '%"></i>' : '';
-        return '<td class="num">' + bar + '<span>' + esc(fmtM(col.key, v)) + '</span></td>';
+        // 明细沿用原始读数，汇总沿用度量声明的数字格式与单位。
+        var text = col.key ? fmtM(col.key, v) : fmt(v, 'raw');
+        return '<td class="num">' + bar + '<span>' + esc(text) + '</span></td>';
       }).join('') + '</tr>';
     });
     if (!out.length) h += '<tr><td colspan="' + (cols.length + 1) + '" class="rf-empty-cell">当前筛选条件下无数据</td></tr>';

@@ -21,7 +21,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
-from . import auth, db, mcp_oauth, repo, services
+from . import auth, db, design, mcp_oauth, repo, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
@@ -273,6 +273,8 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
         "rules": rules,
         "note": ("specified 是检索出的样式约束（业务场景规则 ≥ 通用规则 ≥ 内置样式 合并的结果）：theme 在渲染时自动生效，"
                  "模板中无需重复；items 是展示要求，各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
+                 f"内置页面布局要求：{design.BUILTIN_CARD_LAYOUT}窄屏换行后也按实际行计算。"
+                 f"{design.BUILTIN_CARD_STYLE}自编 HTML 时请复用同类卡片的 CSS 与图表配置。"
                  "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。默认遵守展示约束，"
                  "确有理由时（如用户明确要求、报告内容需要）可在模板 theme 中覆盖或不采纳某条要求，并在最终回复中说明。"
                  "未指定的视觉样式与展示要求由你自由决定（可用样式项见 get_template_spec「主题」）。"),

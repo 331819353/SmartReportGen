@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>结论指标着色示例</title>
+  <style>
+    :root {
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #1f2937;
+      background: #f5f7fa;
+      --positive: #047857;
+      --negative: #b91c1c;
+    }
+    main { max-width: 48rem; margin: 3rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.75rem; }
+    h2 { font-size: 1.2rem; }
+    p { line-height: 1.65; }
+    form { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; }
+    select, button { font: inherit; padding: .4rem .6rem; }
+    /* 卡片按基准宽度自动换行，每行分配剩余宽度并拉伸到同一高度。 */
+    .card-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 1.25rem; margin-top: 1.25rem; }
+    .card-row > section { box-sizing: border-box; flex: 1 0 min(100%, 18rem); min-width: 0; padding: .75rem 1.25rem; border-radius: .5rem; background: white; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: .5rem; border-bottom: 1px solid #e5e7eb; text-align: right; }
+    th:first-child { text-align: left; }
+    .metric { font-weight: 700; font-variant-numeric: tabular-nums; }
+    .metric[data-state="positive"] { color: var(--positive); }
+    .metric[data-state="negative"] { color: var(--negative); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>结论指标着色示例</h1>
+    <p>示例数据。切换大区可查看同比和目标达成率的变化，达标阈值为 100%。</p>
+    <form id="filters">
+      <label for="region">大区</label>
+      <select id="region" name="region">
+        <option value="">全部</option>
+        <option>华东</option>
+        <option>华北</option>
+        <option>华南</option>
+        <option>西南</option>
+        <option>西北</option>
+      </select>
+      <button type="reset">重置</button>
+    </form>
+    <div class="card-row">
+      <section aria-labelledby="summary-title">
+        <h2 id="summary-title">销售结论</h2>
+        <p aria-live="polite" aria-atomic="true">
+          销售额同比 <span class="metric" id="yoy">—</span>，目标达成率 <span class="metric" id="attainment">—</span>。
+        </p>
+      </section>
+      <section aria-labelledby="evidence-title">
+        <h2 id="evidence-title">筛选后的数据</h2>
+        <table aria-labelledby="evidence-title">
+          <thead><tr><th scope="col">大区</th><th scope="col">本期</th><th scope="col">基期</th><th scope="col">目标</th></tr></thead>
+          <tbody id="evidence"></tbody>
+        </table>
+        <p id="empty-evidence" hidden>当前筛选没有数据。</p>
+      </section>
+    </div>
+  </main>
+  <script type="application/json" id="report-data">
+    [
+      {"region":"华东","current":120,"prior":100,"target":110},
+      {"region":"华北","current":80,"prior":100,"target":100},
+      {"region":"华南","current":100,"prior":100,"target":100},
+      {"region":"西南","current":20,"prior":0,"target":0}
+    ]
+  </script>
+  <script>
+    const rows = JSON.parse(document.getElementById('report-data').textContent);
+    const filters = document.getElementById('filters');
+    const region = document.getElementById('region');
+    const yoy = document.getElementById('yoy');
+    const attainment = document.getElementById('attainment');
+    const evidence = document.getElementById('evidence');
+    const emptyEvidence = document.getElementById('empty-evidence');
+    const targetThreshold = 1;
+    const percent = new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 });
+    const signedPercent = new Intl.NumberFormat('zh-CN', {
+      style: 'percent', maximumFractionDigits: 1, signDisplay: 'exceptZero'
+    });
+
+    function ratio(filteredRows, baseline) {
+      // 先聚合再求比率。空结果或缺少任一参与计算的字段时，无法判定该口径。
+      if (!filteredRows.length) return null;
+      let numerator = 0;
+      let denominator = 0;
+      for (const row of filteredRows) {
+        if (!Number.isFinite(row.current) || !Number.isFinite(row[baseline])) return null;
+        numerator += row.current;
+        denominator += row[baseline];
+      }
+      if (denominator === 0) return null;
+      const value = numerator / denominator;
+      return Number.isFinite(value) ? value : null;
+    }
+
+    function showMetric(element, text, state = '') {
+      // 每次重写状态，避免筛到空结果或零值时保留上一次的颜色。
+      element.textContent = text;
+      if (state) element.dataset.state = state;
+      else delete element.dataset.state;
+    }
+
+    function render() {
+      const filteredRows = region.value ? rows.filter(row => row.region === region.value) : rows;
+      // 结论与明细表使用同一份筛选结果，所有动态值都按文本写入。
+      evidence.replaceChildren(...filteredRows.map(row => {
+        const tr = document.createElement('tr');
+        const name = document.createElement('th');
+        name.scope = 'row';
+        name.textContent = row.region;
+        tr.append(name);
+        for (const key of ['current', 'prior', 'target']) {
+          tr.insertCell().textContent = Number.isFinite(row[key]) ? row[key] : '—';
+        }
+        return tr;
+      }));
+      emptyEvidence.hidden = filteredRows.length > 0;
+      const yearRatio = ratio(filteredRows, 'prior');
+      const targetRatio = ratio(filteredRows, 'target');
+      if (yearRatio === null) {
+        showMetric(yoy, '—');
+      } else {
+        const change = yearRatio - 1;
+        const label = change > 0 ? '增长' : change < 0 ? '下降' : '持平';
+        const state = change > 0 ? 'positive' : change < 0 ? 'negative' : '';
+        showMetric(yoy, `${signedPercent.format(change)}（${label}）`, state);
+      }
+      if (targetRatio === null) {
+        showMetric(attainment, '—');
+      } else {
+        // 使用原始比率比较，避免四舍五入到 100% 后被误判为达标。
+        const reached = targetRatio >= targetThreshold;
+        const label = reached ? '达标' : '未达标';
+        showMetric(attainment, `${percent.format(targetRatio)}（${label}）`, reached ? 'positive' : 'negative');
+      }
+    }
+
+    region.addEventListener('change', render);
+    // 原生重置事件先于控件恢复默认值，等下一帧再读取筛选状态。
+    filters.addEventListener('reset', () => requestAnimationFrame(render));
+    render();
+  </script>
+</body>
+</html>

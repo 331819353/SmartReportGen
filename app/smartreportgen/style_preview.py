@@ -90,12 +90,19 @@ y: yoy
 span: 6
 ```
 ```chart
+type: bar
+title: 各大区销售额
+x: region
+y: gmv
+span: 6
+```
+```chart
 type: bullet
 title: 各大区目标达成（子弹图）
 x: region
 y: [gmv, tgt]
 status: {{direction: up, good: 1.0, warn: 0.95}}
-span: 6
+span: 5
 ```
 ```chart
 type: heatmap
@@ -108,11 +115,20 @@ height: 300
 ```
 ```chart
 type: table
-title: 大区明细（表格）
+title: 大区销售汇总
 dims: [region]
 y: [gmv, yoy, rate]
 headers: {{region: 大区}}
 span: 5
+height: 300
+```
+```chart
+type: table
+title: 销售明细
+query: s
+columns: [month, region, channel, amount]
+headers: {{month: 月份, region: 大区, channel: 渠道, amount: 销售额（元）}}
+span: 7
 height: 300
 ```
 """

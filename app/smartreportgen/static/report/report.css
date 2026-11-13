@@ -92,10 +92,10 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-text code{font-size:12px;background:var(--color-bg-page);padding:1px 5px;border-radius:4px}
 .rf-metric{font-weight:700;color:var(--color-heading);font-variant-numeric:tabular-nums;white-space:nowrap}
 
-/* 卡片栅格：模板按 12 栅格书写，内部 60 等分；每行宽度和为 60，用 flex 计算宽度，间距不随列数累加 */
-.rf-grid{--rf-grid-gap:var(--rre-card-gap);display:flex;flex-wrap:wrap;gap:var(--rf-grid-gap);margin:8px 0 4px}
+/* 卡片按 60 等分计算换行宽度，再由该行的卡片分配余量；同行拉伸到最高卡片的高度。 */
+.rf-grid{--rf-grid-gap:var(--rre-card-gap);display:flex;flex-wrap:wrap;align-items:stretch;gap:var(--rf-grid-gap);margin:8px 0 4px}
 .rf-grid-kpi{--rf-grid-gap:var(--rre-kpi-gap)}
-.rf-card{--card-main:var(--color-brand);--w:var(--span,30);flex:0 0 calc(var(--w) / 60 * (100% + var(--rf-grid-gap)) - var(--rf-grid-gap) - .02px);position:relative;background:var(--color-bg-card);border:var(--rre-card-border-width) solid var(--color-border-card);border-radius:var(--radius-card);box-shadow:var(--shadow-card);padding:var(--rre-card-pad);min-width:0;display:flex;flex-direction:column;overflow:hidden}
+.rf-card{--card-main:var(--color-brand);--w:var(--span,30);flex:1 0 calc(var(--w) / 60 * (100% + var(--rf-grid-gap)) - var(--rf-grid-gap) - .02px);position:relative;background:var(--color-bg-card);border:var(--rre-card-border-width) solid var(--color-border-card);border-radius:var(--radius-card);box-shadow:var(--shadow-card);padding:var(--rre-card-pad);min-width:0;display:flex;flex-direction:column;overflow:hidden}
 .rf-type-kpi{padding:var(--rre-kpi-pad);min-height:var(--rre-kpi-min-height)}
 .rf-type-kpi::after{content:"";position:absolute;inset:auto 0 0;height:2px;background:color-mix(in srgb,var(--color-brand) 9%,var(--color-bg-card));pointer-events:none}
 .rf-type-kpi .rf-card-head{flex-wrap:wrap;row-gap:2px;margin-bottom:4px}
@@ -137,8 +137,9 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-table td{text-align:var(--rf-table-text-align);vertical-align:middle;height:var(--rre-card-row-height);padding:0 10px;border-bottom:1px solid color-mix(in srgb,var(--color-border-card) 60%,transparent);white-space:nowrap}
 .rf-zebra .rf-table tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--color-brand) 3%,var(--color-bg-card))}
 .rf-table tr:hover td{background:color-mix(in srgb,var(--color-brand) 6%,transparent)}
-.rf-table th.num,.rf-table td.num{text-align:var(--rf-table-num-align);font-variant-numeric:tabular-nums;position:relative}
-.rf-table td.num span{position:relative}
+/* 数值表头沿用固定表头定位；单元格为数据条和数值文字提供定位容器。 */
+.rf-table th.num,.rf-table td.num{text-align:var(--rf-table-num-align);font-variant-numeric:tabular-nums}
+.rf-table td.num,.rf-table td.num span{position:relative}
 .rf-cellbar{position:absolute;right:10px;top:8px;bottom:8px;max-width:calc(100% - 20px);border-radius:var(--rre-radius-pill);background:color-mix(in srgb,var(--color-brand) 14%,transparent)}
 .rf-rank{width:36px;color:var(--color-text-secondary);text-align:center!important}
 .rf-empty-cell{text-align:center;color:var(--color-text-secondary);padding:24px!important}

@@ -260,6 +260,10 @@ def runtime_tokens(t: dict) -> dict:
 # ============================================================ 业务人员可读的元数据（样式规则编辑器使用）
 PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式：后三者合并为一份“指定样式”（视觉样式与展示要求），"
               "同一项以优先级高者为准，作为约束交给智能体；智能体可以按自己的判断调整，没有指定的由智能体自由决定")
+# 内置样式同时约束布局和同类卡片的视觉表现。
+BUILTIN_CARD_LAYOUT = "同一行的卡片等高并铺满可用宽度，单张卡片占满所在行。"
+BUILTIN_CARD_STYLE = ("同一报告内同类卡片跨章节共用组件样式。表格统一表头、行高、隔行底色和列对齐。"
+                      "同类图表统一图形、坐标轴、网格、图例、标签和配色规则。")
 
 # 按报告页面的组成部分分类；每个令牌只属于一类
 TOKEN_GROUPS: list[dict] = [
@@ -285,7 +289,7 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "rre-card-font-prose", "label": "正文", "type": "font", "sample": "本月收入高于目标。"},
         {"key": "rre-prose-line-height", "label": "正文行距", "type": "number", "step": 0.05, "min": 1.2, "max": 2.4, "desc": "行高是字号的倍数"},
     ]},
-    {"key": "layout", "label": "页面布局", "desc": "页面宽度、边距、章节间距与目录", "tokens": [
+    {"key": "layout", "label": "页面布局", "desc": BUILTIN_CARD_LAYOUT, "tokens": [
         {"key": "max_width", "label": "页面最大宽度", "type": "px"},
         {"key": "rre-page-pad", "label": "页面左右边距", "type": "px"},
         {"key": "rre-section-gap", "label": "章节之间的间距", "type": "px"},
@@ -354,7 +358,7 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "color-trend-up", "label": "上升", "type": "color", "desc": "中国习惯“红涨绿跌”可将上升、下降互换"},
         {"key": "color-trend-down", "label": "下降", "type": "color"},
     ]},
-    {"key": "chart", "label": "图表", "desc": "柱、线、坐标轴、网格与图例", "tokens": [
+    {"key": "chart", "label": "图表", "desc": "同类图表共用图形、坐标轴、网格与图例样式", "tokens": [
         {"key": "rre-card-bar-max", "label": "柱子最大宽度", "type": "px"},
         {"key": "rre-data-radius", "label": "柱子圆角", "type": "px"},
         {"key": "rre-chart-line-width", "label": "折线粗细", "type": "number", "step": 0.2, "min": 1, "max": 6},
@@ -364,7 +368,7 @@ TOKEN_GROUPS: list[dict] = [
         {"key": "rre-card-axis-gap", "label": "刻度文字到轴线", "type": "px"},
         {"key": "rre-card-axis-title-gap", "label": "轴标题到刻度", "type": "px"},
     ]},
-    {"key": "table", "label": "表格", "desc": "明细表与排行表", "tokens": [
+    {"key": "table", "label": "表格", "desc": "明细表、汇总表与排行表共用表头、行高、隔行底色和列对齐", "tokens": [
         {"key": "rre-card-row-height", "label": "行高", "type": "px"},
         {"key": "color-table-head-bg", "label": "表头底色", "type": "color_auto", "desc": "留空则与卡片底色一致"},
         {"key": "table_zebra", "label": "斑马纹（隔行底色）", "type": "bool"},
