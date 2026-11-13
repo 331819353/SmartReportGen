@@ -9,7 +9,7 @@ function toast(msg, kind = '') {
   setTimeout(() => { const i = toasts.indexOf(t); if (i >= 0) toasts.splice(i, 1); }, kind === 'err' ? 7000 : 3000);
 }
 async function api(path, opts = {}) {
-  const init = { method: opts.method || 'GET', headers: {}, credentials: 'same-origin' };
+  const init = { method: opts.method || 'GET', headers: {}, credentials: 'same-origin', signal: opts.signal };
   if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
   const r = await fetch(path, init);
   if (r.ok && opts.download) return r.blob();
@@ -405,14 +405,79 @@ let sceneTableKey = 0;
 function sceneTableDraft(table = {}) {
   return { table_name: '', table_description: '', ...table, key: ++sceneTableKey, expanded: false,
     columns: null, loadingColumns: false, columnError: '', row_filters: (table.row_filters || []).map(rule => ({
-      column: rule.column, values: rule.values, input: rule.values.filter(v => v !== null).join('\n'),
-      includeNull: rule.values.includes(null)
+      column: rule.column, values: [...rule.values]
     })) };
 }
 const filterValueLabel = value => value === null ? 'NULL（空值）' : value === '' ? '空字符串' : String(value);
 
+const SceneFilterValues = {
+  props: { source: Number, table: String, column: String, modelValue: Array },
+  emits: ['update:modelValue'],
+  template: `<div class="scene-values">
+    <div class="scene-values-label">保留值 <span class="muted small">已选 {{modelValue.length}} 项</span></div>
+    <ul v-if="modelValue.length" class="scene-selected-values" aria-label="已选保留值">
+      <li v-for="value in modelValue" :key="key(value)">
+        <button type="button" class="btn sm scene-value-chip" :aria-label="'取消选择 ' + label(value)" @click="toggle(value)">
+          <span>{{label(value)}}</span><span class="ico" v-html="icon('close')"></span>
+        </button>
+      </li>
+    </ul>
+    <p v-if="!ready" class="field-help">先选择字段，再勾选要保留的值。</p>
+    <template v-else>
+      <input type="search" class="in" v-model="search" maxlength="120" :aria-label="'搜索 ' + column + ' 的候选值'" placeholder="搜索候选值">
+      <div v-if="options.length" class="scene-value-options" role="group" :aria-label="column + ' 的候选值'" :aria-busy="loading">
+        <label v-for="value in options" :key="key(value)" class="check">
+          <input type="checkbox" :checked="selected(value)" :disabled="modelValue.length >= 100 && !selected(value)" @change="toggle(value)">
+          <span>{{label(value)}}</span>
+        </label>
+      </div>
+      <p v-if="modelValue.length >= 100" class="field-help" role="status">每个字段最多保留 100 个值。</p>
+      <p v-if="loading" class="field-help" role="status">正在读取候选值…</p>
+      <div v-else-if="error" class="msg err" role="alert">{{error}} <button type="button" class="link scene-values-action" @click="load(failedOffset)">重试</button></div>
+      <button v-else-if="nextOffset !== null" type="button" class="link scene-values-action" @click="load(nextOffset)">加载更多候选值</button>
+      <p v-else-if="!options.length" class="field-help" role="status">{{search.trim() ? '没有匹配的候选值。' : '当前字段没有可选值。'}}</p>
+    </template>
+  </div>`,
+  setup(props, { emit }) {
+    const options = ref([]), search = ref(''), loading = ref(false), nextOffset = ref(null), error = ref(''), failedOffset = ref(0);
+    const ready = computed(() => !!(props.source && props.table && props.column));
+    let controller, timer;
+    const key = value => JSON.stringify(value);
+    // 旧表单以文本存数字和布尔值；单列类型固定，相同字面值应显示为已选，且空值仍独立。
+    const sameValue = (a, b) => a === b || (a !== null && b !== null && String(a) === String(b));
+    const selected = value => props.modelValue.some(v => sameValue(v, value));
+    function toggle(value) {
+      if (selected(value)) emit('update:modelValue', props.modelValue.filter(v => !sameValue(v, value)));
+      else if (props.modelValue.length < 100) emit('update:modelValue', [...props.modelValue, value]);
+    }
+    function cancel() { clearTimeout(timer); controller?.abort(); }
+    async function load(offset = 0) {
+      cancel();
+      const request = controller = new AbortController();
+      loading.value = true; error.value = ''; failedOffset.value = offset;
+      const params = new URLSearchParams({ table: props.table, column: props.column, q: search.value.trim(), offset });
+      try {
+        const result = await api(`/api/datasources/${props.source}/values?${params}`, { signal: request.signal });
+        if (request.signal.aborted) return;
+        options.value = [...new Set([...(offset ? options.value : []), ...result.values])];
+        nextOffset.value = result.next_offset;
+      } catch (e) { if (!request.signal.aborted) error.value = e.message; }
+      finally { if (!request.signal.aborted) loading.value = false; }
+    }
+    // 搜索换页只更新候选列表，已选值仍由父表单保存；取消旧请求避免串用字段或搜索结果。
+    watch(search, () => {
+      cancel();
+      options.value = []; nextOffset.value = null; error.value = ''; loading.value = ready.value;
+      if (ready.value) timer = setTimeout(() => load(), 350);
+    });
+    onMounted(() => { if (ready.value) load(); });
+    onBeforeUnmount(cancel);
+    return { options, search, ready, loading, nextOffset, error, failedOffset, load, toggle, selected, key, label: filterValueLabel, icon };
+  }
+};
+
 const Datasets = {
-  components: { Drawer },
+  components: { Drawer, SceneFilterValues },
   template: `<div>
     <div class="page-head"><div><h1>业务场景</h1><p>按业务主题找数据，查看每个场景可用于分析的数据表。</p></div>
       <div class="actions" v-if="admin"><button class="btn" @click="reindex">重建检索索引</button><button class="btn primary" @click="edit()">新建业务场景</button></div></div>
@@ -492,21 +557,19 @@ const Datasets = {
           <button class="link scene-filter-toggle" type="button" :aria-expanded="t.expanded" :aria-controls="'scene-filters-' + t.key"
             :disabled="!form.datasource_id || !t.table_name" @click="toggleFilters(t)">数据过滤 · {{t.row_filters.length ? t.row_filters.length + ' 个字段' : '不限制'}}</button>
           <div v-show="t.expanded" :id="'scene-filters-' + t.key" class="scene-filter-editor">
-            <p class="field-help">同一字段满足任一保留值即可；不同字段须同时满足。每行输入一个值。</p>
+            <p class="field-help">选择字段后，从表中的实际取值里勾选。不同字段的条件须同时满足。</p>
             <p v-if="t.loadingColumns" class="small muted" role="status">正在读取字段…</p>
             <div v-if="t.columnError" class="msg err" role="alert">{{t.columnError}} <button class="link" type="button" @click="loadColumns(t)">重试</button></div>
             <div v-for="(rule,j) in t.row_filters" :key="rule" class="scene-filter-rule">
               <div><label :for="'scene-column-' + t.key + '-' + j">字段</label>
-                <select :id="'scene-column-' + t.key + '-' + j" class="in" v-model="rule.column" :disabled="!t.columns?.length">
+                <select :id="'scene-column-' + t.key + '-' + j" class="in" :value="rule.column" @change="changeRuleColumn(rule, $event.target.value)" :disabled="!t.columns?.length">
                   <option value="" disabled>选择字段</option>
                   <option v-if="rule.column && !t.columns?.some(c => (c.source_name || c.name) === rule.column)" :value="rule.column">{{rule.column}}</option>
                   <option v-for="c in t.columns" :key="c.source_name || c.name" :value="c.source_name || c.name">{{c.source_name || c.name}}{{c.comment ? ' · ' + c.comment : ''}}</option>
                 </select>
               </div>
-              <div>
-                <label>保留值<textarea class="in" v-model="rule.input" rows="2" placeholder="每行一个值"></textarea></label>
-                <label class="check small"><input type="checkbox" v-model="rule.includeNull"> 包含 NULL（空值）</label>
-              </div>
+              <SceneFilterValues v-if="t.expanded" :key="JSON.stringify([form.datasource_id, t.table_name, rule.column])"
+                :source="form.datasource_id" :table="t.table_name" :column="rule.column" v-model="rule.values" />
               <button class="link danger" type="button" @click="t.row_filters.splice(j,1)" :aria-label="'移除筛选条件 ' + (rule.column || (j+1))">移除</button>
             </div>
             <button class="btn sm" type="button" @click="addRule(t)" :disabled="!t.columns?.some(c => !t.row_filters.some(r => r.column === (c.source_name || c.name))) || t.row_filters.length >= 20">添加字段条件</button>
@@ -549,12 +612,8 @@ const Datasets = {
         const tables = f.tables.map(t => {
           if (!t.table_name.trim()) throw new Error('请为每个表或视图填写名称，或移除空白项。');
           const row_filters = t.row_filters.map(r => {
-            // 原值未改动时保留 API 保存的数字、布尔及特殊文本，不因打开表单而转换类型。
-            const original = (r.values || []).filter(v => v !== null);
-            const values = r.values && r.input === original.join('\n') ? original : r.input.split(/\r?\n/).filter(v => v !== '');
-            if (r.includeNull) values.push(null);
-            if (!r.column || !values.length) throw new Error(`${t.table_name}：请选择字段并填写保留值，或移除这条条件。`);
-            return { column: r.column, values };
+            if (!r.column || !r.values.length) throw new Error(`${t.table_name}：请选择字段并勾选保留值，或移除这条条件。`);
+            return { column: r.column, values: r.values };
           });
           return { table_name: t.table_name, table_description: t.table_description, row_filters };
         });
@@ -592,6 +651,8 @@ const Datasets = {
     function changeSource() { picker.value = null; pickKw.value = ''; form.value.tables.forEach(changeTable); }
     function changeTable(t) {
       t.columns = null; t.columnError = ''; t.loadingColumns = false;
+      // 表或数据源换了，旧值不再代表当前字段的候选；保留条件位置，提示用户重新勾选。
+      t.row_filters.forEach(r => { r.values = []; });
       if (t.expanded && t.table_name && form.value.datasource_id) loadColumns(t);
     }
     async function loadColumns(t) {
@@ -611,10 +672,14 @@ const Datasets = {
       t.expanded = !t.expanded;
       if (t.expanded && !t.columns && !t.loadingColumns) loadColumns(t);
     }
-    function addRule(t) { t.row_filters.push({ column: '', input: '', includeNull: false }); }
+    function changeRuleColumn(rule, column) {
+      // 显式改选字段时清除旧字段的值；重新打开编辑器仍保留已保存的原值。
+      if (rule.column !== column) { rule.column = column; rule.values = []; }
+    }
+    function addRule(t) { t.row_filters.push({ column: '', values: [] }); }
     return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
       picker, pickKw, pickShown, pickLoading, pickError, edit, save, del, search, reindex, pick, has, togglePick,
-      addTable, changeSource, changeTable, loadColumns, toggleFilters, addRule, filterValueLabel, DS_LABEL, OBJECT_LABEL,
+      addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule, filterValueLabel, DS_LABEL, OBJECT_LABEL,
       icon, hasMine: computed(canVisitMine) };
   }
 };

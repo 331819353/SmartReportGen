@@ -517,6 +517,19 @@ def ds_columns(request: Request, ds_id: int, table: str):
     return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).columns(table))
 
 
+@app.get("/api/datasources/{ds_id}/values")
+def ds_values(request: Request, ds_id: int, table: str = Query(min_length=1, max_length=512),
+              column: str = Query(min_length=1, max_length=256), q: str = Query("", max_length=120),
+              limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=10000)):
+    """编辑场景时读取指定字段的原始候选值；复用数据源浏览的管理员权限。"""
+    _require_admin(request)
+    if "\x00" in table or "\x00" in column or "\x00" in q:
+        raise repo.Invalid("表名、字段和搜索词不能包含空字符")
+    result = get_connector(repo.get_datasource(ds_id, with_secret=True)).distinct_values(table, column, q, limit, offset)
+    result["next_offset"] = offset + limit if result.pop("has_more") and offset + limit <= 10000 else None
+    return J(result)
+
+
 @app.post("/api/datasources/{ds_id}/query")
 def ds_query(request: Request, ds_id: int, data: dict = Body(...)):
     _require_admin(request)

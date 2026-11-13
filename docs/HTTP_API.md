@@ -253,6 +253,7 @@ FastAPI 自带文档路由和静态资源还支持 `HEAD`，返回响应头，�
 | `POST /api/datasources/{ds_id}/test` | 管理员 | 路径 `ds_id`，无请求体 | 使用已保存的配置，返回连接测试对象。数据源不存在返回 `404` |
 | `GET /api/datasources/{ds_id}/tables` | 管理员 | 路径 `ds_id`，可选查询参数 `schema` | 数据库账号可见的表和视图。每项有 `schema`、`table`、`name`、`comment`、`kind`（`table`、`view` 或 `materialized_view`）。不存在返回 `404` |
 | `GET /api/datasources/{ds_id}/columns` | 管理员 | 路径 `ds_id`，必填查询参数 `table` | 字段元数据数组：`name`（小写）、`source_name`（原始名称）、`type`、`nullable`、`comment`。数据库数据源不读取业务行 |
+| `GET /api/datasources/{ds_id}/values` | 管理员 | 必填 `table` 和 `column`（使用字段的 `source_name`）；可选 `q`（字面包含搜索）、`limit`（默认 50，最多 100）、`offset`（默认 0，最大 10000） | 字段实际去重值 `{"values":[null,"华东","华南"],"next_offset":null}`。有下一页时 `next_offset` 为整数。候选值不受场景中已有过滤条件影响 |
 | `GET /api/datasources/{ds_id}/describe` | 管理员 | 路径 `ds_id`，必填查询参数 `table`，可选整数 `sample_rows`，默认 10 | 表结构、样本和列画像，见下方示例。数据源不存在返回 `404`，表查询失败可返回 `400` |
 | `POST /api/datasources/{ds_id}/query` | 管理员 | 路径 `ds_id`。JSON 传必填 `sql`，可选整数 `limit`，默认 200，有效返回上限限制在 1–5000 | 查询结果，见下方示例。无数据源返回 `404`，空 SQL、非只读语句或执行失败返回 `400` |
 

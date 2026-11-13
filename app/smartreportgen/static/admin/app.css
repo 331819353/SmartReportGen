@@ -288,13 +288,27 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .scene-filter-toggle{min-height:34px;margin-top:4px}
 .scene-filter-editor{background:var(--bg);border-radius:8px;padding:12px;margin-top:4px}
 .scene-filter-rule{margin-bottom:10px}
-.scene-filter-rule .check{margin-top:6px;min-height:28px}
+/* 已选值单独显示，候选列表限高，搜索或翻页时无需滚动整个编辑抽屉。 */
+.scene-values{min-width:0}
+.scene-values-label{font-size:13px}
+.scene-values-label .small{margin-inline-start:6px}
+.scene-selected-values{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0;padding:0;list-style:none}
+.scene-selected-values li{max-width:100%;min-width:0}
+.scene-value-chip{gap:6px;max-width:100%;text-align:start}
+.scene-value-chip span:first-child,.scene-value-options label span{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
+.scene-value-chip .ico,.scene-value-options input{flex:none}
+.scene-value-chip .ico{width:14px;height:14px}
+.scene-value-options{display:flex;flex-wrap:wrap;align-content:flex-start;column-gap:14px;max-height:174px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-top:6px;padding:4px 8px}
+.scene-value-options .check{min-height:34px;padding:4px 0}
+.scene-values .field-help{margin:6px 0 0}
+.scene-filter-rule .scene-values-action{margin-top:3px}
 .scene-table-actions{margin-top:8px}
 .scene-source-picker{max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:10px}
 .scene-pick-item{display:flex;flex-wrap:wrap;min-height:36px;padding:4px 0}
 @media(max-width:620px){
   .source-browser,.scene-table-fields,.scene-filter-rule{grid-template-columns:minmax(0,1fr)}
   .source-object-list{max-height:220px}
+  .scene-value-options .check{min-height:44px}
   .scene-table-fields .link,.scene-filter-rule .link{margin-top:0;justify-self:start}
 }
 .template-brief{padding:20px 24px}

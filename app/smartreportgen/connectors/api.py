@@ -27,7 +27,7 @@ from typing import Any
 import duckdb
 import httpx
 
-from .base import Connector, ConnectorError, ensure_readonly, norm_columns, norm_value
+from .base import Connector, ConnectorError, ensure_readonly, norm_columns, norm_value, value_options
 
 _TABLE_REF = re.compile(r'\b(?:from|join)\s+("?)([\w./-]+)\1', re.I)
 
@@ -151,6 +151,27 @@ class APIConnector(Connector):
             name = table.replace('"', '""')
             rows = con.execute(f'DESCRIBE "{name}"').fetchall()
         return [{"name": r[0].lower(), "source_name": r[0], "type": r[1], "nullable": True, "comment": ""} for r in rows]
+
+    def distinct_values(self, table: str, column: str, search: str, limit: int, offset: int) -> dict:
+        # 使用与正式查询相同的 DuckDB 推断类型，避免把接口记录里的日期或数字当作另一种类型。
+        eps = self.cfg.get("endpoints") or {}
+        if eps and table not in eps:
+            raise ConnectorError(f"未配置接口表 {table}")
+        name, col = ['"' + x.replace('"', '""') + '"' for x in (table, column)]
+        try:
+            with self._duck([table]) as con:
+                fields = con.execute(f"DESCRIBE {name}").fetchall()
+                if not any(r[0] == column for r in fields):
+                    raise ConnectorError(f"接口表 {table} 中没有字段 {column}")
+                sql = f"SELECT candidate FROM (SELECT DISTINCT {col} AS candidate FROM {name}) vals"
+                params = [search.lower()] if search else []
+                if search:
+                    sql += " WHERE STRPOS(LOWER(CAST(candidate AS VARCHAR)), ?) > 0"
+                sql += " ORDER BY candidate NULLS FIRST LIMIT ? OFFSET ?"
+                rows = con.execute(sql, [*params, limit + 1, offset]).fetchall()
+        except duckdb.Error as e:
+            raise ConnectorError(f"无法读取候选值：{str(e).splitlines()[0]}") from e
+        return value_options(rows, limit)
 
     def query(self, sql: str, limit: int, *, params: dict | None = None, tables: list[str] | None = None) -> dict:
         s = sql

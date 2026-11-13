@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import URL, Engine
 
 from ..config import settings
-from .base import Connector, ConnectorError, ensure_readonly, norm_columns, norm_value
+from .base import Connector, ConnectorError, ensure_readonly, norm_columns, norm_value, value_options
 
 DEFAULT_PORTS = {"mysql": 3306, "starrocks": 9030, "postgresql": 5432, "oracle": 1521}
 _NAME_PART = r'(?:"(?:[^"]|"")+"|`(?:[^`]|``)+`|[\w$#]+)'
@@ -82,7 +82,7 @@ class SQLConnector(Connector):
         self.engine = _build_engine(self.type, self.cfg, secret)
 
     # ---------------- helpers ----------------
-    def _run(self, sql: str, params: Any = None, limit: int | None = None) -> tuple[list[str], list[list]]:
+    def _run(self, sql: str, params: Any = None, limit: int | None = None, *, normalize: bool = True) -> tuple[list[str], list[list]]:
         try:
             with self.engine.connect() as c:
                 if params is None:
@@ -91,7 +91,7 @@ class SQLConnector(Connector):
                     res = c.exec_driver_sql(sql, params)
                 cols = list(res.keys())
                 raw = res.fetchmany(limit) if limit else res.fetchall()
-                return cols, [[norm_value(v) for v in r] for r in raw]
+                return cols, [[norm_value(v) for v in r] for r in raw] if normalize else [list(r) for r in raw]
         except ConnectorError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -112,7 +112,7 @@ class SQLConnector(Connector):
             if part.startswith(('"', '`')):
                 parts.append(part[1:-1].replace(part[0] * 2, part[0]))
             else:
-                parts.append(part.upper() if self.type == "oracle" else part)
+                parts.append(part.upper() if self.type == "oracle" else part.lower() if self.type == "postgresql" else part)
         return (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
 
     def _list_name(self, name: str) -> str:
@@ -192,6 +192,50 @@ class SQLConnector(Connector):
         s = ensure_readonly(sql) if tables is None else sql
         cols, rows = self._run(self._wrap_limit(s, limit + 1), params or None)
         return {"columns": norm_columns(cols), "rows": rows[:limit], "truncated": len(rows) > limit}
+
+    def distinct_values(self, table: str, column: str, search: str, limit: int, offset: int) -> dict:
+        # 表名先按连接器规则校验，字段名从目录精确匹配并引用，搜索词只作为参数传入。
+        schema, name = self._split(table)
+        field = next((c for c in self.columns(table) if c["source_name"] == column), None)
+        if not field:
+            raise ConnectorError(f"数据表或视图 {table} 中没有字段 {column}")
+        q = "`" if self.type in ("mysql", "starrocks") else '"'
+
+        def quote(ident: str) -> str:
+            return q + ident.replace(q, q * 2) + q
+
+        table = ".".join(quote(p) for p in (schema, name) if p is not None)
+        col = quote(column)
+        cast_type = {"postgresql": "TEXT", "mysql": "CHAR", "starrocks": "VARCHAR", "oracle": "VARCHAR2(4000)"}[self.type]
+        value = col
+        if self.type == "oracle":
+            # 统一时区和时间格式，后续按固定格式解析绑定值，避免依赖会话的 NLS 格式。
+            dtype = field["type"].upper()
+            if dtype == "DATE":
+                value = f"""TO_CHAR({col}, 'YYYY-MM-DD"T"HH24:MI:SS')"""
+            elif dtype.startswith("TIMESTAMP"):
+                if "TIME ZONE" in dtype:
+                    value = f"""TO_CHAR(SYS_EXTRACT_UTC({col}), 'YYYY-MM-DD"T"HH24:MI:SS.FF9"Z"')"""
+                else:
+                    value = f"""TO_CHAR({col}, 'YYYY-MM-DD"T"HH24:MI:SS.FF9')"""
+        # 先去重再分页。稳定地把 NULL 放在首页；搜索按字面包含匹配，不把 % 和 _ 当通配符。
+        inner = f"SELECT DISTINCT {value} AS candidate FROM {table}"
+        sql = f"SELECT candidate FROM ({inner}) vals"
+        params = None
+        if search:
+            if self.type != "oracle":
+                sql = sql.replace("%", "%%")
+            bind = ":needle" if self.type == "oracle" else "%(needle)s"
+            func = "STRPOS" if self.type == "postgresql" else "INSTR"
+            sql += f" WHERE {func}(LOWER(CAST(candidate AS {cast_type})), {bind}) > 0"
+            params = {"needle": search.lower()}
+        sql += " ORDER BY CASE WHEN candidate IS NULL THEN 0 ELSE 1 END, candidate"
+        if self.type == "oracle":
+            sql += f" OFFSET {int(offset)} ROWS FETCH NEXT {int(limit) + 1} ROWS ONLY"
+        else:
+            sql += f" LIMIT {int(limit) + 1} OFFSET {int(offset)}"
+        _, rows = self._run(sql, params, normalize=False)
+        return value_options(rows, limit)
 
     def sample(self, table: str, n: int) -> dict:
         self._split(table)

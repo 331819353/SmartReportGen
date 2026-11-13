@@ -77,6 +77,15 @@ class ScenarioFiltersTest(unittest.TestCase):
             with self.subTest(rule=rule), self.assertRaises(ConnectorError):
                 table_filters([rule], "Sales", columns)
 
+    def test_value_options_use_source_values_and_keep_null(self):
+        first = self.connector.distinct_values("Sales", "region", "", 2, 0)
+        self.assertEqual(first, {"values": [None, "O'Reilly -- x%"], "has_more": True})
+        self.assertEqual(self.connector.distinct_values("Sales", "region", "", 2, 2)["values"], ["华东", "华北"])
+        self.assertEqual(self.connector.distinct_values("Sales", "region", "X%", 10, 0)["values"], ["O'Reilly -- x%"])
+        self.assertEqual(self.connector.distinct_values("Sales", "Status", "", 10, 0)["values"], [0, 1])
+        with self.assertRaises(ConnectorError):
+            self.connector.distinct_values("Sales", "missing", "", 10, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

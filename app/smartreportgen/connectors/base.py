@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal
+import math
 import re
 import uuid
 from collections import Counter
@@ -79,6 +80,25 @@ def norm_value(v: Any) -> Any:
     return str(v)
 
 
+def value_options(rows, limit: int) -> dict:
+    """候选值保留原始标量；无法无损存入场景规则的值不生成可选项。"""
+    values = []
+    for row in rows:
+        v = row[0]
+        if isinstance(v, (dt.date, dt.time, uuid.UUID)):
+            v = v.isoformat() if not isinstance(v, uuid.UUID) else str(v)
+        elif isinstance(v, decimal.Decimal):
+            v = str(v) if v.is_finite() else v
+        elif type(v) is int and abs(v) > 2**53 - 1:
+            # 浏览器的 Number 无法精确表示大整数；以文本保存后仍由数据库按字段类型比较。
+            v = str(v)
+        if v is None or type(v) in (bool, int) or (type(v) is float and math.isfinite(v)) or (
+            isinstance(v, str) and len(v) <= 1000 and "\x00" not in v
+        ):
+            values.append(v)
+    return {"values": values[:limit], "has_more": len(rows) > limit}
+
+
 def norm_columns(cols: list[str]) -> list[str]:
     """列名统一小写，重名自动加后缀。"""
     out, seen = [], Counter()
@@ -143,6 +163,9 @@ class Connector:
         raise NotImplementedError
 
     def columns(self, table: str) -> list[dict]:
+        raise NotImplementedError
+
+    def distinct_values(self, table: str, column: str, search: str, limit: int, offset: int) -> dict:
         raise NotImplementedError
 
     def query(self, sql: str, limit: int, *, params: dict | None = None, tables: list[str] | None = None) -> dict:

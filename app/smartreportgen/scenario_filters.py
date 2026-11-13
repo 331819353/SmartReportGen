@@ -69,6 +69,24 @@ def _key(table: exp.Table, dialect: str) -> tuple[str, ...]:
     return tuple(p.name.casefold() if dialect == "duckdb" else p.name for p in table.parts)
 
 
+_ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9}Z?)?\Z")
+
+
+def _oracle_time_bind(dtype: str, value: str, bind: exp.Expr) -> tuple[object, exp.Expr]:
+    # 候选时间使用固定 ISO 格式；保留旧规则的其他写法，并且不转换形似日期的文本列。
+    base_format = 'YYYY-MM-DD"T"HH24:MI:SS'
+    if dtype == "DATE":
+        return value, exp.Anonymous(this="TO_DATE", expressions=[bind, exp.Literal.string(base_format)])
+    if dtype.startswith("TIMESTAMP"):
+        fmt = base_format + (".FF" if "." in value else "")
+        if value.endswith("Z") and "TIME ZONE" in dtype:
+            return value[:-1] + "+00:00", exp.Anonymous(
+                this="TO_TIMESTAMP_TZ", expressions=[bind, exp.Literal.string(fmt + "TZH:TZM")])
+        if not value.endswith("Z"):
+            return value, exp.Anonymous(this="TO_TIMESTAMP", expressions=[bind, exp.Literal.string(fmt)])
+    return value, bind
+
+
 def _physical_tables(tree: exp.Expr) -> list[tuple[Scope, exp.Table]]:
     refs, seen = [], set()
     for scope in traverse_scope(tree):
@@ -129,7 +147,7 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         for key in keys:
             scope_tables.setdefault(key, []).append((item, table))
 
-    params, api_tables = {}, []
+    params, api_tables, oracle_types = {}, [], {}
     marker = f"sr_{uuid4().hex}_"
     replacements = []
     for scope, table in refs:
@@ -168,8 +186,14 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
             for value in rule["values"]:
                 if value is not None:
                     key = f"p{len(params)}"
+                    bind = exp.Var(this=marker + key)
+                    if ds_type == "oracle" and isinstance(value, str) and _ISO_TIME.fullmatch(value):
+                        name = item["table_name"]
+                        if name not in oracle_types:
+                            oracle_types[name] = {c["source_name"]: c["type"].upper() for c in connector.columns(name)}
+                        value, bind = _oracle_time_bind(oracle_types[name].get(rule["column"], ""), value, bind)
                     params[key] = value
-                    values.append(exp.Var(this=marker + key))
+                    values.append(bind)
             cond = col.isin(*values) if values else None
             if None in rule["values"]:
                 is_null = col.copy().is_(exp.Null())
