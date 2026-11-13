@@ -1,6 +1,6 @@
 """SmartReportGen MCP 服务（Streamable HTTP，路径 /mcp）。
 
-认证：每个请求必须携带 Authorization: Bearer <JWT>；JWT 中的员工工号用于查询权限表（permission schema），
+认证：每个请求携带海尔 IAM access token；经 IAM 核实的工号用于查询权限表（permission schema），
       决定可检索的业务场景与可访问的数据表。数据访问一律默认拒绝。
 工具按智能报告生成流程组织：
   a. search_business_scenarios → get_dataset_tables
@@ -18,9 +18,10 @@ from typing import Any
 import uvicorn
 from fastapi.encoders import jsonable_encoder
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
-from . import auth, db, repo, services
+from . import auth, db, mcp_oauth, repo, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
@@ -46,7 +47,7 @@ def _skill_body() -> str:
             text = text[end + 4:].lstrip()
     return text
 
-INSTRUCTIONS = """SmartReportGen 智能报告 MCP（需令牌认证：员工令牌或海尔 IAM access token；数据按员工工号做表级权限控制）。
+INSTRUCTIONS = """SmartReportGen 智能报告 MCP（使用海尔 IAM access token；数据按员工工号做表级权限控制）。
 若你所在的 agent 没有加载 smart-report 技能（Skill），请先调用 get_skill_guide 获取完整的生成流程与方法，再按流程执行。推荐流程：
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
 2) 结合用户需求和场景的 analysis_approach，用 describe_table / run_query 验证数据与分析假设，确定分析目标；调用 get_template_spec 了解模板语法；
@@ -345,16 +346,14 @@ def list_report_templates(ctx: Context, keyword: str = "") -> dict:
 
 
 def _report_links(report_id: int) -> dict:
-    t = auth.share_token(report_id)
     base = f"{settings.public_base_url}/reports/{report_id}"
-    return {"url": f"{base}?t={t}", "download_url": f"{base}/download?t={t}",
-            "link_expires_in_days": settings.report_share_days}
+    return {"url": base, "download_url": f"{base}/download"}
 
 
 @mcp.tool()
 def render_report_html(template_id: int, ctx: Context, report_name: str = "") -> dict:
     """基于本人创建的报告模板执行查询（按权限校验每条 SQL）并生成 HTML 报告页面，同时存储到报告库。
-    返回 report_id 与带查看凭证的访问 URL。"""
+    返回 report_id 与 IAM 登录后可访问的 URL。"""
     try:
         acc = _access(ctx)
         tpl = repo.get_template(template_id)
@@ -408,11 +407,17 @@ class TokenAuth:
         if scope["type"] == "http" and scope["path"].startswith("/mcp"):
             headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
             try:
-                principal = auth.verify_bearer(headers.get("authorization"),
-                                               headers.get("x-iam-access-token") or headers.get("access-token"))
+                principal = await run_in_threadpool(auth.verify_bearer, headers.get("authorization"),
+                                                    headers.get("x-iam-access-token") or headers.get("access-token"))
+            except auth.AuthUnavailable as e:
+                await JSONResponse({"error": "iam_unavailable", "message": str(e)}, status_code=503)(scope, receive, send)
+                return
             except AuthError as e:
+                challenge = 'Bearer realm="smartreportgen"'
+                if mcp_oauth.enabled():
+                    challenge += f', resource_metadata="{mcp_oauth.resource_metadata_url()}"'
                 resp = JSONResponse({"error": "unauthorized", "message": str(e)}, status_code=401,
-                                    headers={"WWW-Authenticate": 'Bearer realm="smartreportgen"'})
+                                    headers={"WWW-Authenticate": challenge})
                 await resp(scope, receive, send)
                 return
             scope.setdefault("state", {})["principal"] = principal
@@ -434,6 +439,10 @@ def build_app():
         return JSONResponse({"ok": True})
 
     app.add_route("/healthz", health)
+    # 标准 OAuth 发现从 MCP 的公网地址开始，登录与换票走管理 API 的地址。
+    app.add_route(mcp_oauth.resource_metadata_path(), mcp_oauth.resource_metadata)
+    if mcp_oauth.resource_metadata_path() != "/.well-known/oauth-protected-resource":
+        app.add_route("/.well-known/oauth-protected-resource", mcp_oauth.resource_metadata)
     app.add_middleware(TokenAuth)
     return app
 
@@ -441,7 +450,6 @@ def build_app():
 def main() -> None:
     db.init_db()
     repo.load_custom_words()
-    auth.jwt_secret()
     uvicorn.run(build_app(), host="0.0.0.0", port=settings.mcp_port, log_level="info")
 
 

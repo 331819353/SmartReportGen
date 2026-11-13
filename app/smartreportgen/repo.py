@@ -138,12 +138,24 @@ def reindex_dataset(dataset_id: int) -> None:
     )
 
 
-def list_datasets() -> list[dict]:
+def _contains_pattern(q: str) -> str:
+    # 列表搜索按字面匹配，与管理台包含搜索一致。% 和 _ 也可以作为业务文本搜索。
+    return "%" + q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def list_datasets(q: str | None = None) -> list[dict]:
+    where, params = "", ()
+    if q and q.strip():
+        pattern = _contains_pattern(q)
+        where = (" WHERE d.business_scenario ILIKE %s OR d.business_description ILIKE %s "
+                 "OR EXISTS (SELECT 1 FROM unnest(d.tags) tag WHERE tag ILIKE %s)")
+        params = (pattern, pattern, pattern)
     rows = db.fetchall(
         "SELECT d.id, d.business_scenario, d.business_description, d.datasource_id, d.tags, d.enabled, "
         "d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
         "s.type AS datasource_type, (SELECT count(*) FROM dataset.dataset_table t WHERE t.dataset_id=d.id) AS table_count "
-        "FROM dataset.dataset d LEFT JOIN datasource.datasource s ON s.id=d.datasource_id ORDER BY d.id"
+        "FROM dataset.dataset d LEFT JOIN datasource.datasource s ON s.id=d.datasource_id" + where + " ORDER BY d.id",
+        params,
     )
     return rows
 
@@ -432,10 +444,10 @@ TPL_COLS = ("t.id, t.name, t.dataset_id, t.user_requirement, t.analysis_goal, t.
 def list_templates(q: str | None = None, owner: str | None = None) -> list[dict]:
     """owner 不为 None 时只返回该工号创建的模板。"""
     conds, params = [], []
-    if q:
+    if q and q.strip():
         conds.append("(t.name ILIKE %s OR t.user_requirement ILIKE %s OR t.business_summary ILIKE %s "
                      "OR t.analysis_goal ILIKE %s OR d.business_scenario ILIKE %s)")
-        params += [f"%{q}%"] * 5
+        params += [_contains_pattern(q)] * 5
     if owner is not None:
         conds.append("t.created_by = %s")
         params.append(owner)
@@ -516,11 +528,11 @@ def delete_template(tpl_id: int) -> None:
 
 
 # ============================ 报告 ============================
-def list_reports(template_id: int | None = None, owner: str | None = None) -> list[dict]:
+def list_reports(template_id: int | None = None, owner: str | None = None, q: str | None = None) -> list[dict]:
     sql = ("SELECT r.id, r.name, r.template_id, r.template_version, r.meta, r.created_at, length(r.html) AS size, "
-           "r.created_by, t.name AS template_name, "
-           "(SELECT e.name FROM permission.employee e WHERE e.emp_no = r.created_by) AS creator_name "
-           "FROM report.report r LEFT JOIN report_template.report_template t ON t.id=r.template_id")
+           "r.created_by, t.name AS template_name, e.name AS creator_name "
+           "FROM report.report r LEFT JOIN report_template.report_template t ON t.id=r.template_id "
+           "LEFT JOIN permission.employee e ON e.emp_no=r.created_by")
     conds, params = [], []
     if template_id:
         conds.append("r.template_id=%s")
@@ -528,6 +540,9 @@ def list_reports(template_id: int | None = None, owner: str | None = None) -> li
     if owner is not None:
         conds.append("r.created_by=%s")
         params.append(owner)
+    if q and q.strip():
+        conds.append("(r.name ILIKE %s OR t.name ILIKE %s OR e.name ILIKE %s OR r.created_by ILIKE %s)")
+        params += [_contains_pattern(q)] * 4
     where = (" WHERE " + " AND ".join(conds)) if conds else ""
     return db.fetchall(sql + where + " ORDER BY r.id DESC", params)
 
@@ -623,9 +638,10 @@ def save_employee(data: dict, emp_no: str | None = None) -> dict:
 
 
 def delete_employee(emp_no: str) -> None:
-    db.execute("DELETE FROM permission.table_grant WHERE subject_type='employee' AND subject=%s", (emp_no,))
-    db.execute("UPDATE permission.access_token SET revoked=true WHERE emp_no=%s", (emp_no,))
-    db.execute("DELETE FROM permission.employee WHERE emp_no=%s", (emp_no,))
+    # 删除员工和直授记录在同一事务中进行，浏览器会话由外键一并清理。
+    with db.conn() as c, c.transaction():
+        c.execute("DELETE FROM permission.table_grant WHERE subject_type='employee' AND subject=%s", (emp_no,))
+        c.execute("DELETE FROM permission.employee WHERE emp_no=%s", (emp_no,))
 
 
 def list_grants() -> list[dict]:
@@ -642,37 +658,26 @@ def add_grants(data: dict) -> dict:
     if st not in ("employee", "role") or not subject:
         raise Invalid("请指定授权对象（员工工号或角色编码）")
     ds = get_dataset(int(data.get("dataset_id") or 0))
-    tables = data.get("tables") or ["*"]
+    tables = data.get("tables")
+    # 空表单不能意外变成全表授权。全表范围由调用方显式提交 ["*"]。
+    if not isinstance(tables, list) or not tables or not all(isinstance(table, str) for table in tables):
+        raise Invalid("请指定要授权的数据表；全部表请显式提交 [\"*\"]")
     valid = {t["table_name"] for t in ds["tables"]}
     bad = [t for t in tables if t != "*" and t not in valid]
     if bad:
         raise Invalid(f"数据集「{ds['business_scenario']}」中不存在表：{bad}")
     if st == "employee" and not db.fetchone("SELECT 1 AS x FROM permission.employee WHERE emp_no=%s", (subject,)):
         raise Invalid(f"工号 {subject} 未登记，请先在员工中添加")
-    n = 0
-    for t in ("*",) if "*" in tables else tables:
-        row = db.fetchone(
-            "INSERT INTO permission.table_grant(subject_type, subject, dataset_id, table_name) VALUES (%s,%s,%s,%s) "
-            "ON CONFLICT DO NOTHING RETURNING id", (st, subject, ds["id"], t))
-        n += 1 if row else 0
-    return {"added": n}
+    chosen = ["*"] if "*" in tables else tables
+    rows = db.fetchall(
+        "INSERT INTO permission.table_grant(subject_type, subject, dataset_id, table_name) "
+        "SELECT %s,%s,%s,table_name FROM unnest(%s::text[]) AS names(table_name) "
+        "ON CONFLICT DO NOTHING RETURNING id", (st, subject, ds["id"], chosen))
+    return {"added": len(rows)}
 
 
 def delete_grant(grant_id: int) -> None:
     db.execute("DELETE FROM permission.table_grant WHERE id=%s", (grant_id,))
-
-
-def list_tokens(emp_no: str | None = None) -> list[dict]:
-    sql = ("SELECT t.jti, t.emp_no, e.name, t.note, t.expires_at, t.revoked, t.created_at, t.last_used_at, "
-           "(t.expires_at < now()) AS expired FROM permission.access_token t "
-           "LEFT JOIN permission.employee e ON e.emp_no=t.emp_no")
-    if emp_no:
-        return db.fetchall(sql + " WHERE t.emp_no=%s ORDER BY t.created_at DESC", (emp_no,))
-    return db.fetchall(sql + " ORDER BY t.created_at DESC")
-
-
-def revoke_token(jti: str) -> None:
-    db.execute("UPDATE permission.access_token SET revoked=true WHERE jti=%s", (jti,))
 
 
 __all__ = ["NotFound", "Invalid", "ConnectorError"]

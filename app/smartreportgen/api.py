@@ -13,10 +13,14 @@ from urllib.parse import quote
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from markdown_it import MarkdownIt
+from psycopg.errors import ForeignKeyViolation, UniqueViolation
+from starlette.concurrency import run_in_threadpool
 
-from . import auth, db, design, embedding, iam, permission, repo, seed, services
+from . import auth, db, design, embedding, iam, mcp_oauth, permission, repo, seed, services
 from .config import settings
 from .connectors import ConnectorError, get_connector
 from .renderer import RenderError, render, standalone, validate
@@ -25,6 +29,9 @@ from .template_parser import TemplateError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("smartreportgen.api")
 STATIC = Path(__file__).with_name("static")
+DOCS = Path(__file__).with_name("docs")
+if not (DOCS / "HTTP_API.md").is_file():
+    DOCS = Path(__file__).resolve().parents[2] / "docs"
 
 
 @asynccontextmanager
@@ -39,65 +46,85 @@ async def lifespan(_app: FastAPI):
         stale = repo.reindex_all(only_stale=True)
         if stale["datasets"] or stale["style_rules"]:
             log.info("补齐未向量化记录：%s", stale)
-    if settings.iam_enabled and not iam.configured():
-        log.warning("AUTH_MODE=iam 但 IAM 未配置齐全（缺 %s），IAM 单点登录不可用", "、".join(iam.missing_vars()))
-    if open_mode():
-        log.warning("既未配置 IAM 也未设置 ADMIN_TOKEN：管理台与管理 API 处于开发模式（无鉴权），请勿暴露到公网")
+    if not iam.configured():
+        log.warning("海尔 IAM 未配置齐全（缺 %s），受保护的接口不可用", "、".join(iam.missing_vars()))
     yield
 
 
-app = FastAPI(title=settings.app_name, version="1.1.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="1.1.0", lifespan=lifespan,
+              description="管理台 HTTP API，使用海尔 IAM access token。完整示例见 [HTTP 接入说明](/api-guide)。")
+app.include_router(mcp_oauth.router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
-# ------------------------------------------------------------------ 认证：IAM 会话 / 管理员令牌
-ADMIN_COOKIE = "r2h_token"
+def _openapi():
+    if app.openapi_schema is None:
+        schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+        # FastAPI 的鉴权在中间件中执行，显式声明 Bearer 供 Swagger 和生成客户端使用。
+        components = schema.setdefault("components", {})
+        components["securitySchemes"] = {"HaierIAM": {"type": "http", "scheme": "bearer",
+                                                     "description": "海尔 IAM 签发的原始 access token"}}
+        schema["externalDocs"] = {"description": "HTTP 接入说明", "url": "/api-guide"}
+        for path, operations in schema["paths"].items():
+            if path.startswith(("/api/", "/reports/")) and not path.startswith("/api/auth/"):
+                for operation in operations.values():
+                    operation["security"] = [{"HaierIAM": []}]
+                    for status, description in (("401", "IAM 身份缺失或令牌无效"), ("403", "没有操作权限"),
+                                                ("503", "IAM 核验暂不可用")):
+                        operation["responses"].setdefault(status, {"description": description})
+        app.openapi_schema = schema
+    return app.openapi_schema
 
 
-def open_mode() -> bool:
-    """既没有管理员令牌也没有可用的 IAM：开发模式，管理端不鉴权（启动日志会告警）。"""
-    return not settings.admin_token and not (settings.iam_enabled and iam.configured())
+app.openapi = _openapi
 
 
-def console_principal(request: Request) -> auth.Principal | None:
-    tok = request.headers.get("authorization", "").removeprefix("Bearer ").strip() or request.cookies.get(ADMIN_COOKIE, "")
-    if settings.admin_token and tok and secrets.compare_digest(tok, settings.admin_token):
-        return auth.Principal(emp_no=None, name="管理员令牌", is_admin=True, via="admin_token")
-    if settings.iam_enabled:
-        return auth.verify_session(request.cookies.get(auth.SESSION_COOKIE))
-    return None
-
-
+# ------------------------------------------------------------------ 认证：海尔 IAM Bearer / 管理台浏览器会话
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     request.state.principal = None
-    request.state.share_ok = False
-    # 报告页面可凭 MCP 返回链接中的查看凭证 ?t= 免登录访问（仅限该报告）
-    m = re.match(r"^/reports/(\d+)(/download)?$", path)
-    if m and auth.verify_share(int(m.group(1)), request.query_params.get("t")):
-        request.state.share_ok = True
-        return await call_next(request)
     if not (path.startswith("/api/") or path.startswith("/reports/")):
         return await call_next(request)
-    if open_mode():
-        request.state.principal = auth.Principal(emp_no=None, name="开发模式", is_admin=True, via="open")
+    auth_config_path = path in ("/api/auth/config", "/api/auth/check")
+    authorization = request.headers.get("authorization")
+    try:
+        # 显式 Bearer 优先，错误的 Bearer 不回退到浏览器 Cookie。
+        if authorization is not None:
+            principal = await run_in_threadpool(auth.verify_bearer, authorization)
+        else:
+            principal = await run_in_threadpool(auth.verify_session, request.cookies.get(auth.SESSION_COOKIE))
+    except auth.AuthUnavailable as exc:
+        if auth_config_path and authorization is None:
+            principal = None
+        else:
+            return JSONResponse({"detail": str(exc)}, status_code=503)
+    except auth.AuthError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=401,
+                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
+    request.state.principal = principal
+    if auth_config_path:
         return await call_next(request)
-    p = console_principal(request)
-    if path.startswith("/api/auth/"):
-        request.state.principal = p
+    if not principal:
+        # 点击报告链接时引导浏览器完成 IAM 登录，程序调用继续收到标准 401。
+        if (authorization is None and request.method == "GET" and re.fullmatch(r"/reports/\d+(/download)?", path)
+                and "text/html" in request.headers.get("accept", "")):
+            target = path + (f"?{request.url.query}" if request.url.query else "")
+            return RedirectResponse("/auth/iam/login?next=" + quote(target, safe=""), status_code=302)
+        return JSONResponse({"detail": "未登录或 IAM access token 已失效"}, status_code=401,
+                            headers={"WWW-Authenticate": 'Bearer realm="smartreportgen"'})
+    if request.method == "GET" and path in ("/api/me", "/api/me/permissions"):
         return await call_next(request)
-    if not p:
-        return JSONResponse({"detail": "未登录或登录已过期"}, status_code=401)
-    request.state.principal = p
-    if p.is_admin or path.startswith("/reports/") or _user_allowed(request.method, path):
+    if not principal.registered:
+        return JSONResponse({"detail": "工号未登记或已停用"}, status_code=403)
+    if principal.is_admin or path.startswith("/reports/") or _user_allowed(request.method, path):
         return await call_next(request)
     return JSONResponse({"detail": "需要管理员权限；如需开通请联系管理员"}, status_code=403)
 
 
 # 普通用户可访问的接口（默认拒绝）；接口内部再按“有权限 / 本人创建”过滤
 USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
-    ("GET", r"^/api/(me|meta)(/.*)?$"), ("POST", r"^/api/me/.+$"),
+    ("GET", r"^/api/meta$"),
     ("GET", r"^/api/datasources(/\d+)?$"),
     ("GET", r"^/api/datasets(/search|/\d+)?$"), ("GET", r"^/api/scenarios$"),
     ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
@@ -122,6 +149,19 @@ for _exc in (repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeEr
     app.add_exception_handler(_exc, lambda _r, e: JSONResponse({"detail": str(e)}, status_code=400))
 
 
+@app.exception_handler(permission.PermissionDenied)
+async def _denied(_r, exc):
+    return JSONResponse({"detail": str(exc)}, status_code=403)
+
+
+@app.exception_handler(UniqueViolation)
+@app.exception_handler(ForeignKeyViolation)
+async def _resource_conflict(_r, exc):
+    # 并发创建重名资源或引用已删除对象时，返回可处理的冲突，不泄露数据库异常详情。
+    detail = "资源已存在" if isinstance(exc, UniqueViolation) else "资源引用冲突，请重新读取后提交"
+    return JSONResponse({"detail": detail}, status_code=409)
+
+
 def J(obj) -> JSONResponse:
     return JSONResponse(jsonable_encoder(obj))
 
@@ -144,10 +184,39 @@ def index():
     return HTMLResponse(_admin_index_html(), headers={"Cache-Control": "no-cache"})
 
 
-@app.get("/healthz", include_in_schema=False)
+@app.get("/healthz")
 def healthz():
     db.fetchone("SELECT 1")
     return {"ok": True}
+
+
+@cache
+def _api_guide_html() -> str:
+    # 页面直接渲染同一份仓库文档，避免在两处维护 HTTP 契约。
+    renderer = MarkdownIt("commonmark").enable("table")
+    markdown = (DOCS / "HTTP_API.md").read_text(encoding="utf-8")
+    markdown = markdown.replace("../skills/smart-report/references/template-spec.md", "/api-guide/template-spec")
+    body = renderer.render(markdown)
+    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>SmartReportGen HTTP 接入说明</title>
+<style>body{{max-width:70rem;margin:2rem auto;padding:0 1rem;font:16px/1.65 system-ui;color:#24334b}}
+pre{{overflow:auto;padding:1rem;background:#f2f5fa}}table{{display:block;overflow:auto;border-collapse:collapse}}
+td,th{{padding:.4rem .7rem;border:1px solid #dbe3ee}}th{{background:#f2f5fa}}a{{color:#235fba}}</style>
+<nav><a href="/">管理台</a> · <a href="/docs">接口调试</a> · <a href="/openapi.json">OpenAPI JSON</a></nav>
+<main>{body}</main></html>'''
+
+
+@app.get("/api-guide", response_class=HTMLResponse, include_in_schema=False)
+def api_guide():
+    return _api_guide_html()
+
+
+@app.get("/api-guide/template-spec", include_in_schema=False)
+def api_template_spec():
+    spec = DOCS / "skill" / "references" / "template-spec.md"
+    if not spec.is_file():
+        spec = DOCS.parent / "skills" / "smart-report" / "references" / "template-spec.md"
+    return Response(spec.read_text(encoding="utf-8"), media_type="text/plain")
 
 
 def _cookie_secure() -> bool:
@@ -163,78 +232,67 @@ def _me(p: auth.Principal | None) -> dict:
 
 @app.get("/api/auth/config")
 def auth_config(request: Request):
-    return {
-        "mode": settings.auth_mode, "open_mode": open_mode(),
-        "iam_configured": settings.iam_enabled and iam.configured(),
-        "iam_missing": iam.missing_vars() if settings.iam_enabled else [],
-        "admin_token_login": bool(settings.admin_token),
-        "self_service_tokens": settings.self_service_tokens and settings.iam_enabled,
-        "token_max_days": settings.token_max_days,
-        "me": _me(request.state.principal),
-    }
+    return {"mode": "iam", "iam_configured": iam.configured(), "mcp_oauth": mcp_oauth.enabled(),
+            "me": _me(request.state.principal)}
 
 
 @app.get("/api/auth/check")
 def auth_check(request: Request):
-    """兼容旧版管理台：是否需要登录、当前是否已登录。"""
-    return {"required": not open_mode(), "ok": open_mode() or request.state.principal is not None}
+    """返回当前请求是否具有可用的 IAM 身份。"""
+    principal = request.state.principal
+    return {"required": True, "ok": bool(principal and principal.registered)}
 
 
-@app.post("/api/auth/token-login")
-def token_login(data: dict = Body(...)):
-    """应急入口：用 ADMIN_TOKEN 登录管理台（写 HttpOnly Cookie）。"""
-    tok = str(data.get("token") or "")
-    if not settings.admin_token or not secrets.compare_digest(tok, settings.admin_token):
-        return JSONResponse({"detail": "管理员令牌不正确或未启用"}, status_code=401)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie(ADMIN_COOKIE, tok, httponly=True, samesite="strict", secure=_cookie_secure(), max_age=86400 * 7)
-    return resp
-
-
-@app.get("/auth/iam/login", include_in_schema=False)
+@app.get("/auth/iam/login", response_class=HTMLResponse, responses={302: {"description": "跳转到海尔 IAM"}})
 def iam_login(next: str = "/"):
-    if not settings.iam_enabled:
-        return HTMLResponse(_auth_page("未启用 IAM 单点登录", "当前 AUTH_MODE 不是 iam。"), status_code=404)
     if not iam.configured():
-        return HTMLResponse(_auth_page("IAM 单点登录未配置", "缺少配置：" + "、".join(iam.missing_vars())),
-                            status_code=503)
-    state = iam.pack_state(auth.jwt_secret(), iam.safe_next(next))
-    return RedirectResponse(iam.authorize_url(state), status_code=302, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(_auth_page("海尔 IAM 暂不可用", "请联系系统管理员。"), status_code=503)
+    # 用独立的短时 Cookie 绑定此次登录，避免其他浏览器的 IAM 回调替换当前用户会话。
+    browser = secrets.token_urlsafe(32)
+    state = iam.pack_state(browser, iam.safe_next(next))
+    response = RedirectResponse(iam.authorize_url(state), status_code=302, headers={"Cache-Control": "no-store"})
+    response.set_cookie(auth.LOGIN_COOKIE, browser, path="/auth/iam/callback", httponly=True,
+                        samesite="lax", secure=_cookie_secure(), max_age=600)
+    return response
 
 
 @app.get("/auth/iam/callback", include_in_schema=False)
-def iam_callback(code: str = "", state: str = ""):
+def iam_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if state.startswith(mcp_oauth.STATE_PREFIX):
+        return mcp_oauth.complete_iam(request, code, state, error)
+    browser = request.cookies.get(auth.LOGIN_COOKIE)
     try:
-        if not code:
-            raise iam.IamError("回调缺少 code")
-        nxt = iam.unpack_state(auth.jwt_secret(), state)
-        token, body = iam.exchange_code(code)
-        try:
-            acc = iam.resolve_account(token)
-        except iam.IamError:
-            emp = iam.account_of(body)
-            if not emp:
-                raise
-            acc = iam.IamAccount(emp_no=emp, name=iam.name_of(body))
-        p = auth.principal_for(acc.emp_no, acc.name, via="session", register="iam_login")
-    except iam.IamError as e:
-        return HTMLResponse(_auth_page("单点登录失败", str(e)), status_code=400)
-    except iam.IamUnavailable as e:
-        log.error("IAM 回调失败：%s", e)
-        return HTMLResponse(_auth_page("单点登录失败", "IAM 暂时无法核实，请稍后重试"), status_code=502)
-    log.info("IAM 登录：%s %s（管理员=%s，已登记=%s）", p.emp_no, p.name, p.is_admin, p.registered)
-    resp = RedirectResponse(nxt, status_code=302, headers={"Cache-Control": "no-store"})
-    resp.set_cookie(auth.SESSION_COOKIE, auth.issue_session(acc.emp_no), httponly=True, samesite="lax",
-                    secure=_cookie_secure(), max_age=settings.session_hours * 3600)
-    return resp
+        if error or not code or not browser:
+            raise iam.IamError("登录未完成，请从管理台重新登录")
+        nxt = iam.unpack_state(browser, state)
+        token, ticket = iam.exchange_code(code)
+        account = iam.resolve_account(token)
+        principal = auth.principal_for(account.emp_no, account.name, via="session", register="iam_login")
+    except iam.IamError as exc:
+        return HTMLResponse(_auth_page("单点登录失败", str(exc)), status_code=400)
+    except iam.IamUnavailable as exc:
+        log.warning("IAM 回调失败：%s", exc)
+        return HTMLResponse(_auth_page("单点登录失败", "IAM 暂时无法核实，请稍后重试"), status_code=503)
+    if not principal.registered:
+        return HTMLResponse(_auth_page("工号未登记或已停用", "请联系系统管理员。"), status_code=403)
+    seconds = settings.session_hours * 3600
+    if lifetime := iam.expires_in(ticket):
+        seconds = min(seconds, lifetime)
+    session_id = auth.start_session(principal.emp_no, token, seconds)
+    auth.end_session(request.cookies.get(auth.SESSION_COOKIE))
+    response = RedirectResponse(nxt, status_code=302, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(auth.LOGIN_COOKIE, path="/auth/iam/callback")
+    response.set_cookie(auth.SESSION_COOKIE, session_id, httponly=True, samesite="lax",
+                        secure=_cookie_secure(), max_age=seconds)
+    return response
 
 
-@app.post("/auth/logout", include_in_schema=False)
-def logout():
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(auth.SESSION_COOKIE)
-    resp.delete_cookie(ADMIN_COOKIE)
-    return resp
+@app.post("/auth/logout")
+def logout(request: Request):
+    auth.end_session(request.cookies.get(auth.SESSION_COOKIE))
+    response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(auth.SESSION_COOKIE)
+    return response
 
 
 def _auth_page(title: str, msg: str) -> str:
@@ -257,35 +315,6 @@ def my_permissions(request: Request):
     if not p or not p.registered:
         return {"registered": False, "all": False, "datasets": []}
     return J({"registered": True, **permission.describe(permission.access_for(p))})
-
-
-@app.get("/api/me/tokens")
-def my_tokens(request: Request):
-    p = request.state.principal
-    return J(repo.list_tokens(p.emp_no) if p and p.emp_no else [])
-
-
-@app.post("/api/me/tokens")
-def my_token_issue(request: Request, data: dict = Body(default={})):
-    p = request.state.principal
-    if not (settings.self_service_tokens and settings.iam_enabled):
-        raise repo.Invalid("未开启自助签发令牌，请联系管理员")
-    if not p or not p.emp_no:
-        raise repo.Invalid("请使用 IAM 单点登录后再签发个人令牌")
-    if not p.registered:
-        raise repo.Invalid("你的工号未登记或已停用，请联系管理员")
-    days = int(data.get("days") or min(30, settings.token_max_days))
-    return J(auth.issue_token(p.emp_no, days, (data.get("note") or "自助签发")[:100], max_days=settings.token_max_days))
-
-
-@app.post("/api/me/tokens/{jti}/revoke")
-def my_token_revoke(request: Request, jti: str):
-    p = request.state.principal
-    row = db.fetchone("SELECT emp_no FROM permission.access_token WHERE jti=%s", (jti,))
-    if not row or not p or (row["emp_no"] != p.emp_no and not p.is_admin):
-        raise repo.NotFound("令牌不存在")
-    repo.revoke_token(jti)
-    return {"ok": True}
 
 
 # ------------------------------------------------------------------ 角色与归属
@@ -355,12 +384,9 @@ def meta(request: Request):
         "mcp_url": services.mcp_endpoint(),
         "public_base_url": settings.public_base_url,
         "stats": stats,
-        "auth": not open_mode(),
-        "auth_mode": settings.auth_mode,
+        "auth": True,
+        "auth_mode": "iam",
         "app_name": settings.app_name,
-        "jwt": {"emp_claim": settings.jwt_emp_claim, "issuer": settings.jwt_issuer, "audience": settings.jwt_audience,
-                "algorithms": settings.jwt_algorithms, "external_public_key": bool(settings.jwt_public_key),
-                "admin_token_for_mcp": bool(settings.admin_token and settings.mcp_allow_admin_token)},
     })
 
 
@@ -462,8 +488,8 @@ def _scoped_dataset(request: Request, ds: dict) -> dict:
 
 
 @app.get("/api/datasets")
-def dataset_list(request: Request):
-    rows = repo.list_datasets()
+def dataset_list(request: Request, q: str | None = None):
+    rows = repo.list_datasets(q=q)
     if _is_admin(request):
         return J(rows)
     acc = _access(request)
@@ -692,8 +718,8 @@ def tpl_render(request: Request, tpl_id: int, data: dict = Body(default={})):
 
 # ------------------------------------------------------------------ 报告（每人只看自己的，管理员看全部）
 @app.get("/api/reports")
-def report_list(request: Request, template_id: int | None = None):
-    return J(repo.list_reports(template_id, owner=_owner_filter(request)))
+def report_list(request: Request, template_id: int | None = None, q: str | None = None):
+    return J(repo.list_reports(template_id, owner=_owner_filter(request), q=q))
 
 
 @app.get("/api/reports/{report_id}")
@@ -712,21 +738,19 @@ def report_delete(request: Request, report_id: int):
 
 
 def _can_view_report(request: Request, r: dict) -> bool:
-    if request.state.share_ok:
-        return True
     p = request.state.principal
     return bool(p and (p.is_admin or (p.emp_no and r.get("created_by") == p.emp_no)))
 
 
-@app.get("/reports/{report_id}", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/reports/{report_id}", response_class=HTMLResponse)
 def report_view(request: Request, report_id: int):
     r = repo.get_report(report_id)
     if not _can_view_report(request, r):
-        return HTMLResponse(_auth_page("无权查看该报告", "只有报告创建人与管理员可以查看，或使用带查看凭证的分享链接。"), status_code=403)
+        return HTMLResponse(_auth_page("无权查看该报告", "只有报告创建人与管理员可以查看。"), status_code=403)
     return HTMLResponse(r["html"])
 
 
-@app.get("/reports/{report_id}/download", include_in_schema=False)
+@app.get("/reports/{report_id}/download", response_class=HTMLResponse)
 def report_download(request: Request, report_id: int, standalone_file: bool = Query(True, alias="standalone")):
     r = repo.get_report(report_id)
     if not _can_view_report(request, r):
@@ -737,7 +761,7 @@ def report_download(request: Request, report_id: int, standalone_file: bool = Qu
                     headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"})
 
 
-# ------------------------------------------------------------------ 权限：员工 / 授权 / 令牌
+# ------------------------------------------------------------------ 权限：员工 / 表授权
 @app.get("/api/employees")
 def emp_list():
     return J(repo.list_employees())
@@ -775,32 +799,12 @@ def grant_delete(grant_id: int):
     return {"ok": True}
 
 
-@app.get("/api/tokens")
-def token_list(emp_no: str | None = None):
-    return J(repo.list_tokens(emp_no))
-
-
-@app.post("/api/tokens")
-def token_issue(data: dict = Body(...)):
-    """签发 MCP 访问令牌（JWT，含员工工号）。令牌明文只返回这一次。"""
-    days = int(data.get("days") or 90)
-    if not 1 <= days <= 3650:
-        raise repo.Invalid("有效期需在 1-3650 天之间")
-    return J(auth.issue_token((data.get("emp_no") or "").strip(), days, data.get("note") or ""))
-
-
-@app.post("/api/tokens/{jti}/revoke")
-def token_revoke(jti: str):
-    repo.revoke_token(jti)
-    return {"ok": True}
-
-
 @app.get("/api/permissions/check")
 def perm_check(emp_no: str):
     emp = db.fetchone("SELECT * FROM permission.employee WHERE emp_no=%s", (emp_no,))
     if not emp:
         return J({"registered": False, "all": False, "datasets": []})
-    p = auth.Principal(emp_no=emp_no, name=emp["name"], is_admin=emp["is_admin"], registered=emp["enabled"],
+    p = auth.Principal(emp_no=emp_no, name=emp["name"], is_admin=emp["is_admin"] and emp["enabled"], registered=emp["enabled"],
                        roles=list(emp["roles"] or []))
     return J({"registered": emp["enabled"], "employee": emp, **permission.describe(permission.access_for(p))})
 

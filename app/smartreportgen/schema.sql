@@ -140,15 +140,29 @@ CREATE TABLE IF NOT EXISTS permission.table_grant (
     UNIQUE (subject_type, subject, dataset_id, table_name)
 );
 
-CREATE TABLE IF NOT EXISTS permission.access_token (
-    jti          text PRIMARY KEY,
-    emp_no       text NOT NULL,
-    note         text NOT NULL DEFAULT '',
-    expires_at   timestamptz,
-    revoked      boolean NOT NULL DEFAULT false,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    last_used_at timestamptz
+-- 管理台会话只引用 IAM 访问令牌，浏览器持有的会话 ID 仅保存摘要。
+CREATE TABLE IF NOT EXISTS permission.iam_session (
+    id_hash    text PRIMARY KEY,
+    emp_no     text NOT NULL REFERENCES permission.employee(emp_no) ON DELETE CASCADE,
+    iam_token  text NOT NULL,
+    expires_at timestamptz NOT NULL
 );
+CREATE INDEX IF NOT EXISTS iam_session_expiry ON permission.iam_session(expires_at);
+
+-- OAuth 状态和授权码保存摘要，IAM 票只在短期换票窗口内加密保存。
+CREATE TABLE IF NOT EXISTS permission.mcp_oauth_flow (
+    state_hash    text PRIMARY KEY,
+    browser_hash  text,
+    code_hash     text UNIQUE,
+    redirect_uri  text NOT NULL,
+    client_state  text NOT NULL,
+    challenge     text NOT NULL,
+    emp_no        text,
+    iam_token     text,
+    iam_expires_at timestamptz,
+    expires_at    timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mcp_oauth_flow_expiry ON permission.mcp_oauth_flow(expires_at);
 
 -- 兼容已有库，旧记录可以在管理台补充说明。
 ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_approach text NOT NULL DEFAULT '';
@@ -158,6 +172,6 @@ ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS created_by 
 ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS items jsonb NOT NULL DEFAULT '[]'::jsonb;
 -- 创建人：通用规则由管理员配置；业务场景规则归属创建人，只对其本人的报告生效
 ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS created_by text;
--- 员工来源：manual（管理员登记）/ iam_login（IAM 登录管理台自动注册）/ mcp（首次调用 MCP 自动注册）
+-- 员工来源：manual（管理员登记）/ iam_login（IAM 登录管理台）/ mcp（IAM Bearer 接入）
 ALTER TABLE permission.employee ADD COLUMN IF NOT EXISTS registered_via text NOT NULL DEFAULT 'manual';
 ALTER TABLE report.report ADD COLUMN IF NOT EXISTS created_by text;

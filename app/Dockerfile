@@ -11,6 +11,7 @@ RUN pip install --retries 10 --timeout 60 -i ${PIP_INDEX_URL} -r requirements.tx
 COPY app/smartreportgen ./smartreportgen
 # Skill 单一来源：仓库根目录 skills/（MCP 通过 get_skill_guide / get_template_spec / smart_report 提示词对外提供）
 COPY skills/smart-report ./smartreportgen/docs/skill
+COPY docs/HTTP_API.md ./smartreportgen/docs/HTTP_API.md
 
 RUN useradd -r -u 10001 -m app && chown -R app /srv
 USER app

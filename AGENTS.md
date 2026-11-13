@@ -8,12 +8,12 @@
 
 1. 使用技能 **smart-report**：`skills/smart-report/SKILL.md`（在 `.agents/skills/`、`.claude/skills/` 下均有指向它的软链接）。
    若当前 agent 不能加载技能，读取该文件全文并严格按其流程执行；也可以调用 MCP 工具 `get_skill_guide` 获取同样的内容。
-2. 所有数据访问只通过 MCP 服务 **smartreportgen**（`http://localhost:18601/mcp`，请求头 `Authorization: Bearer $SMARTREPORT_TOKEN`）。
-   令牌由员工用海尔 IAM 登录管理台后在「我的令牌」签发，也可以是 IAM access token。
+2. 所有数据访问只通过 MCP 服务 **smartreportgen**（`http://localhost:18600/mcp`）。
+   Codex CLI 可通过 `codex mcp login smartreportgen` 登录海尔 IAM 并自动携带 IAM access token。使用 Bearer 配置的客户端可传入 海尔 IAM access token。
    不要直连数据库，不要编造数据；遇到 `permission_denied` 不要尝试绕过，应告知用户申请权限。
 3. 模板语法：MCP 工具 `get_template_spec`，或 `skills/smart-report/references/template-spec.md`。
 
-各 agent 的 MCP 接入方式见 `docs/DEPLOYMENT.md` 的「接入 Agent」一节。
+各 agent 的 MCP 接入方式见 `docs/DEPLOYMENT.md` 的「接入 Agent」一节。管理台 HTTP 接入见 `docs/HTTP_API.md`。
 
 ## 开发本仓库
 

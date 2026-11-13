@@ -117,6 +117,8 @@ def exchange_code(code: str) -> tuple[str, dict]:
         raise IamUnavailable(f"换票请求失败：{e}") from e
     if r.status_code in (400, 401, 403):
         raise IamError(f"换票被拒绝（HTTP {r.status_code}），授权码可能已使用或过期，请重新登录")
+    if r.status_code >= 500:
+        raise IamUnavailable(f"换票失败：HTTP {r.status_code}")
     try:
         body = r.json()
     except ValueError as e:
@@ -126,6 +128,15 @@ def exchange_code(code: str) -> tuple[str, dict]:
     if not token:
         raise IamError("换票成功但返回里没有 access_token")
     return str(token), data or {}
+
+
+def expires_in(ticket: dict) -> int | None:
+    """IAM 各版本的剩余秒数使用不同字段名，缺失时由 IAM 核验实际有效期。"""
+    try:
+        value = int(ticket.get("expires_in", ticket.get("expiresIn")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value > 0 else None
 
 
 def resolve_account(access_token: str) -> IamAccount:
@@ -141,6 +152,8 @@ def resolve_account(access_token: str) -> IamAccount:
     # 真实 IAM 对无效 / 过期票直接回 HTTP 401（空响应体），不走 resultCode 信封
     if r.status_code in (401, 403):
         raise IamError("IAM 令牌无效或已过期")
+    if r.status_code >= 500:
+        raise IamUnavailable(f"读取账号失败：HTTP {r.status_code}")
     try:
         body = r.json()
     except ValueError as e:

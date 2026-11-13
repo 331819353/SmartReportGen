@@ -3,7 +3,7 @@
   "mcp": {
     "smartreportgen": {
       "type": "remote",
-      "url": "http://localhost:18601/mcp",
+      "url": "http://localhost:18600/mcp",
       "headers": {
         "Authorization": "Bearer {env:SMARTREPORT_TOKEN}"
       }

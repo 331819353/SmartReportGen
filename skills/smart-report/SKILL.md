@@ -5,19 +5,19 @@ description: 智能报告生成（SmartReportGen）。当用户需要“生成/�
 
 # 智能报告生成（SmartReportGen）
 
-依赖 MCP 服务 `smartreportgen`（Streamable HTTP，默认 `http://localhost:18601/mcp`）。
+依赖 MCP 服务 `smartreportgen`（Streamable HTTP，默认 `http://localhost:18600/mcp`）。
 若工具不可用，提示用户先部署服务并为所用 agent 注册 MCP（见部署文档 `docs/DEPLOYMENT.md`「接入 Agent」），不要凭空编造数据。
 
 本技能与 agent 无关（Claude Code、Codex、Cursor 等均可使用）。没有技能机制的 agent 可调用 MCP 工具 `get_skill_guide` 获取本文全文。
 
-**认证与权限**：MCP 必须携带代表员工本人的令牌——员工用海尔 IAM 登录管理台后在「我的令牌」自助签发，或直接使用 IAM access token（服务端向 IAM 核实工号）。工号决定能检索哪些业务场景、能访问哪些数据表：
+**认证与权限**：Codex CLI 可用 `codex mcp login smartreportgen` 通过浏览器登录海尔 IAM，并自动携带 IAM access token。使用 Bearer 配置的客户端可传入 海尔 IAM access token。工号决定可访问的场景和表。
 - 检索、取表、探查、查询、校验、渲染都只覆盖**已授权**的场景与表；任何 SQL（含 JOIN / 子查询）引用未授权表都会被拒绝。
 - 收到 `error_type: permission_denied` 时**不要改写 SQL 绕过**，直接告诉用户缺少哪张表/哪个场景的权限、应向管理员申请；可在已授权范围内给出降级方案（例如去掉依赖该表的章节）。
-- 401 / 令牌无效或过期：提示用户用 IAM 登录管理台，在「我的令牌」重新签发，并更新 agent 的 `SMARTREPORT_TOKEN`（通常需要重开 agent 会话）。
+- 401 / 令牌无效或过期时，按客户端的认证方式重新登录或更新令牌。Codex CLI 使用 `codex mcp login smartreportgen`。
 - 模板与报告按创建人隔离：只能读取、修改、渲染本人创建的模板。
 
 产出物：一份存储在报告库中的**报告模板（markdown）**和由它生成的**HTML 报告**。
-最终回复给出报告链接、核心结论摘要和需要用户确认的口径假设。
+最终回复给出需海尔 IAM 登录的报告链接、核心结论摘要和需要用户确认的口径假设。
 
 ## 流程总览
 
@@ -75,7 +75,7 @@ description: 智能报告生成（SmartReportGen）。当用户需要“生成/�
 1. `validate_report_template(markdown, dataset_id)`：修复全部 `errors`；核对 `warnings`，检查返回的行数与筛选取值是否符合预期。循环直到 `ok: true`。
 2. 核对结论文本中的每个静态数字都能在 `run_query` 结果中找到出处；与实时指标冲突时以实时指标为准改写文本。
 3. `save_report_template(name, markdown, dataset_id, user_requirement, analysis_goal, business_summary)` → 得到 `template_id`（修改已有模板时传 `template_id`）。用通俗语言填写 `business_summary`，让同事知道模板适合回答哪些问题、重点看哪些指标或对比。使用业务名称，省去 SQL、字段名和模板参数。
-4. `render_report_html(template_id)` → 生成 HTML 并**自动存入报告库**，返回 `report_id` 与带查看凭证的 `url`（默认 7 天内免登录可看）。
+4. `render_report_html(template_id)` → 生成 HTML 并**自动存入报告库**，返回 `report_id` 与`url`（报告创建人或管理员使用海尔 IAM 登录后可看）。
 
 ## f. 存储 HTML
 

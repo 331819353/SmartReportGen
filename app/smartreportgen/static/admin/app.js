@@ -26,7 +26,7 @@ async function run(fn, okMsg) {
 }
 const fmtTime = s => s ? String(s).replace('T', ' ').slice(0, 16) : '';
 const isAdmin = () => !!(state.me && state.me.is_admin);
-const creator = x => x.created_by ? `${x.creator_name || ''}${x.creator_name ? '（' + x.created_by + '）' : x.created_by}` : '管理员令牌 / 系统';
+const creator = x => x.created_by ? `${x.creator_name || ''}${x.creator_name ? '（' + x.created_by + '）' : x.created_by}` : '系统';
 const fmtSize = n => n == null ? '' : n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : (n / 1024).toFixed(0) + ' KB';
 const DS_LABEL = { mysql: 'MySQL', postgresql: 'PostgreSQL', oracle: 'Oracle', starrocks: 'StarRocks', api: 'HTTP API' };
 const DEFAULT_PORT = { mysql: 3306, postgresql: 5432, oracle: 1521, starrocks: 9030 };
@@ -156,7 +156,7 @@ const Home = {
       { page: 'reports', label: '报告库', icon: 'rep', description: '查阅和下载已有报告' },
       { page: 'styles', label: '报告样式', icon: 'sty', description: '预览报告版式和设置样式规则' },
       { page: 'perms', label: '员工与授权', icon: 'perm', description: '维护员工和数据访问权限', visible: admin.value },
-      { page: 'mine', label: '我的令牌', icon: 'key', description: '查看个人权限和接入指引', visible: canVisitMine() }
+      { page: 'mine', label: '我的权限与接入', icon: 'key', description: '查看个人权限和接入指引', visible: canVisitMine() }
     ].filter(entry => entry.visible !== false));
     return { ...reports, admin, entries, fmtTime, icon };
   }
@@ -1090,11 +1090,11 @@ const Styles = {
   }
 };
 
-// ------------------------------------------------------------ 权限与令牌
+// ------------------------------------------------------------ 员工与授权
 const Perms = {
   components: { Drawer },
   template: `<div>
-    <div class="page-head"><div><h1>员工与授权</h1><p>为员工或角色开放业务场景和数据表，也可在这里管理访问令牌。</p></div></div>
+    <div class="page-head"><div><h1>员工与授权</h1><p>为员工或角色开放业务场景和数据表，并查询有效权限。</p></div></div>
     <div class="subtabs"><button v-for="t in tabs" :class="{on:tab===t[0]}" @click="tab=t[0]">{{t[1]}}</button></div>
 
     <template v-if="tab==='emp'">
@@ -1103,9 +1103,9 @@ const Perms = {
         <tbody><tr v-for="e in emps"><td class="mono">{{e.emp_no}}</td><td>{{e.name}}</td><td>{{e.department}}</td>
           <td><span v-for="r in e.roles" class="badge" style="margin-right:4px">{{r}}</span><span v-if="e.direct_grants" class="small muted">+{{e.direct_grants}} 项直授</span></td>
           <td><span class="badge" :class="e.is_admin?'red':''">{{e.is_admin?'管理员（全部数据）':'普通用户'}}</span></td>
-          <td class="small">{{({manual:'管理员登记', iam_login:'IAM 登录', mcp:'首次调用 MCP'})[e.registered_via] || e.registered_via}}</td>
+          <td class="small">{{({manual:'管理员登记', iam_login:'IAM 登录', mcp:'IAM 接入'})[e.registered_via] || e.registered_via}}</td>
           <td><span class="dot" :class="{on:e.enabled}"></span>{{e.enabled?'启用':'停用'}}</td>
-          <td><div class="links"><button class="link" @click="issueFor(e)">签发令牌</button><button class="link" @click="checkEmp(e.emp_no)">查看权限</button>
+          <td><div class="links"><button class="link" @click="checkEmp(e.emp_no)">查看权限</button>
             <button class="link" @click="editEmp(e)">编辑</button><button class="link danger" @click="delEmp(e)">删除</button></div></td></tr>
           <tr v-if="!emps.length"><td colspan="8" class="empty">暂无员工</td></tr></tbody></table></div>
     </template>
@@ -1135,34 +1135,11 @@ const Perms = {
           <tr v-if="!grants.length"><td colspan="5" class="empty">暂无授权</td></tr></tbody></table></div>
     </template>
 
-    <template v-if="tab==='token'">
-      <div class="card card-pad" style="margin-bottom:14px">
-        <h3>签发 MCP 访问令牌</h3>
-        <div class="row3" style="grid-template-columns:1.2fr 120px 1.5fr auto;align-items:end">
-          <div class="field"><label>员工</label><select class="in" v-model="tk.emp_no"><option value="" disabled>选择员工</option><option v-for="e in emps.filter(e=>e.enabled)" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select></div>
-          <div class="field"><label>有效期（天）</label><input class="in" type="number" v-model.number="tk.days"></div>
-          <div class="field"><label>备注</label><input class="in" v-model="tk.note" placeholder="如：张敏的 Claude Code"></div>
-          <div class="field"><button class="btn primary" @click="issue" :disabled="!tk.emp_no">签发</button></div>
-        </div>
-        <div v-if="issued" class="msg ok" style="margin-top:4px">令牌已签发（仅显示这一次，请立即复制给 {{issued.emp_no}}）：
-          <pre class="block" style="margin-top:8px">{{issued.token}}</pre>
-          <div class="small" style="margin-top:8px">Claude Code 注册命令：</div>
-          <pre class="block" style="margin-top:4px">claude mcp add --transport http smartreportgen {{mcpUrl}} --header "Authorization: Bearer {{issued.token}}"</pre>
-          <div class="actions" style="margin-top:8px"><button class="btn sm" @click="copy(issued.token)">复制令牌</button><button class="btn sm" @click="copy(cmd)">复制命令</button></div></div>
-        <div class="small muted" style="margin-top:8px">令牌为 JWT，工号位于 claim「{{jwt.emp_claim}}」，iss={{jwt.issuer}}，aud={{jwt.audience}}。{{jwt.external_public_key ? '已配置外部公钥，也接受企业 SSO 签发的令牌。' : '如需接入企业 SSO 签发的令牌，配置 JWT_PUBLIC_KEY。'}}</div>
-      </div>
-      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>员工</th><th>备注</th><th>签发时间</th><th>过期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody><tr v-for="t in tokens"><td><span class="mono">{{t.emp_no}}</span> {{t.name}}</td><td>{{t.note}}</td><td class="small">{{fmtTime(t.created_at)}}</td><td class="small">{{fmtTime(t.expires_at)}}</td><td class="small">{{fmtTime(t.last_used_at) || '-'}}</td>
-          <td><span class="badge" :class="t.revoked?'red':t.expired?'amber':'green'">{{t.revoked?'已吊销':t.expired?'已过期':'有效'}}</span></td>
-          <td><button class="link danger" v-if="!t.revoked" @click="revoke(t)">吊销</button></td></tr>
-          <tr v-if="!tokens.length"><td colspan="7" class="empty">暂无令牌</td></tr></tbody></table></div>
-    </template>
-
     <template v-if="tab==='check'">
       <div class="card card-pad">
         <div class="actions"><select class="in" v-model="chk" style="width:260px"><option value="" disabled>选择员工</option><option v-for="e in emps" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select><button class="btn primary" @click="checkEmp(chk)" :disabled="!chk">查询有效权限</button></div>
         <div v-if="chkRes" style="margin-top:14px">
-          <div class="msg warn" v-if="!chkRes.registered">该工号未登记或已停用：MCP 调用将被拒绝访问任何数据。</div>
+          <div class="msg warn" v-if="!chkRes.registered">该工号未登记或已停用：HTTP 和 MCP 无法访问业务数据。</div>
           <div class="msg ok" v-else-if="chkRes.all">管理员：可访问全部业务场景与数据表。</div>
           <div v-for="d in chkRes.datasets" class="hit" v-if="!chkRes.all"><h4>{{d.business_scenario}} <span class="score">dataset_id={{d.dataset_id}}</span></h4>
             <div><span v-for="t in d.tables" class="badge" style="margin:2px 6px 2px 0"><span class="mono">{{t}}</span></span></div></div>
@@ -1182,18 +1159,15 @@ const Perms = {
     </Drawer>
   </div>`,
   setup() {
-    const tabs = [['emp', '员工'], ['grant', '表授权'], ['token', '访问令牌'], ['check', '权限查询']];
-    const tab = ref('emp'), emps = ref([]), grants = ref([]), tokens = ref([]), datasets = ref([]), emp = ref(null);
+    const tabs = [['emp', '员工'], ['grant', '表授权'], ['check', '权限查询']];
+    const tab = ref('emp'), emps = ref([]), grants = ref([]), datasets = ref([]), emp = ref(null);
     const g = reactive({ subject_type: 'role', subject: '', dataset_id: null, tables: ['*'] });
-    const tk = reactive({ emp_no: '', days: 90, note: '' }), issued = ref(null), chk = ref(''), chkRes = ref(null), dsDetail = ref(null);
-    const jwt = computed(() => (state.meta && state.meta.jwt) || {});
-    const mcpUrl = computed(() => state.meta ? state.meta.mcp_url : '');
-    const cmd = computed(() => issued.value ? `claude mcp add --transport http smartreportgen ${mcpUrl.value} --header "Authorization: Bearer ${issued.value.token}"` : '');
+    const chk = ref(''), chkRes = ref(null), dsDetail = ref(null);
     const roles = computed(() => Array.from(new Set(emps.value.flatMap(e => e.roles || []))));
     const dsTables = computed(() => dsDetail.value ? dsDetail.value.tables : []);
     watch(() => g.dataset_id, async id => { dsDetail.value = id ? await api('/api/datasets/' + id) : null; });
     const load = async () => {
-      [emps.value, grants.value, tokens.value, datasets.value] = await Promise.all([api('/api/employees'), api('/api/grants'), api('/api/tokens'), api('/api/datasets')]);
+      [emps.value, grants.value, datasets.value] = await Promise.all([api('/api/employees'), api('/api/grants'), api('/api/datasets')]);
     };
     onMounted(load);
     function editEmp(e) { emp.value = e ? { ...e, rolesTxt: (e.roles || []).join(', ') } : { _new: true, emp_no: '', name: '', department: '', rolesTxt: '', is_admin: false, enabled: true }; }
@@ -1202,24 +1176,13 @@ const Perms = {
       await run(() => e._new ? api('/api/employees', { method: 'POST', body }) : api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'PUT', body }), '已保存');
       emp.value = null; load();
     }
-    async function delEmp(e) { if (!confirm(`删除员工 ${e.emp_no}？其直授权限会删除、令牌会被吊销。`)) return; await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load(); }
+    async function delEmp(e) { if (!confirm(`删除员工 ${e.emp_no}？其直接授权和管理台会话会删除。`)) return; await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load(); }
     function toggleT(t) { const i = g.tables.indexOf(t); if (i >= 0) g.tables.splice(i, 1); else g.tables.push(t); }
     async function addGrant() { const r = await run(() => api('/api/grants', { method: 'POST', body: { ...g } })); toast(`新增 ${r.added} 条授权`, 'ok'); load(); }
     async function delGrant(x) { if (!confirm('撤销该授权？')) return; await run(() => api('/api/grants/' + x.id, { method: 'DELETE' }), '已撤销'); load(); }
-    function issueFor(e) { tab.value = 'token'; tk.emp_no = e.emp_no; issued.value = null; }
-    async function issue() {
-      if (issuing.value) return;
-      issuing.value = true;
-      try {
-        issued.value = await run(() => api('/api/me/tokens', { method: 'POST', body: { days: days.value, note: note.value } }), '令牌已创建');
-        await load();
-      } finally { issuing.value = false; }
-    }
-    async function revoke(t) { if (!confirm(`吊销 ${t.emp_no} 的令牌？使用该令牌的 MCP 客户端将立即失效。`)) return; await run(() => api(`/api/tokens/${t.jti}/revoke`, { method: 'POST' }), '已吊销'); load(); }
     async function checkEmp(no) { tab.value = 'check'; chk.value = no; chkRes.value = await run(() => api('/api/permissions/check?emp_no=' + encodeURIComponent(no))); }
-    function copy(text) { navigator.clipboard.writeText(text).then(() => toast('已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err')); }
-    return { tabs, tab, emps, grants, tokens, datasets, emp, g, tk, issued, chk, chkRes, jwt, mcpUrl, cmd, roles, dsTables,
-      editEmp, saveEmp, delEmp, toggleT, addGrant, delGrant, issueFor, issue, revoke, checkEmp, copy, fmtTime };
+    return { tabs, tab, emps, grants, datasets, emp, g, chk, chkRes, roles, dsTables,
+      editEmp, saveEmp, delEmp, toggleT, addGrant, delGrant, checkEmp, fmtTime };
   }
 };
 
@@ -1230,49 +1193,24 @@ const Login = {
       <a class="brand" href="/"><span class="brand-icon" v-html="icon('rep')"></span><span>报告管理台<small>SmartReportGen</small></span></a>
       <h1>登录报告管理台</h1><p class="login-intro">登录后可查看报告、模板及已授权的业务数据。</p>
       <template v-if="cfg">
-        <template v-if="cfg.mode==='iam'">
-          <a v-if="cfg.iam_configured" class="btn primary big" href="/auth/iam/login?next=/">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
-          <div v-else class="msg warn" role="status">海尔单点登录暂不可用，请联系系统管理员。</div>
-        </template>
-        <details v-if="cfg.admin_token_login" :open="cfg.mode!=='iam'" class="fallback">
-          <summary>管理员令牌登录</summary>
-          <form @submit.prevent="login">
-            <div class="field"><label for="admin-token">管理员令牌</label><input id="admin-token" class="in" type="password" v-model="tok" autocomplete="current-password" required></div>
-            <div class="msg err" v-if="error" role="alert">{{error}}</div>
-            <button class="btn" :disabled="busy || !tok">{{busy ? '正在登录…' : '登录'}}</button>
-          </form>
-        </details>
-        <div class="msg err" v-if="cfg.mode!=='iam' && !cfg.admin_token_login" role="alert">登录方式暂不可用，请联系系统管理员。</div>
+        <a v-if="cfg.iam_configured" class="btn primary big" href="/auth/iam/login?next=/">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
+        <div v-else class="msg warn" role="status">海尔单点登录暂不可用，请联系系统管理员。</div>
       </template>
     </div>
   </main>`,
-  setup() {
-    const tok = ref(''), busy = ref(false), error = ref('');
-    const cfg = computed(() => state.authCfg);
-    async function login() {
-      if (busy.value || !tok.value) return;
-      busy.value = true;
-      error.value = '';
-      try {
-        await api('/api/auth/token-login', { method: 'POST', body: { token: tok.value } });
-        location.reload();
-      } catch (e) { error.value = e.message; }
-      finally { busy.value = false; }
-    }
-    return { tok, cfg, busy, error, login, icon };
-  }
+  setup() { return { cfg: computed(() => state.authCfg), icon }; }
 };
 
-// ------------------------------------------------------------ 我的令牌（所有登录员工）
+// ------------------------------------------------------------ 我的权限与接入（所有登录员工）
 const Mine = {
   template: `<div>
-    <div class="page-head"><div><h1>我的令牌</h1><p>连接 Codex 或 Claude Code，并查看 AI 助手可以使用的业务数据。</p></div></div>
+    <div class="page-head"><div><h1>我的权限与接入</h1><p>查看数据权限及 HTTP、MCP 接入方式。</p></div></div>
     <div class="grid g2">
       <div class="card card-pad">
         <h2>账号信息</h2>
-        <dl class="kv" v-if="state.me"><dt>工号</dt><dd class="mono">{{state.me.emp_no || '（管理员令牌登录）'}}</dd><dt>姓名</dt><dd>{{state.me.name || '-'}}</dd>
+        <dl class="kv" v-if="state.me"><dt>工号</dt><dd class="mono">{{state.me.emp_no || '-'}}</dd><dt>姓名</dt><dd>{{state.me.name || '-'}}</dd>
           <dt>身份</dt><dd><span class="badge" :class="state.me.is_admin?'red':''">{{state.me.is_admin ? '管理员' : '员工'}}</span> <span class="badge" v-if="!state.me.registered" style="margin-left:4px">未登记 / 已停用</span></dd>
-          <dt>登录方式</dt><dd>{{({session:'海尔 IAM 单点登录', admin_token:'管理员令牌', open:'开发模式'})[state.me.via] || state.me.via}}</dd></dl>
+          <dt>登录方式</dt><dd>{{({session:'海尔 IAM 单点登录', iam:'海尔 IAM'})[state.me.via] || state.me.via}}</dd></dl>
         <h2 class="account-section">我的数据权限</h2>
         <div v-if="perm">
           <div class="msg ok" v-if="perm.all">管理员：可访问全部业务场景与数据表。</div>
@@ -1284,50 +1222,22 @@ const Mine = {
       </div>
       <div class="card card-pad">
         <h2>接入 AI 助手</h2>
-        <p class="muted">个人令牌用于验证身份，使用你已有的数据权限。</p>
-        <template v-if="canIssue">
-          <div class="row2"><div class="field"><label for="token-days">有效期</label><select id="token-days" class="in" v-model.number="days"><option v-for="d in dayOpts" :value="d">{{d}} 天</option></select></div>
-            <div class="field"><label for="token-note">用途备注 <small>选填</small></label><input id="token-note" class="in" v-model="note" placeholder="如：我的 Codex"></div></div>
-          <button class="btn primary" :disabled="issuing" @click="issue">{{issuing ? '正在创建…' : '创建个人令牌'}}</button>
-          <div v-if="issued" class="msg ok issued-token">令牌仅在创建后显示一次，请复制并妥善保存。
-            <pre class="block">{{issued.token}}</pre>
-            <div class="actions"><button class="btn sm" @click="copy(issued.token)">复制令牌</button><button class="btn sm" @click="copy('export SMARTREPORT_TOKEN=' + issued.token)">复制环境变量命令</button></div>
-          </div>
-          <details class="fallback">
-            <summary>查看接入步骤</summary>
-            <p>在启动 AI 助手的终端中，把个人令牌设为环境变量：</p>
-            <pre class="block">export SMARTREPORT_TOKEN=&lt;个人令牌&gt;</pre>
-            <p>Codex</p>
-            <pre class="block">codex mcp add smartreportgen --url {{mcpUrl}} --bearer-token-env-var SMARTREPORT_TOKEN</pre>
-            <p>Claude Code</p>
-            <pre class="block">claude mcp add --transport http smartreportgen {{mcpUrl}} --header "Authorization: Bearer $SMARTREPORT_TOKEN"</pre>
-          </details>
+        <template v-if="state.authCfg?.mcp_oauth && mcpUrl">
+          <p>Codex CLI 在浏览器中完成海尔 IAM 登录，自动取得访问令牌。</p>
+          <pre class="block">codex mcp add smartreportgen --url {{mcpUrl}} --oauth-client-id smartreportgen-cli
+codex mcp login smartreportgen</pre>
         </template>
-        <div v-else class="msg warn">{{whyNot}}</div>
+        <p>HTTP 和 MCP 均使用海尔 IAM access token。</p>
+        <div class="actions"><a class="btn" href="/api-guide" target="_blank" rel="noopener">HTTP 接入说明</a>
+          <a class="btn" href="/docs" target="_blank" rel="noopener">接口调试</a></div>
       </div>
     </div>
-    <div class="card scroll-x token-list"><div class="card-pad"><h2>已创建的令牌</h2></div><table class="tbl"><thead><tr><th>备注</th><th>签发时间</th><th>过期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead>
-      <tbody><tr v-for="t in tokens"><td>{{t.note}}</td><td class="small">{{fmtTime(t.created_at)}}</td><td class="small">{{fmtTime(t.expires_at)}}</td><td class="small">{{fmtTime(t.last_used_at) || '-'}}</td>
-        <td><span class="badge" :class="t.revoked?'red':t.expired?'amber':'green'">{{t.revoked?'已吊销':t.expired?'已过期':'有效'}}</span></td>
-        <td><button class="link danger" v-if="!t.revoked && !t.expired" @click="revoke(t)">吊销</button></td></tr>
-        <tr v-if="!tokens.length"><td colspan="6" class="empty">还没有个人令牌</td></tr></tbody></table></div>
   </div>`,
   setup() {
-    const tokens = ref([]), perm = ref(null), issued = ref(null), note = ref(''), days = ref(30), issuing = ref(false);
-    const maxDays = computed(() => (state.authCfg && state.authCfg.token_max_days) || 90);
-    // 部署可配置更短的签发上限，确保下拉框始终包含可提交的有效期。
-    const dayOpts = computed(() => [...new Set([7, 30, 60, 90, 180, 365, maxDays.value])].filter(d => d <= maxDays.value).sort((a,b) => a-b));
-    days.value = Math.min(days.value, maxDays.value);
-    const mcpUrl = computed(() => state.meta ? state.meta.mcp_url : '');
-    const canIssue = computed(() => state.authCfg && state.authCfg.self_service_tokens && state.me && state.me.emp_no && state.me.registered);
-    const whyNot = computed(() => !state.authCfg || !state.authCfg.self_service_tokens ? '未开启自助签发，请联系管理员签发令牌。'
-      : !(state.me && state.me.emp_no) ? '请使用海尔 IAM 单点登录后签发个人令牌（管理员令牌登录没有工号）。' : '你的工号未登记或已停用，请联系管理员。');
-    const load = async () => { [tokens.value, perm.value] = await Promise.all([api('/api/me/tokens'), api('/api/me/permissions')]); };
-    onMounted(load);
-    async function issue() { issued.value = await run(() => api('/api/me/tokens', { method: 'POST', body: { days: days.value, note: note.value } }), '令牌已签发'); load(); }
-    async function revoke(t) { if (!confirm('吊销这枚令牌？使用它的 agent 将立即无法访问。')) return; await run(() => api(`/api/me/tokens/${t.jti}/revoke`, { method: 'POST' }), '已吊销'); load(); }
-    function copy(text) { navigator.clipboard.writeText(text).then(() => toast('已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err')); }
-    return { state, tokens, perm, issued, note, days, dayOpts, mcpUrl, canIssue, whyNot, issuing, issue, revoke, copy, fmtTime };
+    const perm = ref(null);
+    const mcpUrl = computed(() => state.meta?.mcp_url);
+    onMounted(async () => { perm.value = await run(() => api('/api/me/permissions')); });
+    return { state, perm, mcpUrl };
   }
 };
 
@@ -1336,10 +1246,10 @@ const PAGES = { home: Home, datasources: Datasources, datasets: Datasets, templa
 const NAV_GROUPS = [
   { title: '报告', items: [['home', '管理总览', 'home'], ['reports', '报告库', 'rep'], ['templates', '报告模板', 'tpl']] },
   { title: '资源', items: [['datasets', '业务场景', 'set'], ['styles', '报告样式', 'sty']] },
-  { title: '账号', items: [['mine', '我的令牌', 'key']] },
+  { title: '账号', items: [['mine', '我的权限与接入', 'key']] },
   { title: '系统管理', admin: true, items: [['datasources', '数据源', 'ds'], ['perms', '员工与授权', 'perm']] }
 ];
-function canVisitMine() { return !!(state.me?.emp_no || state.authCfg?.mode === 'iam'); }
+function canVisitMine() { return !!state.me?.emp_no; }
 
 createApp({
   components: { Login, GenerateReport },
@@ -1365,7 +1275,7 @@ createApp({
         <div class="account">
           <span class="avatar" aria-hidden="true">{{person.slice(0,1)}}</span>
           <span class="account-name"><b :title="person">{{person}}</b><small>{{state.me.is_admin ? '管理员' : '员工'}}</small></span>
-          <button v-if="state.me.via!=='open'" type="button" class="btn ghost logout" @click="logout">退出登录</button>
+          <button type="button" class="btn ghost logout" @click="logout">退出登录</button>
         </div>
       </header>
       <main id="main-content" ref="main" class="main" tabindex="-1"><component :is="page" :key="current[0]"/></main>
@@ -1405,8 +1315,8 @@ createApp({
       try {
         const cfg = await api('/api/auth/config');
         state.authCfg = cfg;
-        if (!cfg.open_mode && !cfg.me.logged_in) { state.needLogin = true; return; }
-        state.me = cfg.me.logged_in ? cfg.me : { emp_no: null, name: '开发模式', is_admin: true, via: 'open', registered: true };
+        if (!cfg.me.logged_in) { state.needLogin = true; return; }
+        state.me = cfg.me;
         loadMeta().catch(e => toast(e.message, 'err'));
       } catch (e) { bootError.value = e.message; }
     }
