@@ -66,18 +66,14 @@ description: 智能报告生成（SmartReportGen）。当用户要求生成分�
 
 1. 调用 `get_style_rules(business_scenario, query=用户需求)`，得到 `specified`——业务场景规则（当前用户本人为该场景配置的）
    ≥ 通用规则（管理员配置的）≥ 内置样式 按优先级合并的约束：
-   - `specified.theme` 提供视觉样式取值，例如封面、目录、章节面板、图表配色和表格排版。编写 HTML 时将适用取值落实到 CSS 和图表配置。
+   - `specified.theme` 提供视觉样式取值，编写 HTML 时将适用取值落实到 CSS 和图表配置。需要沿用内置版式时，可直接内联工具返回的 `builtin_style.css`，并参考 `builtin_style.components` 组织页面。
    - `specified.items`：展示要求（好坏判定 / 涨跌颜色 / 数字格式 / 文案要求 / 其他展示要求），各类别内业务场景规则的条目排在前面，同类冲突时以排在前面的为准。
-   - **默认页面布局**：标题背景和正文使用同一个最大宽度（`max_width`）与页面左右边距（`rre-page-pad`），整块等宽、居中、左右边缘对齐。背景应用于标题块，不铺满视口。`header_align` 只控制标题块内的文字对齐。
-   - 开启目录（`toc`）时，宽屏将目录放在正文左侧的留白中，不占正文宽度。可用宽度至少达到 `max_width + 2 × (rre-page-pad + rre-toc-width + rre-toc-gap)` 时才使用侧栏；留白不足时将目录放到标题下方、正文之前，目录过长可在目录内部滚动。参考 [默认布局 HTML 示例](references/example-report.html)。
-   - 内置页面布局中，指标卡、图表卡和表格卡在同一行时按最高的卡片等高拉伸，保留卡片间距并分配行内剩余宽度。单张卡片占满所在行，最后一行和窄屏换行后也遵循此规则。可用 `flex-wrap`、`align-items: stretch` 和卡片的 `flex-grow` 实现。
-   - 同一报告内同类卡片跨章节复用同一套 CSS 类和图表基础配置。所有表格共用表头样式、行高、隔行底色及文字列和数值列的对齐规则。所有柱状图共用柱宽上限、圆角规则、坐标轴、网格、图例、标签和配色规则。其他同类卡片按同样方式复用。排序、单位、轴范围及正负、状态、分类配色按数据含义设置。
+   - 同类卡片跨章节复用组件样式及图表基础配置。排序、单位、轴范围及数据着色按业务含义设置。
    - 章节安排、图表类型和筛选条件在 b、c 节决定。样式条目中涉及这些分析决策的文字不作为展示约束。
 2. **默认遵守约束，确有理由时按自己的判断调整**：例如用户在对话中明确提出的要求（如“红涨绿跌”）、某条要求不适合本报告的数据。
    在 HTML 的样式或交互中落实调整。
    所有偏离约束的地方都要在最终回复的“口径与假设”中说明。
 3. 未指定的视觉样式与展示要求由你按报告内容决定。结论正文的状态颜色要与页面底色保持足够对比度。
-   保持整份报告一致，例如数据密集的报告减小卡片内边距与表格行高，面向管理层的概览让指标卡与头部居中（`kpi_align: center`、`header_align: center`）。
 
 ## d 与 e 之间. 编写并保存业务报告模板
 
@@ -89,7 +85,7 @@ description: 智能报告生成（SmartReportGen）。当用户要求生成分�
 
 1. 根据已保存版本的业务模板，编写包含 `<!doctype html>`、`<html>`、`<head>` 和 `<body>` 的完整文档，内联 CSS、JavaScript、必要的图表库和图像。每份查询结果写一个空数据标签 `<script type="application/json" id="sales" data-srg-snapshot="实际返回的 snapshot_id"></script>`。多个结果使用不同 `id`，将这些标签放在读取它们的脚本之前。服务端将完整的 `{columns, rows}` 写进对应标签。页面通过 `JSON.parse(document.getElementById('sales').textContent)` 读取，以 `columns` 与 `rows` 对应字段。页面运行时不需要访问 JSON 文件、CDN 或接口，动态文案使用 `textContent` 等文本 API。
 2. 调用 `preview_report_html(html=含快照引用的完整文档)`，用返回的 `url` 在浏览器预览，或用 `download_url` 下载展开后的 HTML，再以离线方式打开。在桌面和窄屏分别检查卡片行是否等高并铺满可用宽度。切换每个筛选维度，检查多条件组合及重置，核对图表、指标卡、表格和结论是否按适用范围一起更新。用 `run_query` 的汇总结果复核各表来源的数字。至少验证同比为正、负、零，达成率高于、低于、刚好达到阈值，以及空结果和分母为零时的文案、符号和实际颜色。正式数据缺少边界样本时可用独立测试数据验证计算，正式报告只使用已核实的数据。
-   在报告实际展示容器中检查宽屏和窄屏：标题背景与正文左右边缘对齐、整页无横向溢出，目录在侧栏与标题下方正确切换，目录链接定位到对应章节。对照不同章节中的同类卡片，检查表格排版与同类图表样式在初始和筛选状态下一致。
+   在报告实际展示容器中检查宽屏和窄屏：页面符合所采用的版式、整页无横向溢出，目录链接定位到对应章节。对照不同章节中的同类卡片，检查表格排版与同类图表样式在初始和筛选状态下一致。
 3. 调用 `save_report(name, html=预览时提交的含引用文档, template_id, template_version)`。服务端保存展开后的离线单文件，报告版本不依赖临时 JSON 的有效期。传入实际用于开发的模板 ID 和版本，并用返回的 `url` 和 `download_url` 交付报告。创建人和管理员可在报告库按员工工号分享，接收人使用海尔 IAM 登录。
 
 服务端的 `validate_report_template` 和 `render_report_html` 用于维护和运行已有的结构化模板。
@@ -116,5 +112,5 @@ description: 智能报告生成（SmartReportGen）。当用户要求生成分�
 
 ## 参考
 
-- `references/example-report.html` 是可直接离线打开的默认布局示例，也演示筛选联动、结论动态着色和边界行为。需要时可调用 MCP `get_skill_guide(include_example=true)` 获取。
+- `references/example-report.html` 是可直接离线打开的筛选联动、结论动态着色和边界行为示例。需要时可调用 MCP `get_skill_guide(include_example=true)` 获取。
 - 维护已有结构化模板时，参考 `references/template-spec.md`（MCP `get_template_spec`）和 `references/example-retail.md`。

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 COLOR_TOKENS = {
@@ -55,7 +56,7 @@ SIZE_TOKENS = {  # px；不随卡片宽度变化，只有图形区随卡片伸�
     "rre-header-pad": 24, "rre-control-height": 36,
     "rre-card-pad": 14, "rre-card-gap": 12, "rre-card-border-width": 1, "rre-card-title-line": 20, "rre-card-head-gap": 8,
     "rre-kpi-pad": 10, "rre-kpi-gap": 8, "rre-kpi-min-height": 96,
-    "rre-card-fact-line": 18, "rre-card-fact-gap": 3, "rre-status-bar": 2, "rre-card-row-height": 31,
+    "rre-card-fact-line": 18, "rre-card-fact-gap": 3, "rre-status-bar": 2, "rre-card-row-height": 34,
     "rre-card-legend-gap": 16, "rre-card-axis-gap": 8, "rre-card-axis-title-gap": 4, "rre-card-bar-max": 24,
     "radius-card": 8, "rre-radius-panel": 16, "rre-radius-section": 10, "rre-radius-tile": 999, "rre-radius-chip": 999,
     "rre-radius-control": 999, "rre-radius-pill": 999, "rre-data-radius": 2,
@@ -77,7 +78,7 @@ OTHER_TOKENS = {
 LAYOUT_OPTIONS = {  # 非 CSS 变量的页面选项
     "header_style": "banner",   # banner：主题色横幅 + 反白文字；plain：白色卡片
     "toc": True,
-    "max_width": 1240,         # 标题块与正文的最大宽度，不含侧边目录与页边距
+    "max_width": 1036,         # 封面与正文宽度；加上目录 188px 和列间距 16px 后为 1240px
     "filter_sticky": False,     # 默认筛选位于封面；开启后移到封面下方并吸顶
     "chart_grid": "solid",      # 图表网格线：dashed / solid / none
     "table_zebra": True,        # 表格斑马纹
@@ -258,20 +259,52 @@ def runtime_tokens(t: dict) -> dict:
 
 
 def toc_min_width(t: dict) -> int:
-    """正文居中时，两侧都要为目录宽度、目录间距和页面边距留足空间。"""
-    return t["max_width"] + 2 * (t["rre-page-pad"] + t["rre-toc-width"] + t["rre-toc-gap"])
+    """宽屏使用双列；目录或页边距调大时，等正文仍有可读宽度再切换。"""
+    min_report_width = min(t["max_width"], 640)
+    columns_width = min_report_width + t["rre-toc-width"] + t["rre-toc-gap"]
+    return max(981, columns_width + 2 * t["rre-page-pad"])
+
+
+def report_css(theme: dict) -> str:
+    """为服务端渲染和 Agent 自编 HTML 生成同一份内联样式。"""
+    theme = full(theme)
+    path = Path(__file__).with_name("static") / "report" / "report.css"
+    # 容器查询无法读取 CSS 变量，按合并后的主题计算目录断点。
+    css = path.read_text(encoding="utf-8").replace("__RF_TOC_MIN_WIDTH__", f"{toc_min_width(theme)}px")
+    return "\n".join((css_vars(theme), css, theme["custom_css"]))
 
 
 # ============================================================ 业务人员可读的元数据（样式规则编辑器使用）
 PRECEDENCE = ("智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式：后三者合并为一份“指定样式”（视觉样式与展示要求），"
               "同一项以优先级高者为准，作为约束交给智能体；智能体可以按自己的判断调整，没有指定的由智能体自由决定")
-# 内置样式同时约束布局和同类卡片的视觉表现。
-BUILTIN_PAGE_LAYOUT = ("标题背景与正文共用 max_width 和页面边距，等宽居中。"
-                       "只有两侧留白都能容纳目录宽度、目录间距和页面边距时，目录才放在左侧留白；"
-                       "空间不足时目录放在标题下方、正文之前。目录不占正文宽度。")
+# 内置版式集中维护在样式层，样式编辑器和 Agent 读取相同的说明。
+BUILTIN_PAGE_LAYOUT = ("宽屏下目录与报告两列整体居中，目录随滚动保持可见，封面和正文在右侧同列且等宽。"
+                       "空间不足时，目录放在封面下方、正文之前，长目录在卡片内滚动。")
 BUILTIN_CARD_LAYOUT = "同一行的卡片等高并铺满可用宽度，单张卡片占满所在行。"
 BUILTIN_CARD_STYLE = ("同一报告内同类卡片跨章节共用组件样式。表格统一表头、行高、隔行底色和列对齐。"
                       "同类图表统一图形、坐标轴、网格、图例、标签和配色规则。")
+
+
+def builtin_style(theme: dict) -> dict:
+    """给自编 HTML 提供已应用指定主题的组件 CSS 和可选用的类名。"""
+    return {
+        "css": report_css(theme),
+        "layout": BUILTIN_PAGE_LAYOUT + BUILTIN_CARD_LAYOUT + BUILTIN_CARD_STYLE,
+        "components": {
+            "page": ("body 按 table_zebra 添加 rf-zebra。外层用 rf-wrap rf-layout，有目录时加 rf-has-toc。"
+                     "封面、目录、正文按此顺序作为外层的直接子级。"),
+            "header": ("rf-header 配合 rf-header-banner 或 rf-header-plain；标题 rf-title，副标题 rf-subtitle，标题上方的报告类别可用 rf-kicker。"
+                       "封面内筛选用 rf-filterbar rf-filter-in-header；吸顶筛选用 rf-filterbar rf-filter-sticky，放在正文开头。"
+                       "rf-filterbar-inner 内放 rf-filters，单组用 rf-f、rf-f-label 与 rf-select 等，操作区用 rf-tools 和 rf-btn。"),
+            "toc": "rf-toc > rf-toc-card，含 rf-toc-title 与 rf-toc-group；分组链接用 rf-toc-parent，子链接包在 rf-toc-children。",
+            "section": "rf-main 内放 rf-section；用 rf-section-title、rf-summary 和 rf-finding-title 排版章节标题、结论及子标题。",
+            "cards": ("rf-grid 内放 rf-card，卡片内用 rf-card-head、rf-card-title 和 rf-chart-body。用 --span 指定占比（60 为整行）。"
+                      "图表卡另加 rf-chart。纯指标行另加 rf-grid-kpi，指标卡用 rf-type-kpi 和 rf-hero；辅助数值用 rf-facts > rf-fact。"
+                      "窄屏允许两列的指标卡加 rf-narrow。"),
+            "table": "rf-table-wrap 内放 rf-table；数值列的表头和单元格用 num，外层表格卡用 rf-card rf-type-table。",
+            "metrics": "动态结论用 rf-metric，结论与表格数值可用 data-state=positive 或 negative 着色，持平或无数据时清除状态。",
+        },
+    }
 
 # 按报告页面的组成部分分类；每个令牌只属于一类
 TOKEN_GROUPS: list[dict] = [

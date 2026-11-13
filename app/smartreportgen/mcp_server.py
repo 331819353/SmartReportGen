@@ -297,7 +297,7 @@ def get_skill_guide(include_example: bool = False) -> str:
     适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。"""
     text = _skill_body()
     if include_example:
-        text += "\n\n## 附：默认布局与结论动态着色的 HTML 示例\n\n```html\n" + EXAMPLE_FILE.read_text(encoding="utf-8") + "```\n"
+        text += "\n\n## 附：筛选联动与结论动态着色的 HTML 示例\n\n```html\n" + EXAMPLE_FILE.read_text(encoding="utf-8") + "```\n"
     return text
 
 
@@ -319,7 +319,8 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
     """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置经营报告主题，合并为一份 specified，
     作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
     文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
-    最终生效顺序：你的决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。将适用的样式和展示要求落实到生成的 HTML 中。"""
+    builtin_style 提供可选用的内联 CSS 和组件说明。最终生效顺序：你的决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。
+    将适用的样式和展示要求落实到生成的 HTML 中。"""
     try:
         p = _principal(ctx)
         res = repo.style_rules_for(business_scenario, query or None, owner=p.emp_no)
@@ -333,10 +334,11 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
         "business_scenario": res["business_scenario"],
         "precedence": res["precedence"],
         "specified": res["specified"],
+        # 自编 HTML 可以直接复用内置组件样式；指定主题和展示要求仍通过原有字段返回。
+        "builtin_style": design.builtin_style(res["specified"]["theme"]),
         "rules": rules,
         "note": ("specified 合并了业务场景、通用及内置样式。直接编写 HTML 时，请将适用的 theme 和 items 落实到 CSS、图表配置与脚本。"
-                 f"内置页面布局要求：{design.BUILTIN_PAGE_LAYOUT}{design.BUILTIN_CARD_LAYOUT}窄屏换行后也按实际行计算。"
-                 f"{design.BUILTIN_CARD_STYLE}自编 HTML 时请复用同类卡片的 CSS 与图表配置。"
+                 "采用内置样式时，可以内联 builtin_style.css 并参考组件说明；同类卡片复用 CSS 与图表配置。"
                  "items 各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
                  "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。确有理由时可调整展示要求并在回复中说明。"
                  "使用服务端结构化模板渲染时，theme 会自动应用。"),

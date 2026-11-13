@@ -4,16 +4,17 @@
 html{scroll-behavior:smooth;scroll-padding-top:var(--rf-scroll-inset,14px)}
 body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);font-family:var(--font-family);
   font-size:var(--rre-card-font-prose-size);font-weight:var(--rre-card-font-prose-weight);line-height:var(--rre-prose-line-height);-webkit-font-smoothing:antialiased;
-  container:rf-viewport / inline-size}
+  container:rf-viewport / inline-size;--rf-layout-width:calc(var(--rf-max) + var(--rre-toc-width) + var(--rre-toc-gap))}
 .rf-wrap{width:min(var(--rf-max),calc(100% - 2 * var(--rre-page-pad)));margin:0 auto}
 :focus-visible{outline:2px solid var(--color-brand);outline-offset:2px}
 
 /* 头部面板 */
-.rf-header{text-align:var(--rf-header-align);margin:0 0 var(--rre-section-gap);padding:var(--rre-header-pad);border-radius:var(--rre-radius-panel)}
+.rf-header{position:relative;z-index:2;text-align:var(--rf-header-align);margin:0 0 var(--rre-section-gap);padding:var(--rre-header-pad);border-radius:var(--rre-radius-panel)}
 .rf-header-banner{background:var(--rf-header-bg);color:var(--color-text-inverse);box-shadow:var(--shadow-header)}
 .rf-header-plain{background:var(--color-bg-card);color:var(--color-heading);border:1px solid var(--color-border-card);box-shadow:var(--shadow-section)}
+.rf-kicker{margin:0 0 4px;font-size:var(--rre-card-font-table-size);font-weight:700;letter-spacing:.4px;opacity:.78}
 .rf-title{margin:0;font-size:var(--rre-page-font-title-size);line-height:1.3;font-weight:var(--rre-page-font-title-weight);overflow-wrap:anywhere}
-.rf-subtitle{margin:8px 0 0;font-size:var(--rre-card-font-prose-size);opacity:.88}
+.rf-subtitle{margin:4px 0 0;font-size:var(--rre-card-font-prose-size);opacity:.82}
 .rf-goal{margin:var(--rf-header-goal-margin);max-width:920px;font-size:var(--rre-card-font-prose-size);opacity:.95}
 .rf-goal b{display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;line-height:1;min-height:20px;margin-right:8px;padding:1px 10px;border-radius:var(--rre-radius-chip);font-size:var(--rre-card-font-unit-size);font-weight:var(--rre-card-font-unit-weight);background:color-mix(in srgb,var(--color-text-inverse) 18%,transparent)}
 .rf-header-plain .rf-goal b{background:color-mix(in srgb,var(--color-brand) 10%,var(--color-bg-card));color:var(--color-brand)}
@@ -23,19 +24,20 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-header-plain .rf-chip{background:var(--color-bg-page);border-color:var(--color-border-card);color:var(--color-text-secondary)}
 
 /* 筛选栏 */
-/* 同一套控件支持封面内布局与独立吸顶布局。封面筛选面板按实际控件宽度换行。 */
+/* 封面筛选面板靠右，空间不足时控件自然换行；吸顶模式沿用同一套控件。 */
 .rf-filterbar{position:relative;z-index:30;color:var(--color-text-primary)}
-.rf-filter-in-header{width:fit-content;max-width:100%;margin:12px 0 0 auto;padding:6px;text-align:left;border:1px solid var(--color-border-card);border-radius:var(--rre-radius-panel);background:var(--color-bg-summary)}
-.rf-header-banner .rf-filter-in-header{background:color-mix(in srgb,var(--color-text-inverse) 14%,transparent);border-color:color-mix(in srgb,var(--color-text-inverse) 24%,transparent)}
+.rf-filter-in-header{width:min(100%,560px);margin:12px 0 0 auto;padding:6px;text-align:left;border:1px solid var(--color-border-card);border-radius:var(--rre-radius-panel);background:var(--color-bg-summary)}
+.rf-header-banner .rf-filter-in-header{background:color-mix(in srgb,var(--color-text-inverse) 14%,transparent);border-color:color-mix(in srgb,var(--color-text-inverse) 24%,transparent);box-shadow:inset 0 1px 0 color-mix(in srgb,var(--color-text-inverse) 14%,transparent),0 10px 22px rgba(4,23,45,.12)}
 .rf-filter-sticky{position:sticky;top:0;margin-bottom:var(--rre-section-gap);padding:8px;background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
 .rf-filterbar-inner{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}
-.rf-filters{display:flex;flex-wrap:wrap;gap:5px;align-items:center;min-width:0}
+.rf-filters{display:flex;flex-wrap:wrap;gap:5px;align-items:center;min-width:0;max-width:100%}
 .rf-f{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%;padding:0 4px 0 10px;border-radius:var(--rre-radius-control);background:var(--color-bg-card)}
+.rf-header-banner .rf-f{background:color-mix(in srgb,var(--color-bg-card) 94%,transparent);box-shadow:0 1px 2px rgba(15,23,42,.08)}
 .rf-f-label{font-size:var(--rre-card-font-label-size);font-weight:700;color:var(--color-text-secondary);white-space:nowrap}
 .rf-f-on .rf-f-label{color:var(--color-heading)}
-.rf-f-ctl{display:flex;align-items:center;gap:6px}
+.rf-f-ctl{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%;flex-wrap:wrap}
 .rf-select,.rf-date,.rf-ms-btn{height:var(--rre-control-height);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-control);background:var(--color-bg-card);color:var(--color-text-primary);font:inherit;font-size:var(--rre-card-font-table-size);padding:0 12px;outline:none;transition:border-color .15s,box-shadow .15s}
-.rf-filter-in-header :is(.rf-select,.rf-date,.rf-ms-btn){border-color:transparent;background:transparent}
+.rf-filter-in-header :is(.rf-select,.rf-date,.rf-ms-btn){border-color:transparent;background:transparent;font-weight:700}
 .rf-select{padding-right:8px;max-width:180px}
 .rf-select,.rf-date{padding-top:0;padding-bottom:0;line-height:normal;vertical-align:middle;text-align:var(--rf-filter-align);text-align-last:var(--rf-filter-align)}
 .rf-date::-webkit-datetime-edit{display:inline-flex;align-items:center;justify-content:var(--rf-filter-justify);width:100%}
@@ -61,49 +63,56 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-btn:hover{border-color:var(--color-brand);background:var(--color-bg-summary)}
 .rf-preset.on{background:var(--color-heading);border-color:var(--color-heading);color:var(--color-text-inverse)}
 .rf-reset{color:var(--color-text-secondary)}
+.rf-header-banner .rf-filter-in-header .rf-btn:not(.on){border-color:transparent;background:color-mix(in srgb,var(--color-brand) 8%,var(--color-bg-card));color:var(--color-heading)}
+.rf-header-banner .rf-filter-in-header .rf-btn:not(.on):hover{background:var(--color-bg-card);color:var(--color-heading)}
 
 /* 主体 */
-.rf-layout{padding:14px 0 28px}
+.rf-layout{padding:0 0 28px}
 /* 源码顺序即窄屏阅读顺序。目录较长时只滚动目录卡片。 */
 .rf-toc{min-width:0;margin-block-end:var(--rre-section-gap)}
-.rf-toc-card{width:100%;max-height:min(180px,32dvh);overflow:auto;padding:10px;background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
-.rf-toc-title{padding:0 2px 6px;color:var(--color-heading);font-size:var(--rre-card-font-prose-size);font-weight:800}
+.rf-toc-card{width:100%;max-height:min(360px,42dvh);overflow:auto;padding:10px;background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
+.rf-toc-title{padding:0 2px 6px;color:var(--color-heading);font-size:var(--rre-card-font-prose-size);line-height:1.2;font-weight:800}
 .rf-toc-group{border-top:1px solid var(--color-border-card);padding:4px 0}
-.rf-toc a{display:block;padding:4px 7px;border-radius:5px;color:var(--color-text-primary);font-size:var(--rre-card-font-table-size);line-height:1.35;text-decoration:none;overflow-wrap:anywhere}
+.rf-toc a{display:block;min-height:26px;padding:4px 7px;border-radius:5px;color:var(--color-text-secondary);font-size:var(--rre-card-font-table-size);line-height:1.3;text-decoration:none;overflow-wrap:anywhere}
 .rf-toc .rf-toc-parent{color:var(--color-heading);font-weight:800}
-.rf-toc-children{margin:2px 0 0 8px;padding-left:7px;border-left:2px solid var(--color-border-card)}
-.rf-toc-children a{color:var(--color-text-secondary);font-weight:600}
+.rf-toc-children{display:grid;gap:2px;margin:3px 0 1px;padding:2px 0 2px 10px;border-left:2px solid var(--color-border-card)}
+.rf-toc-children a{font-weight:700}
 .rf-toc a:hover,.rf-toc a.on{color:var(--color-heading);background:color-mix(in srgb,var(--color-brand) 8%,var(--color-bg-card))}
 .rf-main{min-width:0}
 .rf-intro{margin-bottom:8px;color:var(--color-text-secondary)}
 
-/* 宽屏目录与正文同一行。用零宽轨道把目录放进左侧留白，不改变标题和正文的宽度。 */
+/* 宽屏将左栏和报告作为整体居中。目录跨越封面和正文，在视口中垂直居中。 */
 @media screen{
   @container rf-viewport (min-width:__RF_TOC_MIN_WIDTH__){
-    .rf-has-toc{display:grid;grid-template-columns:0 minmax(0,1fr);align-items:start}
+    .rf-has-toc{width:min(var(--rf-layout-width),calc(100% - 2 * var(--rre-page-pad)));
+      display:grid;grid-template-columns:var(--rre-toc-width) minmax(0,1fr);grid-template-rows:auto 1fr;column-gap:var(--rre-toc-gap);align-items:start}
     .rf-has-toc>.rf-header{grid-column:2;grid-row:1}
     .rf-has-toc>.rf-main{grid-column:2;grid-row:2}
-    .rf-has-toc>.rf-toc{grid-column:1;grid-row:2;justify-self:end;position:sticky;top:14px;
-      width:var(--rre-toc-width);margin:0;margin-inline-end:var(--rre-toc-gap)}
-    .rf-has-toc>.rf-toc .rf-toc-card{max-height:calc(100dvh - 28px)}
+    .rf-has-toc>.rf-toc{grid-column:1;grid-row:1 / 3;position:sticky;top:0;display:flex;align-items:center;height:100dvh;margin:0}
+    .rf-has-toc>.rf-toc .rf-toc-card{max-height:calc(100dvh - 56px)}
+    .rf-has-toc + .rf-footer .rf-wrap{width:min(var(--rf-layout-width),calc(100% - 2 * var(--rre-page-pad)));padding-inline-start:calc(var(--rre-toc-width) + var(--rre-toc-gap))}
   }
 }
 
 .rf-section{margin:0 0 var(--rre-section-gap);padding:var(--rre-section-pad);background:var(--color-bg-card);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-section);box-shadow:var(--shadow-section)}
 .rf-section:last-child{margin-bottom:0}
 .rf-section-title{text-align:var(--rf-section-align);margin:0 0 8px;color:var(--color-heading);font-size:var(--rre-page-font-section-size);line-height:1.35;font-weight:var(--rre-page-font-section-weight);overflow-wrap:anywhere}
-.rf-summary{text-align:var(--rf-section-align);margin:0 0 8px;padding:8px 11px;border-radius:var(--radius-card);background:color-mix(in srgb,var(--color-brand) var(--rre-summary-tint),var(--color-bg-summary));border:1px solid color-mix(in srgb,var(--color-brand) var(--rre-summary-border-tint),var(--color-border-card));border-inline-start:3px solid var(--color-brand)}
-.rf-summary p{margin:0 0 6px}
+.rf-summary{text-align:var(--rf-section-align);margin:0 0 8px;padding:8px 11px;border-radius:var(--radius-card);background:color-mix(in srgb,var(--color-brand) var(--rre-summary-tint),var(--color-bg-summary));border:1px solid color-mix(in srgb,var(--color-brand) var(--rre-summary-border-tint),var(--color-border-card));border-inline-start:3px solid var(--color-brand);color:color-mix(in srgb,var(--color-text-primary) 72%,var(--color-text-secondary))}
+.rf-summary p{margin:0 0 5px}
 .rf-summary-body > :last-child{margin-bottom:0}
 .rf-finding{margin:14px 0 0}
-.rf-finding-title{margin:0 0 6px;font-size:var(--rre-card-font-title-size);font-weight:var(--rre-card-font-title-weight);line-height:var(--rre-card-title-line)}
+.rf-finding-title{margin:0 0 6px;color:color-mix(in srgb,var(--color-text-primary) 72%,var(--color-text-secondary));font-size:var(--rre-card-font-title-size);font-weight:var(--rre-card-font-title-weight);line-height:var(--rre-card-title-line)}
 .rf-text p{margin:0 0 10px}
 .rf-text ul,.rf-text ol{margin:0 0 10px;padding-left:22px}
-.rf-text strong,.rf-summary strong{font-weight:650}
+.rf-text strong,.rf-summary strong{font-weight:700}
+.rf-summary strong{color:var(--color-heading)}
 .rf-text table{border-collapse:collapse;margin:8px 0 12px;font-size:var(--rre-card-font-table-size)}
 .rf-text th,.rf-text td{border:1px solid var(--color-border-card);padding:6px 10px}
 .rf-text code{font-size:12px;background:var(--color-bg-page);padding:1px 5px;border-radius:4px}
-.rf-metric{font-weight:700;color:var(--color-heading);font-variant-numeric:tabular-nums;white-space:nowrap}
+.rf-metric{font-weight:800;color:var(--color-heading);font-variant-numeric:tabular-nums;white-space:nowrap}
+/* 状态由报告自身的计算设置，样式仅负责按当前主题显示。 */
+:is(.rf-metric,.rf-table [data-state])[data-state=positive]{color:var(--color-trend-up)}
+:is(.rf-metric,.rf-table [data-state])[data-state=negative]{color:var(--color-trend-down)}
 
 /* 卡片按 60 等分计算换行宽度，再由该行的卡片分配余量；同行拉伸到最高卡片的高度。 */
 .rf-grid{--rf-grid-gap:var(--rre-card-gap);display:flex;flex-wrap:wrap;align-items:stretch;gap:var(--rf-grid-gap);margin:8px 0 4px}
@@ -112,7 +121,7 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-type-kpi{padding:var(--rre-kpi-pad);min-height:var(--rre-kpi-min-height)}
 .rf-type-kpi::after{content:"";position:absolute;inset:auto 0 0;height:2px;background:color-mix(in srgb,var(--color-brand) 9%,var(--color-bg-card));pointer-events:none}
 .rf-type-kpi .rf-card-head{flex-wrap:wrap;row-gap:2px;margin-bottom:4px}
-.rf-type-kpi .rf-card-title{white-space:normal;overflow-wrap:anywhere;font-size:var(--rre-card-font-table-size);font-weight:600;color:var(--color-text-secondary)}
+.rf-type-kpi .rf-card-title{white-space:normal;overflow-wrap:anywhere;font-size:var(--rre-card-font-table-size);line-height:1.3;font-weight:600;color:var(--color-text-secondary)}
 .rf-card[data-status=positive]{--card-main:var(--color-status-positive)}
 .rf-card[data-status=warning]{--card-main:var(--color-status-warning)}
 .rf-card[data-status=negative]{--card-main:var(--color-status-negative)}
@@ -126,11 +135,13 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-link-hint{flex:none;display:inline-flex;align-items:center;justify-content:center;height:20px;font-size:var(--rre-card-font-label-size);color:var(--color-text-secondary);border:1px solid var(--color-border-card);border-radius:var(--rre-radius-chip);padding:0 8px;line-height:20px}
 .rf-card-note{margin-top:var(--rre-card-head-gap);padding-top:10px;border-top:1px dashed var(--color-border-card);font-size:var(--rre-card-font-label-size);font-weight:var(--rre-card-font-label-weight);color:var(--color-text-secondary);line-height:1.6}
 .rf-chart-body{width:100%;min-height:60px;flex:1 0 auto}
+/* 图形区采用浅边框，指标卡及已有独立边框的表格沿用各自容器。 */
+.rf-chart:not(.rf-type-kpi,.rf-type-table) .rf-chart-body{border:var(--rre-card-border-width) solid var(--color-border-card);border-radius:var(--radius-card)}
 .rf-empty{position:absolute;inset:56px var(--rre-card-pad) var(--rre-card-pad);display:flex;align-items:center;justify-content:center;color:var(--color-text-secondary);font-size:var(--rre-card-font-label-size);background:var(--color-bg-card)}
 
 /* 主值（指标卡 / 子弹图） */
 .rf-hero{display:flex;align-items:baseline;justify-content:var(--rf-kpi-justify);gap:3px;color:var(--color-heading);white-space:nowrap;overflow:hidden}
-.rf-hero b{font-size:var(--rre-card-font-hero-size);font-weight:var(--rre-card-font-hero-weight);line-height:1.15;font-variant-numeric:tabular-nums;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis}
+.rf-hero b{font-size:var(--rre-card-font-hero-size);font-weight:var(--rre-card-font-hero-weight);line-height:1.05;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}
 .rf-hero em{font-style:normal;font-size:var(--rre-card-font-affix-size);font-weight:var(--rre-card-font-affix-weight)}
 .rf-facts{display:flex;flex-direction:column;gap:var(--rre-card-fact-gap);margin-top:var(--rre-card-head-gap)}
 .rf-fact{display:flex;align-items:center;justify-content:var(--rf-kpi-fact-justify);flex-wrap:wrap;gap:2px 6px;line-height:var(--rre-card-fact-line);padding:0 6px;border-radius:var(--rre-radius-tile);background:var(--color-bg-summary)}
@@ -139,17 +150,23 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-fact b.up,.rf-fact b.down{padding:0 5px;border-radius:var(--rre-radius-tile);color:var(--rf-trend-color);background:color-mix(in srgb,var(--rf-trend-color) 7%,var(--color-bg-card))}
 .rf-fact b.up{--rf-trend-color:var(--color-trend-up)}
 .rf-fact b.down{--rf-trend-color:var(--color-trend-down)}
+/* 指标卡用紧凑的标签和值；较长标签可换行，避免挤掉读数。 */
+.rf-type-kpi .rf-fact{justify-content:var(--rf-kpi-justify);padding:0;background:none}
+.rf-type-kpi .rf-fact span{white-space:normal;overflow-wrap:anywhere;font-weight:600}
+.rf-type-kpi .rf-fact b{padding:0 6px;border-radius:var(--rre-radius-tile)}
+.rf-type-kpi .rf-fact b:not(.up,.down){background:var(--color-bg-summary)}
 .rf-type-kpi .rf-chart-body{min-height:0}
 .rf-bullet-top{margin-bottom:8px}
 
 /* 表格 */
 .rf-type-table .rf-chart-body{overflow:hidden;display:flex}
-.rf-table-wrap{overflow:auto;width:100%;max-height:100%}
+.rf-table-wrap{overflow:auto;width:100%;max-height:100%;border:1px solid color-mix(in srgb,var(--color-brand) 7%,var(--color-border-card));border-radius:min(14px,var(--rre-radius-panel));background:var(--color-bg-card);box-shadow:inset -12px 0 18px -18px rgba(15,39,71,.35)}
 .rf-table{width:100%;border-collapse:separate;border-spacing:0;font-size:var(--rre-card-font-table-size);font-weight:var(--rre-card-font-table-weight)}
 .rf-table th{position:sticky;top:0;z-index:1;background:var(--rf-table-head-bg);color:var(--color-heading);font-size:var(--rre-card-font-table-size);font-weight:800;text-align:var(--rf-table-text-align);vertical-align:middle;height:var(--rre-card-row-height);padding:0 10px;border-bottom:1px solid var(--color-border-card);white-space:nowrap}
 .rf-table td{text-align:var(--rf-table-text-align);vertical-align:middle;height:var(--rre-card-row-height);padding:0 10px;border-bottom:1px solid color-mix(in srgb,var(--color-border-card) 60%,transparent);white-space:nowrap}
-.rf-zebra .rf-table tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--color-brand) 3%,var(--color-bg-card))}
-.rf-table tr:hover td{background:color-mix(in srgb,var(--color-brand) 6%,transparent)}
+.rf-table tbody tr:last-child td{border-bottom:0}
+.rf-zebra .rf-table tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--color-brand) 2%,var(--color-bg-card))}
+.rf-table tbody tr:hover td{background:color-mix(in srgb,var(--color-brand) 9%,var(--color-bg-card))}
 /* 数值表头沿用固定表头定位；单元格为数据条和数值文字提供定位容器。 */
 .rf-table th.num,.rf-table td.num{text-align:var(--rf-table-num-align);font-variant-numeric:tabular-nums}
 .rf-table td.num,.rf-table td.num span{position:relative}
@@ -160,15 +177,16 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-footer{border-top:1px solid var(--color-border-card);color:var(--color-text-secondary);font-size:var(--rre-card-font-label-size);padding:18px 0 28px}
 
 @media (max-width:980px){
+  .rf-layout{padding-top:var(--rre-page-pad)}
   .rf-filter-in-header{width:100%}
-  .rf-card.rf-narrow{--w:30}
+  .rf-grid .rf-card:not(.rf-type-kpi){--w:60}
+  .rf-grid .rf-type-kpi.rf-narrow{--w:30}
 }
 @media (max-width:640px){
   .rf-wrap{width:min(var(--rf-max),calc(100% - 2 * min(var(--rre-page-pad),8px)))}
   .rf-header{padding:min(var(--rre-header-pad),16px)}
   .rf-section{padding:min(var(--rre-section-pad),12px)}
   .rf-grid .rf-card{--w:60}
-  .rf-grid .rf-type-kpi.rf-narrow{--w:30}
   .rf-f{flex-wrap:wrap}
   .rf-select,.rf-ms-btn{max-width:140px}
   .rf-f-date_range .rf-date{min-width:0;width:8.8em}
@@ -184,6 +202,7 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
   .rf-section{box-shadow:none}
   .rf-type-table{display:block;break-inside:auto;overflow:visible}
   .rf-type-table .rf-chart-body,.rf-type-table .rf-table-wrap{display:block;height:auto!important;max-height:none;overflow:visible}
+  .rf-table-wrap{box-shadow:none}
   .rf-table th{position:static}
   .rf-table tr{break-inside:avoid}
 }

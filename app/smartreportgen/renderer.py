@@ -304,9 +304,8 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
         "theme": design.runtime_tokens(theme),
         "filters": tpl.filters, "presets": tpl.presets, "measures": measures, "charts": charts, "data": data,
     }
-    # 容器查询不能读取 CSS 自定义属性；使用合并后的主题计算断点，确保目录始终放得进留白。
-    css = (STATIC / "report" / "report.css").read_text(encoding="utf-8").replace(
-        "__RF_TOC_MIN_WIDTH__", f"{design.toc_min_width(theme)}px")
+    # 共用内置样式，保持结构化报告与 Agent 自编 HTML 的视觉默认值一致。
+    css = design.report_css(theme)
     js = (STATIC / "report" / "runtime.js").read_text(encoding="utf-8")
     if inline_echarts:
         ech = "<script>" + (STATIC / "vendor" / "echarts.min.js").read_text(encoding="utf-8") + "</script>"
@@ -328,9 +327,7 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="{html.escape(settings.app_name)}">
 <title>{html.escape(tpl.title)}</title>
-<style>{design.css_vars(theme)}
-{css}
-{theme['custom_css']}</style>
+<style>{css}</style>
 </head>
 <body class="{'rf-zebra' if theme['table_zebra'] else ''}">
 <div class="rf-wrap rf-layout{' rf-has-toc' if toc_html else ''}">
