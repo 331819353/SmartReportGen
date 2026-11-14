@@ -133,6 +133,33 @@ class ReportSnapshotsTest(unittest.TestCase):
         with self.assertRaisesRegex(report_data.ReportDataError, "基准版本没有"):
             report_data.embed(skeleton, "editor")
 
+    def test_reject_snapshot_id_conflicts_during_preview_and_save(self):
+        snapshot = report_data.save_query(self.owner.emp_no, ["value"], [[42]], 0)
+        data = block("forecast", snapshot["snapshot_id"])
+        for draft in (
+            document('<section id="fore&#99;ast">预测</section>', data),
+            document(data, '<input id="forecast" />'),
+        ):
+            with self.subTest(draft=draft):
+                preview = mcp_server.preview_report_html(draft, None)
+                saved = mcp_server.save_report("测试报告", draft, None)
+                self.assertFalse(preview["ok"])
+                self.assertEqual(saved, preview)
+                self.assertIn("数据块 id 与页面元素重复：forecast", preview["error"])
+        # 静态 template 的普通元素不与主文档争用 id；数据块本身必须在主文档中。
+        valid = document('<template><section id="forecast"></section></template>', data)
+        self.assertTrue(mcp_server.preview_report_html(valid, None)["ok"])
+        inert = document(f"<template>{data}</template>")
+        self.assertIn("数据块位于 template 内", mcp_server.preview_report_html(inert, None)["error"])
+
+    def test_can_correct_an_existing_snapshot_id_conflict(self):
+        # 旧报告的已内联数据仍可读出，修订时可保留数据块 id 并修正冲突元素。
+        embedded = block("forecast", "embedded").replace("></script>", '>{"columns":["value"],"rows":[[42]]}</script>')
+        old = document('<section id="forecast"></section>', embedded)
+        revised = report_data.for_edit(old).replace('<section id="forecast">', '<section id="forecast-section">')
+        self.assertEqual(report_data.embed(revised, "editor", old),
+                         old.replace('<section id="forecast">', '<section id="forecast-section">'))
+
 
 if __name__ == "__main__":
     unittest.main()

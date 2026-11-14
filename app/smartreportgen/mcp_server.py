@@ -53,10 +53,10 @@ INSTRUCTIONS = """SmartReportGen 智能报告 MCP（使用海尔 IAM access toke
 若你所在的 agent 没有加载 smart-report 技能（Skill），请先调用 get_skill_guide 获取完整的生成流程与方法，再按流程执行。推荐流程：
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
 2) 多表场景先用 describe_tables 列出所有授权表，逐张用 describe_table 和单表汇总查询核实可用指标、粒度、关联键及覆盖范围，记录每张表的指标或无法使用的原因；
-3) 将场景的 analysis_approach 与用户问题逐项映射到指标、来源表、查询和支撑数值。用 tables_used 核对来源，必要时在验证关联关系和粒度后跨表查询。证据不足时写明缺口，依据已核实的数字确定结论，再设计章节、图表及筛选；
+3) 将场景的 analysis_approach 与用户问题逐项映射到指标、来源表、查询和支撑数值。对每个小节用 run_query 汇总完整业务口径内的授权数据，以 tables_used 核对来源；明细样本仅供核对字段。必要时在验证关联关系和粒度后跨表查询。证据不足时写明缺口，依据已核实的数字确定结论，再设计章节、图表及筛选；
 4) get_style_rules(业务场景) 获取视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，未指定的项由你决定；
 5) 将逐表指标、分析项与证据的映射、缺口、章节、筛选和展示要求写入业务 Markdown 模板。用 save_report_template(template_type="business", ...) 保存，并用 get_report_template 读取指定版本。
-6) 用 run_query(snapshot=true) 保存各组报告数据，只接收少量样本。Agent 在 HTML 中内联 CSS、JavaScript 与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。用 preview_report_html 展开数据，在浏览器验证后用 save_report 提交相同 HTML 并关联模板版本；服务端内联完整数据，下载仍为离线单文件。
+6) 用 run_query(snapshot=true) 保存各组报告数据，与全量口径的证据查询对账。Agent 在 HTML 中内联 CSS、JavaScript 与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。用 preview_report_html 展开数据，在浏览器逐小节核对默认及代表性筛选下的结论和汇总值，再用 save_report 提交相同 HTML 并关联模板版本；服务端内联快照数据，下载仍为离线单文件。
 修改已有报告时用 get_report(include_html=true, omit_snapshot_data=true) 读取选中的版本，显式指定的 version 优先。预览和 revise_report 均传入读取的 revision 作为 base_version，可复用基准版本的数据块。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
@@ -267,9 +267,11 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
     """在业务场景上执行只读 SQL（单条 SELECT/WITH），只能引用该场景中当前员工有权限的表或视图。
     场景的逐表取值条件由服务端在 JOIN、聚合前自动应用。
     SQL 方言与数据源类型一致（API 使用 DuckDB）。返回实际引用的 tables_used，列名统一转小写。
-    普通模式默认返回至多 200 行。snapshot=true 将完整结果保存为 JSON，由报告使用 snapshot_id 引用，
-    MCP 仅返回行数和少量样本（sample_rows 0–20）。快照的默认行数上限由 QUERY_MAX_ROWS 决定。
-    truncated=true 表示超过上限，未创建快照；请调整聚合或分批查询。"""
+    普通模式默认返回至多 200 行，可在 SQL 中先按完整业务口径聚合后读取少量证据行。
+    snapshot=true 将完整 SQL 结果保存为 JSON，由报告使用 snapshot_id 引用。
+    MCP 仅返回行数和少量明细样本（sample_rows 0–20），样本用于检查字段。
+    truncated=true 表示超过返回行数上限，未创建快照；请调整聚合或分批查询。
+    truncated=false 只说明返回上限未截断 SQL 结果，业务覆盖仍需检查查询口径、SQL 自带的行数限制和数据源覆盖。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)

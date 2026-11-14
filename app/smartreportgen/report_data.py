@@ -141,11 +141,15 @@ class _DataBlocks(HTMLParser):
     CDATA_CONTENT_ELEMENTS = (*HTMLParser.CDATA_CONTENT_ELEMENTS, "title", "textarea", "xmp", "iframe",
                               "noembed", "noframes", "noscript")
 
-    def __init__(self, html: str) -> None:
+    def __init__(self, html: str, *, validate_bindings: bool = False) -> None:
         super().__init__()
         self.html = html
         self.lines = [0, *(m.end() for m in re.finditer("\n", html))]
         self.blocks: dict[str, _DataBlock] = {}
+        self.validate_bindings = validate_bindings
+        self.live_ids: set[str] = set()
+        self.reused_ids: set[str] = set()
+        self.template_depth = 0
         self.pending: tuple[str, dict[str, str | None], int, int] | None = None
         try:
             self.feed(html)
@@ -154,12 +158,25 @@ class _DataBlocks(HTMLParser):
             raise ReportDataError("HTML 包含无法解析的标记声明") from exc
         if self.pending:
             raise ReportDataError("数据引用缺少 </script> 结束标签")
+        if validate_bindings:
+            for block_id in self.blocks:
+                if block_id in self.reused_ids:
+                    raise ReportDataError(f"数据块 id 与页面元素重复：{block_id}。请改用唯一 id，并同步更新脚本中的引用")
 
     def _offset(self) -> int:
         line, column = self.getpos()
         return self.lines[line - 1] + column
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "template":
+            self.template_depth += 1
+        if self.validate_bindings and not self.template_depth:
+            # 浏览器遇到重复属性时使用第一个；template 的内容没有进入报告主 DOM。
+            element_id = next((value for key, value in attrs if key == "id"), None)
+            if element_id:
+                if element_id in self.live_ids:
+                    self.reused_ids.add(element_id)
+                self.live_ids.add(element_id)
         if tag != "script":
             return
         fields = dict(attrs)
@@ -172,14 +189,19 @@ class _DataBlocks(HTMLParser):
             raise ReportDataError("数据引用必须为带 id 和快照引用的内联 application/json 脚本标签")
         if block_id in self.blocks:
             raise ReportDataError(f"数据块 id 重复：{block_id}")
+        if self.validate_bindings and self.template_depth:
+            raise ReportDataError(f"数据块位于 template 内，页面脚本无法直接读取：{block_id}")
         start = self._offset()
         self.pending = (block_id, fields, start, start + len(self.get_starttag_text()))
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "script" and MARKER in dict(attrs):
             raise ReportDataError("数据引用必须使用成对的 <script> 标签")
+        self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "template" and self.template_depth:
+            self.template_depth -= 1
         if tag == "script" and self.pending:
             block_id, fields, start, data_start = self.pending
             data_end = self._offset()
@@ -230,7 +252,8 @@ def embed(html: str, owner: str, base_html: str = "") -> str:
         # JSON 仍须符合 HTML 脚本标签的解析规则，防止数据中的 </script> 关闭标签。
         return "embedded", payload.replace("<", "\\u003c")
 
-    return _DataBlocks(html).replace(resolve)
+    # 只校验即将交付的正文。仍允许读取旧基准的数据，供修订时修正冲突。
+    return _DataBlocks(html, validate_bindings=True).replace(resolve)
 
 
 def for_edit(html: str) -> str:
