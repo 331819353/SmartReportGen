@@ -88,23 +88,38 @@ const icon = k => `<svg aria-hidden="true" viewBox="0 0 20 20" fill="none" strok
 
 // ------------------------------------------------------------ 通用组件
 const Drawer = {
-  props: { title: String, wide: Boolean, compact: Boolean, busy: Boolean }, emits: ['close'],
-  template: `<dialog ref="dialog" class="drawer" :class="{wide, compact}" :aria-label="title" @cancel.prevent="close" @click.self="backdrop">
+  props: { title: String, wide: Boolean, compact: Boolean, busy: Boolean, backdropClose: { type: Boolean, default: true } },
+  emits: ['close'],
+  template: `<dialog ref="dialog" class="drawer" :class="{wide, compact}" :aria-label="title"
+    @cancel.prevent="close" @pointerdown="onPointerDown" @pointercancel="clearBackdropPress" @click.self="backdrop" @close="onDialogClose">
     <div class="drawer-head"><h2>{{title}}</h2><button class="x" type="button" aria-label="关闭" :disabled="busy" @click="close" v-html="icon('close')"></button></div>
     <div v-if="toasts.length" class="msgs dialog-feedback" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="msg" :class="t.kind">{{t.msg}}</div></div>
     <div class="drawer-body"><slot/></div>
     <div class="drawer-foot" v-if="$slots.foot"><slot name="foot"/></div></dialog>`,
   setup(props, { emit }) {
     const dialog = ref(null);
+    let backdropPress = false, unmounting = false;
     // 原生弹窗管理焦点与背景交互，关闭后焦点回到触发按钮。
     onMounted(() => dialog.value.showModal());
-    onBeforeUnmount(() => dialog.value.close());
+    onBeforeUnmount(() => { unmounting = true; if (dialog.value?.open) dialog.value.close(); });
     function close() { if (!props.busy) emit('close'); }
-    function backdrop(e) {
+    function outside(e) {
       const { left, right, top, bottom } = dialog.value.getBoundingClientRect();
-      if (e.clientX < left || e.clientX > right || e.clientY < top || e.clientY > bottom) close();
+      return e.clientX < left || e.clientX > right || e.clientY < top || e.clientY > bottom;
     }
-    return { dialog, close, backdrop, icon, toasts };
+    function onPointerDown(e) {
+      backdropPress = props.backdropClose && e.button === 0 && e.target === dialog.value && outside(e);
+    }
+    function clearBackdropPress() { backdropPress = false; }
+    function backdrop(e) {
+      const hit = props.backdropClose && backdropPress && e.target === dialog.value && outside(e);
+      backdropPress = false;
+      if (hit) close();
+    }
+    function onDialogClose() {
+      if (!unmounting && dialog.value?.isConnected && !dialog.value.open) dialog.value.showModal();
+    }
+    return { dialog, close, onPointerDown, clearBackdropPress, backdrop, onDialogClose, icon, toasts };
   }
 };
 const DataTable = {
@@ -408,6 +423,22 @@ function sceneTableDraft(table = {}) {
       column: rule.column, values: [...rule.values]
     })) };
 }
+function sceneFormSnapshot(f) {
+  if (!f) return '';
+  return JSON.stringify({
+    business_scenario: f.business_scenario || '',
+    datasource_id: f.datasource_id ?? null,
+    business_description: f.business_description || '',
+    analysis_approach: f.analysis_approach || '',
+    tagsTxt: f.tagsTxt || '',
+    enabled: !!f.enabled,
+    tables: (f.tables || []).map(t => ({
+      table_name: t.table_name || '',
+      table_description: t.table_description || '',
+      row_filters: (t.row_filters || []).map(r => ({ column: r.column || '', values: [...(r.values || [])] }))
+    }))
+  });
+}
 const filterValueLabel = value => value === null ? 'NULL（空值）' : value === '' ? '空字符串' : String(value);
 
 const SceneFilterValues = {
@@ -538,7 +569,7 @@ const Datasets = {
           <span v-if="!t.row_filters?.length" class="muted">不限制</span></td></tr>
         <tr v-if="!detail.tables.length"><td colspan="3" class="empty">无</td></tr></tbody></table></div>
     </Drawer>
-    <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide :busy="busy" @close="form=null">
+    <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide :busy="busy" :backdrop-close="false" @close="closeForm">
       <div class="row2"><div class="field"><label>业务场景</label><input class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
         <div class="field"><label for="scene-source">数据源</label><select id="scene-source" class="in" v-model="form.datasource_id" @change="changeSource"><option :value="null" disabled>请选择</option><option v-for="s in sources" :value="s.id">{{s.name}}（{{DS_LABEL[s.type]}}）</option></select></div></div>
       <div class="field"><label for="scene-description">业务描述 <small>说明数据范围、指标及适用的分析问题</small></label><textarea id="scene-description" class="in" v-model="form.business_description" rows="4"></textarea></div>
@@ -575,19 +606,19 @@ const Datasets = {
             <button class="btn sm" type="button" @click="addRule(t)" :disabled="!t.columns?.some(c => !t.row_filters.some(r => r.column === (c.source_name || c.name))) || t.row_filters.length >= 20">添加字段条件</button>
           </div>
         </div>
-        <div class="actions scene-table-actions"><button class="btn sm" @click="addTable()">手动添加</button>
-          <button class="btn sm" @click="pick" :disabled="!form.datasource_id">从数据源选择…</button></div>
+        <div class="actions scene-table-actions"><button class="btn sm" type="button" @click="addTable()">手动添加</button>
+          <button class="btn sm" type="button" @click="pick" :disabled="!form.datasource_id">从数据源选择…</button></div>
         <div v-if="picker" class="scene-source-picker" :aria-busy="pickLoading">
           <input class="in" v-model="pickKw" type="search" aria-label="搜索数据源中的表或视图" placeholder="搜索表名、视图名或描述">
           <label v-for="t in pickShown" :key="t.name" class="check scene-pick-item"><input type="checkbox" :checked="has(t.name)" @change="togglePick(t)">
             <span class="mono">{{t.name}}</span><span class="badge">{{OBJECT_LABEL[t.kind] || '表'}}</span><span class="muted small">{{t.comment}}</span></label>
-          <div v-if="pickError" class="msg err" role="alert">{{pickError}} <button class="link" @click="pick">重试</button></div>
+          <div v-if="pickError" class="msg err" role="alert">{{pickError}} <button class="link" type="button" @click="pick">重试</button></div>
           <div v-else-if="!pickShown.length" class="small muted" role="status">{{pickLoading ? '正在加载…' : pickKw ? '没有匹配的表或视图' : '数据源没有可选的表或视图'}}</div>
         </div>
       </section>
       <label class="check"><input type="checkbox" v-model="form.enabled"> 启用（停用后不参与检索）</label>
       <div v-if="saveError" class="msg err" role="alert">{{saveError}}</div>
-      <template #foot><button class="btn" @click="form=null" :disabled="busy">取消</button><button class="btn primary" @click="save" :disabled="busy">{{busy ? '正在保存…' : '保存业务场景'}}</button></template>
+      <template #foot><button class="btn" type="button" @click="closeForm" :disabled="busy">取消</button><button class="btn primary" type="button" @click="save" :disabled="busy">{{busy ? '正在保存…' : '保存业务场景'}}</button></template>
     </Drawer>
   </div>`,
   setup() {
@@ -596,6 +627,8 @@ const Datasets = {
     const sources = ref([]), form = ref(null), busy = ref(false), q = ref(''), sr = ref(null), picker = ref(null), pickKw = ref(''), detail = ref(null);
     const kw = ref(''), searching = ref(false), searchError = ref(''), saveError = ref('');
     const pickLoading = ref(false), pickError = ref('');
+    const initialSnapshot = ref('');
+    const formDirty = computed(() => !!form.value && sceneFormSnapshot(form.value) !== initialSnapshot.value);
     const shown = computed(() => scenes.list.value.filter(d => matches(kw.value, d.business_scenario, d.business_description, ...(d.tags || []))));
     const admin = computed(isAdmin);
     async function view(d) { detail.value = await run(() => api('/api/datasets/' + d.id)); }
@@ -604,6 +637,11 @@ const Datasets = {
       picker.value = null; pickKw.value = ''; saveError.value = '';
       if (d) { const full = await run(() => api(`/api/datasets/${d.id}`)); form.value = { ...full, tagsTxt: (full.tags || []).join(', '), tables: full.tables.map(sceneTableDraft) }; }
       else form.value = { id: null, business_scenario: '', business_description: '', analysis_approach: '', datasource_id: null, tagsTxt: '', tables: [], enabled: true };
+      initialSnapshot.value = sceneFormSnapshot(form.value);
+    }
+    function closeForm() {
+      if (busy.value) return;
+      if (!formDirty.value || confirm('放弃未保存的业务场景修改？')) form.value = null;
     }
     async function save() {
       busy.value = true; saveError.value = '';
@@ -678,7 +716,7 @@ const Datasets = {
     }
     function addRule(t) { t.row_filters.push({ column: '', values: [] }); }
     return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
-      picker, pickKw, pickShown, pickLoading, pickError, edit, save, del, search, reindex, pick, has, togglePick,
+      picker, pickKw, pickShown, pickLoading, pickError, edit, closeForm, save, del, search, reindex, pick, has, togglePick,
       addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule, filterValueLabel, DS_LABEL, OBJECT_LABEL,
       icon, hasMine: computed(canVisitMine) };
   }
