@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -32,6 +33,7 @@ class Settings:
         self.embedding_query_instruction = os.getenv("EMBEDDING_QUERY_INSTRUCTION", "").replace("\\n", "\n")
 
         self.public_base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:18600").rstrip("/")
+        self.public_base_path = urlsplit(self.public_base_url).path.rstrip("/")
         self.query_max_rows = int(os.getenv("QUERY_MAX_ROWS", "50000"))
         self.query_timeout = int(os.getenv("QUERY_TIMEOUT_SECONDS", "60"))
         # MCP 写入查询和预览文件，管理 API 读取预览；容器部署时使用同一个私有卷。
@@ -62,6 +64,11 @@ class Settings:
         # 自动注册的员工默认角色（普通用户）。可对该角色授权，作为所有员工的基础数据权限
         self.default_user_role = os.getenv("DEFAULT_USER_ROLE", "user").strip()
         self.session_hours = max(1, int(os.getenv("SESSION_HOURS", "12")))
+
+    def public_path(self, path: str = "/") -> str:
+        """把应用内根路径转换为对外访问路径，支持反向代理子路径部署。"""
+        path = "/" + str(path or "/").lstrip("/")
+        return f"{self.public_base_path}{path}" if self.public_base_path else path
 
     @property
     def embedding_signature(self) -> str:

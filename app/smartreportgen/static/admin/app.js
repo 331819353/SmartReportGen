@@ -2,6 +2,8 @@
 const { createApp, reactive, ref, computed, onMounted, onBeforeUnmount, watch, nextTick } = Vue;
 
 // ------------------------------------------------------------ 工具
+const BASE_PATH = (window.__SRG_BASE_PATH__ || '').replace(/\/$/, '');
+const appPath = path => BASE_PATH && path.startsWith('/') ? BASE_PATH + path : path;
 const toasts = reactive([]);
 function toast(msg, kind = '') {
   const t = { id: Math.random(), msg, kind };
@@ -11,7 +13,7 @@ function toast(msg, kind = '') {
 async function api(path, opts = {}) {
   const init = { method: opts.method || 'GET', headers: {}, credentials: 'same-origin', signal: opts.signal };
   if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
-  const r = await fetch(path, init);
+  const r = await fetch(appPath(path), init);
   if (r.ok && opts.download) return r.blob();
   const ct = r.headers.get('content-type') || '';
   const data = ct.includes('json') ? await r.json() : await r.text();
@@ -46,7 +48,7 @@ window.addEventListener('hashchange', () => { state.page = location.hash.slice(1
 const reportDraft = ref(null);
 const reportRevision = ref(0);
 function startReport(template = null) { reportDraft.value = { template }; }
-const reportPath = r => '/reports/' + r.id;
+const reportPath = r => appPath('/reports/' + r.id);
 const reportVersionPath = (r, action = '') => reportPath(r) + action + '?version=' + r.revision;
 
 function matches(kw, ...fields) {
@@ -219,7 +221,7 @@ const GenerateReport = {
     <template #foot>
       <template v-if="result">
         <a class="btn" href="#reports" @click="$emit('close')">前往报告库</a>
-        <a class="btn primary" :href="'/reports/'+result.id" target="_blank" rel="noopener">查看报告</a>
+        <a class="btn primary" :href="appPath('/reports/'+result.id)" target="_blank" rel="noopener">查看报告</a>
       </template>
       <template v-else>
         <button class="btn" :disabled="busy" @click="$emit('close')">取消</button>
@@ -245,7 +247,8 @@ const GenerateReport = {
       } catch (e) { error.value = e.message; }
       finally { busy.value = false; }
     }
-    return { list, loading, loadError, load, selectedId, selected, name, busy, error, result, generate, admin: computed(isAdmin), icon };
+    return { list, loading, loadError, load, selectedId, selected, name, busy, error, result, generate,
+      admin: computed(isAdmin), icon, appPath };
   }
 };
 
@@ -1359,7 +1362,7 @@ const ReportViewer = {
   components: { ReportEditor, ReportVersions }, props: ['reportId', 'initialVersion'],
   template: `<main class="report-viewer" :aria-busy="loading">
     <header class="report-viewer-bar">
-      <div class="report-viewer-heading"><a class="link" href="/#reports">报告库</a><h1>{{report?.name || '报告'}}</h1></div>
+      <div class="report-viewer-heading"><a class="link" :href="appPath('/#reports')">报告库</a><h1>{{report?.name || '报告'}}</h1></div>
       <div v-if="report" class="links">
         <button type="button" class="btn report-version-button" :aria-label="'当前版本 ' + report.revision + '，切换版本'" @click="versions=true">版本 {{report.revision}}</button>
         <a class="btn" :href="reportVersionPath(report, '/download')">下载 HTML</a>
@@ -1388,7 +1391,7 @@ const ReportViewer = {
       try { apply(await api(path + (displayedVersion.value ? '?version=' + displayedVersion.value : ''))); }
       catch (e) {
         if (e.status === 401) {
-          location.replace('/auth/iam/login?next=' + encodeURIComponent(location.pathname + location.search));
+          location.replace(appPath('/auth/iam/login?next=' + encodeURIComponent(location.pathname + location.search)));
           return;
         }
         error.value = e.message;
@@ -1408,7 +1411,7 @@ const ReportViewer = {
       displayedVersion.value = next.revision;
       history.replaceState(null, '', reportVersionPath(next));
     }
-    return { report, loading, error, versions, editing, load, selected, saved, reportVersionPath, toasts };
+    return { report, loading, error, versions, editing, load, selected, saved, reportVersionPath, appPath, toasts };
   }
 };
 
@@ -1899,15 +1902,15 @@ const Perms = {
 const Login = {
   template: `<main class="login-shell">
     <div class="card login">
-      <a class="brand" href="/"><span class="brand-icon" v-html="icon('rep')"></span><span>报告管理台<small>SmartReportGen</small></span></a>
+      <a class="brand" :href="appPath('/')"><span class="brand-icon" v-html="icon('rep')"></span><span>报告管理台<small>SmartReportGen</small></span></a>
       <h1>登录报告管理台</h1><p class="login-intro">登录后可查看报告、模板及已授权的业务数据。</p>
       <template v-if="cfg">
-        <a v-if="cfg.iam_configured" class="btn primary big" href="/auth/iam/login?next=/">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
+        <a v-if="cfg.iam_configured" class="btn primary big" :href="appPath('/auth/iam/login?next=' + encodeURIComponent(BASE_PATH ? BASE_PATH + '/' : '/'))">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
         <div v-else class="msg warn" role="status">海尔单点登录暂不可用，请联系系统管理员。</div>
       </template>
     </div>
   </main>`,
-  setup() { return { cfg: computed(() => state.authCfg), icon }; }
+  setup() { return { cfg: computed(() => state.authCfg), icon, appPath, BASE_PATH }; }
 };
 
 // ------------------------------------------------------------ 我的权限与接入（所有登录员工）
@@ -1937,8 +1940,8 @@ const Mine = {
 codex mcp login smartreportgen</pre>
         </template>
         <p>HTTP 和 MCP 均使用海尔 IAM access token。</p>
-        <div class="actions"><a class="btn" href="/api-guide" target="_blank" rel="noopener">HTTP 接入说明</a>
-          <a class="btn" href="/docs" target="_blank" rel="noopener">接口调试</a></div>
+        <div class="actions"><a class="btn" :href="appPath('/api-guide')" target="_blank" rel="noopener">HTTP 接入说明</a>
+          <a class="btn" :href="appPath('/docs')" target="_blank" rel="noopener">接口调试</a></div>
       </div>
     </div>
   </div>`,
@@ -1946,7 +1949,7 @@ codex mcp login smartreportgen</pre>
     const perm = ref(null);
     const mcpUrl = computed(() => state.meta?.mcp_url);
     onMounted(async () => { perm.value = await run(() => api('/api/me/permissions')); });
-    return { state, perm, mcpUrl };
+    return { state, perm, mcpUrl, appPath };
   }
 };
 

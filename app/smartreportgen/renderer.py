@@ -310,7 +310,7 @@ def build_html(tpl: Template, data: dict, theme: dict, generated_at: str, echart
     if inline_echarts:
         ech = "<script>" + (STATIC / "vendor" / "echarts.min.js").read_text(encoding="utf-8") + "</script>"
     else:
-        ech = f'<script src="{html.escape(echarts_src or "/static/vendor/echarts.min.js")}"></script>'
+        ech = f'<script src="{html.escape(echarts_src or settings.public_path("/static/vendor/echarts.min.js"))}"></script>'
     sub = html.escape(meta.get("subtitle") or "")
     goal = html.escape(str(meta.get("analysis_goal") or ""))
     scenario = html.escape(str(meta.get("scenario") or ""))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 import secrets
@@ -15,6 +16,7 @@ from uuid import UUID
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -54,10 +56,33 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.app_name, version="1.1.0", lifespan=lifespan,
-              description="管理台 HTTP API，使用海尔 IAM access token。完整示例见 [HTTP 接入说明](/api-guide)。")
+app = FastAPI(
+    title=settings.app_name,
+    version="1.1.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    description=(
+        "管理台 HTTP API，使用海尔 IAM access token。"
+        f"完整示例见 [HTTP 接入说明]({settings.public_path('/api-guide')})。"
+    ),
+)
 app.include_router(mcp_oauth.router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+def api_docs():
+    return get_swagger_ui_html(
+        openapi_url=settings.public_path("/openapi.json"),
+        title=f"{settings.app_name} - Swagger UI",
+        oauth2_redirect_url=settings.public_path("/docs/oauth2-redirect"),
+    )
+
+
+@app.get("/docs/oauth2-redirect", include_in_schema=False)
+def api_docs_oauth2_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
 
 
 def _openapi():
@@ -67,7 +92,8 @@ def _openapi():
         components = schema.setdefault("components", {})
         components["securitySchemes"] = {"HaierIAM": {"type": "http", "scheme": "bearer",
                                                      "description": "海尔 IAM 签发的原始 access token"}}
-        schema["externalDocs"] = {"description": "HTTP 接入说明", "url": "/api-guide"}
+        schema["externalDocs"] = {"description": "HTTP 接入说明", "url": settings.public_path("/api-guide")}
+        schema["servers"] = [{"url": settings.public_base_url}]
         for path, operations in schema["paths"].items():
             if path.startswith(("/api/", "/reports/")) and not path.startswith("/api/auth/"):
                 for operation in operations.values():
@@ -113,8 +139,9 @@ async def auth_middleware(request: Request, call_next):
         if (authorization is None and request.method == "GET"
                 and re.fullmatch(r"/reports/(?:\d+(?:/download|/content)?|preview/[\da-f-]{36})", path)
                 and "text/html" in request.headers.get("accept", "")):
-            target = path + (f"?{request.url.query}" if request.url.query else "")
-            return RedirectResponse("/auth/iam/login?next=" + quote(target, safe=""), status_code=302)
+            target = settings.public_path(path + (f"?{request.url.query}" if request.url.query else ""))
+            return RedirectResponse(settings.public_path("/auth/iam/login") + "?next=" + quote(target, safe=""),
+                                    status_code=302)
         return JSONResponse({"detail": "未登录或 IAM access token 已失效"}, status_code=401,
                             headers={"WWW-Authenticate": 'Bearer realm="smartreportgen"'})
     if request.method == "GET" and path in ("/api/me", "/api/me/permissions"):
@@ -189,8 +216,13 @@ def _admin_index_html() -> str:
     page = (admin / "index.html").read_text(encoding="utf-8")
     for filename in ("app.css", "app.js"):
         version = sha256((admin / filename).read_bytes()).hexdigest()[:12]
-        url = f"/static/admin/{filename}"
-        page = page.replace(f'"{url}"', f'"{url}?v={version}"')
+        raw_url = f"/static/admin/{filename}"
+        url = settings.public_path(raw_url)
+        page = page.replace(f'"{raw_url}"', f'"{url}?v={version}"')
+    page = page.replace('"/static/vendor/vue.global.prod.js"',
+                        f'"{settings.public_path("/static/vendor/vue.global.prod.js")}"')
+    page = page.replace('window.__SRG_BASE_PATH__ = "";',
+                        f"window.__SRG_BASE_PATH__ = {json.dumps(settings.public_base_path)};")
     return page
 
 
@@ -210,14 +242,18 @@ def _api_guide_html() -> str:
     # 页面直接渲染同一份仓库文档，避免在两处维护 HTTP 契约。
     renderer = MarkdownIt("commonmark").enable("table")
     markdown = (DOCS / "HTTP_API.md").read_text(encoding="utf-8")
-    markdown = markdown.replace("../skills/smart-report/references/template-spec.md", "/api-guide/template-spec")
+    markdown = markdown.replace("../skills/smart-report/references/template-spec.md",
+                                settings.public_path("/api-guide/template-spec"))
     body = renderer.render(markdown)
+    home = settings.public_path("/")
+    docs = settings.public_path("/docs")
+    openapi = settings.public_path("/openapi.json")
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>SmartReportGen HTTP 接入说明</title>
 <style>body{{max-width:70rem;margin:2rem auto;padding:0 1rem;font:16px/1.65 system-ui;color:#24334b}}
 pre{{overflow:auto;padding:1rem;background:#f2f5fa}}table{{display:block;overflow:auto;border-collapse:collapse}}
 td,th{{padding:.4rem .7rem;border:1px solid #dbe3ee}}th{{background:#f2f5fa}}a{{color:#235fba}}</style>
-<nav><a href="/">管理台</a> · <a href="/docs">接口调试</a> · <a href="/openapi.json">OpenAPI JSON</a></nav>
+<nav><a href="{home}">管理台</a> · <a href="{docs}">接口调试</a> · <a href="{openapi}">OpenAPI JSON</a></nav>
 <main>{body}</main></html>'''
 
 
@@ -262,21 +298,22 @@ def auth_check(request: Request):
 
 
 @app.get("/auth/iam/login", response_class=HTMLResponse, responses={302: {"description": "跳转到海尔 IAM"}})
-def iam_login(request: Request, next: str = "/"):
+def iam_login(request: Request, next: str = ""):
     if not iam.configured():
         return HTMLResponse(_auth_page("海尔 IAM 暂不可用", "请联系系统管理员。"), status_code=503)
-    next_path = iam.safe_next(next)
+    next_path = iam.safe_next(next or settings.public_path("/"))
     callback = urlsplit(iam.redirect_uri())
     # 登录 Cookie 仅属于签发它的主机。先切换到配置中的回调主机，例如从 127.0.0.1 切换到 localhost。
     if callback.hostname and request.url.hostname != callback.hostname:
         query = urlencode({"next": next_path})
-        return RedirectResponse(f"{callback.scheme}://{callback.netloc}/auth/iam/login?{query}",
+        login_path = settings.public_path("/auth/iam/login")
+        return RedirectResponse(f"{callback.scheme}://{callback.netloc}{login_path}?{query}",
                                 status_code=302, headers=IAM_BROWSER_HEADERS)
     # 用独立的短时 Cookie 绑定此次登录，避免其他浏览器的 IAM 回调替换当前用户会话。
     browser = secrets.token_urlsafe(32)
     state = iam.pack_state(browser, next_path)
     response = RedirectResponse(iam.authorize_url(state), status_code=302, headers=IAM_BROWSER_HEADERS)
-    response.set_cookie(auth.LOGIN_COOKIE, browser, path="/auth/iam/callback", httponly=True,
+    response.set_cookie(auth.LOGIN_COOKIE, browser, path=auth.cookie_path("/auth/iam/callback"), httponly=True,
                         samesite="lax", secure=_cookie_secure(), max_age=600)
     return response
 
@@ -313,9 +350,9 @@ def iam_callback(request: Request, code: str = "", state: str = "", error: str =
     session_id = auth.start_session(principal.emp_no, token, seconds)
     auth.end_session(request.cookies.get(auth.SESSION_COOKIE))
     response = RedirectResponse(nxt, status_code=302, headers=IAM_BROWSER_HEADERS)
-    response.delete_cookie(auth.LOGIN_COOKIE, path="/auth/iam/callback")
+    response.delete_cookie(auth.LOGIN_COOKIE, path=auth.cookie_path("/auth/iam/callback"))
     response.set_cookie(auth.SESSION_COOKIE, session_id, httponly=True, samesite="lax",
-                        secure=_cookie_secure(), max_age=seconds)
+                        secure=_cookie_secure(), max_age=seconds, path=auth.cookie_path("/"))
     return response
 
 
@@ -323,7 +360,7 @@ def iam_callback(request: Request, code: str = "", state: str = "", error: str =
 def logout(request: Request):
     auth.end_session(request.cookies.get(auth.SESSION_COOKIE))
     response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
-    response.delete_cookie(auth.SESSION_COOKIE)
+    response.delete_cookie(auth.SESSION_COOKIE, path=auth.cookie_path("/"))
     return response
 
 
@@ -332,7 +369,7 @@ def _auth_page(title: str, msg: str) -> str:
             f'<body style="font-family:system-ui,sans-serif;background:#EEF4FE;color:#17396D;display:grid;place-items:center;'
             f'height:100vh;margin:0"><div style="background:#fff;border:1px solid #DCE7F8;border-radius:16px;padding:28px 32px;'
             f'max-width:460px"><h2 style="margin:0 0 8px">{html.escape(title)}</h2><p style="color:#5F7DA8">{html.escape(msg)}</p>'
-            f'<a href="/" style="color:#2168F3">返回管理台</a></div></body>')
+            f'<a href="{settings.public_path("/")}" style="color:#2168F3">返回管理台</a></div></body>')
 
 
 # ------------------------------------------------------------------ 当前用户（自助）

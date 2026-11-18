@@ -31,8 +31,21 @@ def issuer() -> str:
     return settings.public_base_url.rstrip("/")
 
 
+def _mcp_route_path() -> str:
+    path = urlsplit(settings.mcp_public_url).path.rstrip("/")
+    if settings.public_base_path and path.startswith(settings.public_base_path + "/"):
+        path = path[len(settings.public_base_path):]
+    return path or "/mcp"
+
+
 def resource_metadata_path() -> str:
+    """RFC 9728 规定的 MCP 资源元数据路径。"""
     return "/.well-known/oauth-protected-resource" + urlsplit(settings.mcp_public_url).path.rstrip("/")
+
+
+def resource_metadata_local_path() -> str:
+    """子路径部署下，经代理前缀入口访问时的兼容路由。"""
+    return "/.well-known/oauth-protected-resource" + _mcp_route_path()
 
 
 def resource_metadata_url() -> str:
@@ -119,7 +132,7 @@ def authorize(request: Request):
     )
     response = RedirectResponse(iam.authorize_url(state), status_code=302, headers=NO_STORE)
     response.set_cookie(_cookie_name(state), browser, httponly=True, secure=issuer().startswith("https://"),
-                        samesite="lax", path="/auth/iam/callback", max_age=600)
+                        samesite="lax", path=settings.public_path("/auth/iam/callback"), max_age=600)
     return response
 
 
@@ -142,7 +155,7 @@ def complete_iam(request: Request, code: str, state: str, error: str):
         response = RedirectResponse(flow["redirect_uri"] + "?" + urlencode({
             **params, "state": flow["client_state"], "iss": issuer(),
         }), status_code=302, headers=NO_STORE)
-        response.delete_cookie(_cookie_name(state), path="/auth/iam/callback")
+        response.delete_cookie(_cookie_name(state), path=settings.public_path("/auth/iam/callback"))
         return response
 
     try:

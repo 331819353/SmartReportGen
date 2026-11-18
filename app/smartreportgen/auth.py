@@ -95,6 +95,11 @@ SESSION_COOKIE = "srg_iam_session"
 LOGIN_COOKIE = "srg_iam_login"
 
 
+def cookie_path(path: str = "/") -> str:
+    """Cookie 的浏览器侧路径必须包含反向代理的公开前缀。"""
+    return settings.public_path(path)
+
+
 def _session_digest(session_id: str) -> str:
     return hashlib.sha256(session_id.encode()).hexdigest()
 

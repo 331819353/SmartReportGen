@@ -607,9 +607,12 @@ def build_app():
 
     app.add_route("/healthz", health)
     # 标准 OAuth 发现从 MCP 的公网地址开始，登录与换票走管理 API 的地址。
-    app.add_route(mcp_oauth.resource_metadata_path(), mcp_oauth.resource_metadata)
-    if mcp_oauth.resource_metadata_path() != "/.well-known/oauth-protected-resource":
-        app.add_route("/.well-known/oauth-protected-resource", mcp_oauth.resource_metadata)
+    for path in {
+        mcp_oauth.resource_metadata_path(),
+        mcp_oauth.resource_metadata_local_path(),
+        "/.well-known/oauth-protected-resource",
+    }:
+        app.add_route(path, mcp_oauth.resource_metadata)
     app.add_middleware(TokenAuth)
     return app
 
