@@ -1,5 +1,7 @@
 # SmartReportGen 报告模板语法（markdown）
 
+> 本文保留已有结构化模板的兼容语法。下文的聚合、比率公式及零售示例不构成新报告的计算授权；要求事实直取的报告采用 SKILL.md 的 Agent HTML 流程，并遵守 `references/fact-contract.md`。
+
 模板 = **YAML front matter**（数据、度量、筛选、主题）+ **markdown 正文**（章节、结论、图表）。
 查询在服务端执行，结果作为数据包嵌入 HTML；筛选、聚合、图表在浏览器端实时计算，因此**所有筛选联动都无需重新查询**。
 

@@ -1609,6 +1609,12 @@ const Styles = {
         <div class="pane-right" ref="previewPane" tabindex="-1"><div class="preview-box"><div class="preview-bar">示例报告预览 <span class="muted small">{{previewing ? '更新中…' : '改动后自动更新'}}</span></div><iframe title="示例报告预览" :srcdoc="previewHtml"></iframe></div></div>
       </div>
     </template>
+    <!-- 内置事实规则只读展示，独立于可编辑样式；所有用户读取同一份服务端规则。 -->
+    <details v-if="meta && meta.reporting_rules" class="card card-pad" style="margin-top:16px">
+      <summary>内置报告规则（{{meta.reporting_rules.length}} 条）</summary>
+      <p class="small muted">事实取数与离线交付规则独立生效，视觉样式不能覆盖。业务口径变更需由用户明确提出并记录。</p>
+      <ul class="rule-items"><li v-for="rule in meta.reporting_rules" :key="rule.id"><span class="cat">{{rule.label}}</span>{{rule.text}}</li></ul>
+    </details>
   </div>`,
   setup() {
     const list = ref([]), scenarios = ref([]), meta = ref(null), form = ref(null), tab = ref('items'), advanced = ref(false);

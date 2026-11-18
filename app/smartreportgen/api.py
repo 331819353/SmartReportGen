@@ -656,11 +656,12 @@ def rule_list(request: Request):
 
 @app.get("/api/style-tokens")
 def style_tokens():
-    """样式编辑器元数据：内置主题、样式分类与说明、展示要求类别与生效顺序。"""
+    """样式编辑器元数据：内置主题、只读报告规则、展示类别与样式生效顺序。"""
     builtin, _ = design.resolve()
     return J({"groups": design.TOKEN_GROUPS, "categories": design.ITEM_CATEGORIES, "defaults": builtin,
               "retired_analysis_categories": design.RETIRED_ANALYSIS_CATEGORIES,
               "suggested": builtin,
+              "reporting_rules": design.builtin_reporting_rules(),
               "precedence": design.PRECEDENCE})
 
 

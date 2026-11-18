@@ -588,6 +588,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `defaults`、`suggested` | 两个以样式键为索引的对象，当前均返回内置主题 |
 | `retired_analysis_categories` | 已停用类别到名称的映射，键为 `structure`、`chart`、`filter` |
 | `precedence` | 字符串，描述样式生效顺序 |
+| `reporting_rules` | 只读内置报告规则数组，每项含 `id`、`label`、`text`、`level:"builtin"`、`source`；不参与视觉样式的覆盖 |
 
 **`GET /api/style-rules/resolve` 响应字段**
 
@@ -598,8 +599,11 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `specified.theme` | 合并后已设置的样式键和值 |
 | `specified.theme_sources` | 同一批样式键对应的来源说明字符串 |
 | `specified.items` | 合并后的展示要求，每项含 `category`、`category_label`、`text`、`level`（`general` 或 `scenario`）、`source` |
+| `reporting_rules` | 与 `GET /api/style-tokens` 相同的内置事实及离线交付约束，独立于 `specified` 的展示优先级 |
 | `general_rules`、`scenario_rules` | 生效的通用规则和当前用户个人场景规则数组。规则的 `items` 附 `category_label`。有检索命中时规则附 `relevance`，结构同业务场景检索命中去掉 `dataset` |
 | `warnings` | 字符串数组，例如相关度检索的向量降级提示 |
+
+`reporting_rules` 由代码内置，不写入样式规则表，不能通过规则 CRUD 删除或修改。MCP `get_style_rules` 同样返回该字段；`get_skill_guide(reference="fact-contract")` 可读事实取数细则，`reference="green-energy-september-facts"` 可读附件的绿能九月场景参考。后者不代表本次已验证数据或复现样式。规则指导 Agent 直取事实、保留缺失并交付离线单文件，不是任意 SQL、JavaScript 或自然语言结论的自动合规校验器。
 
 **`effective` 与 `preview` 请求示例**
 

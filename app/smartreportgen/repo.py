@@ -460,6 +460,8 @@ def style_rules_for(business_scenario: str | None, query: str | None = None, own
     return {
         "business_scenario": business_scenario,
         "precedence": design.PRECEDENCE,
+        # 事实约束单独返回，不参与可调整的视觉样式优先级，也不写入用户规则表。
+        "reporting_rules": design.builtin_reporting_rules(),
         # 指定样式：内置样式 + 通用规则 + 业务场景规则 按优先级合并后的唯一结果，作为对智能体的约束
         "specified": {
             "theme": theme,

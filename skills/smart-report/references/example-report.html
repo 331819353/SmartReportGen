@@ -25,7 +25,7 @@
 <body>
   <header>
     <h1>结论指标着色示例</h1>
-    <p>示例数据。切换大区可查看同比和目标达成率的变化，达标阈值为 100%。</p>
+    <p>虚构交互夹具，非经营事实。同比与完成率均为夹具直接字段，比例尺度为小数，已确认达标阈值为 100%；全部范围单独读取总体行，不聚合明细。</p>
   </header>
   <main>
     <form id="filters">
@@ -37,6 +37,7 @@
         <option>华南</option>
         <option>西南</option>
         <option>西北</option>
+        <option>东北</option>
       </select>
       <button type="reset">重置</button>
     </form>
@@ -57,10 +58,12 @@
   </main>
   <script type="application/json" id="report-data">
     [
-      {"region":"华东","current":120,"prior":100,"target":110},
-      {"region":"华北","current":80,"prior":100,"target":100},
-      {"region":"华南","current":100,"prior":100,"target":100},
-      {"region":"西南","current":20,"prior":0,"target":0}
+      {"scope":"total","region":"全部","current":420,"prior":380,"target":400,"yoy":0.1053,"attainment":1.05},
+      {"scope":"detail","region":"华东","current":120,"prior":80,"target":100,"yoy":0.5,"attainment":1.1997},
+      {"scope":"detail","region":"华北","current":80,"prior":100,"target":100,"yoy":-0.2,"attainment":0.8},
+      {"scope":"detail","region":"华南","current":100,"prior":100,"target":100,"yoy":0,"attainment":1},
+      {"scope":"detail","region":"西南","current":0,"prior":0,"target":0,"yoy":null,"attainment":null},
+      {"scope":"detail","region":"东北","current":120,"prior":80,"target":100,"yoy":null,"attainment":null}
     ]
   </script>
   <script>
@@ -77,21 +80,6 @@
       style: 'percent', maximumFractionDigits: 1, signDisplay: 'exceptZero'
     });
 
-    function ratio(filteredRows, baseline) {
-      // 先聚合再求比率。空结果或缺少任一参与计算的字段时，无法判定该口径。
-      if (!filteredRows.length) return null;
-      let numerator = 0;
-      let denominator = 0;
-      for (const row of filteredRows) {
-        if (!Number.isFinite(row.current) || !Number.isFinite(row[baseline])) return null;
-        numerator += row.current;
-        denominator += row[baseline];
-      }
-      if (denominator === 0) return null;
-      const value = numerator / denominator;
-      return Number.isFinite(value) ? value : null;
-    }
-
     function showMetric(element, text, state = '') {
       // 每次重写状态，避免筛到空结果或零值时保留上一次的颜色。
       element.textContent = text;
@@ -100,7 +88,11 @@
     }
 
     function render() {
-      const filteredRows = region.value ? rows.filter(row => row.region === region.value) : rows;
+      const filteredRows = rows.filter(row => row.scope === 'detail' && (!region.value || row.region === region.value));
+      // 总体与明细分开选取；缺少或重复的事实不能通过求和、取首条或相除补齐。
+      const facts = rows.filter(row => region.value
+        ? row.scope === 'detail' && row.region === region.value : row.scope === 'total');
+      const fact = facts.length === 1 ? facts[0] : null;
       // 结论与明细表使用同一份筛选结果，所有动态值都按文本写入。
       evidence.replaceChildren(...filteredRows.map(row => {
         const tr = document.createElement('tr');
@@ -114,20 +106,20 @@
         return tr;
       }));
       emptyEvidence.hidden = filteredRows.length > 0;
-      const yearRatio = ratio(filteredRows, 'prior');
-      const targetRatio = ratio(filteredRows, 'target');
-      if (yearRatio === null) {
+      // 此夹具明确约定比率为小数；正式报告须从字段契约确认尺度，不能按值猜测。
+      const change = fact?.yoy;
+      const targetRatio = fact?.attainment;
+      if (!Number.isFinite(change)) {
         showMetric(yoy, '—');
       } else {
-        const change = yearRatio - 1;
         const label = change > 0 ? '增长' : change < 0 ? '下降' : '持平';
         const state = change > 0 ? 'positive' : change < 0 ? 'negative' : '';
         showMetric(yoy, `${signedPercent.format(change)}（${label}）`, state);
       }
-      if (targetRatio === null) {
+      if (!Number.isFinite(targetRatio)) {
         showMetric(attainment, '—');
       } else {
-        // 使用原始比率比较，避免四舍五入到 100% 后被误判为达标。
+        // 直接使用原始完成率比较，即使显示金额看起来相除得到其他数值也不覆盖源比率。
         const reached = targetRatio >= targetThreshold;
         const label = reached ? '达标' : '未达标';
         showMetric(attainment, `${percent.format(targetRatio)}（${label}）`, reached ? 'positive' : 'negative');

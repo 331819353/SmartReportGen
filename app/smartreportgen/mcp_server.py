@@ -52,11 +52,11 @@ def _skill_body() -> str:
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP（使用海尔 IAM access token；数据按员工工号做表级权限控制）。
 若你所在的 agent 没有加载 smart-report 技能（Skill），请先调用 get_skill_guide 获取完整的生成流程与方法，再按流程执行。推荐流程：
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
-2) 多表场景先用 describe_tables 列出所有授权表，逐张用 describe_table 和单表汇总查询核实可用指标、粒度、关联键及覆盖范围，记录每张表的指标或无法使用的原因；
-3) 将场景的 analysis_approach 与用户问题逐项映射到指标、来源表、查询和支撑数值。对每个小节用 run_query 汇总完整业务口径内的授权数据，以 tables_used 核对来源；明细样本仅供核对字段。必要时在验证关联关系和粒度后跨表查询。证据不足时写明缺口，依据已核实的数字确定结论，再设计章节、图表及筛选；
-4) get_style_rules(业务场景) 获取视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并），默认遵守，未指定的项由你决定；
+2) 多表场景先用 describe_tables 列出所有授权表，逐张用 describe_table 和单表事实查询核实可用指标、粒度、关联键及覆盖范围，记录每张表的指标或无法使用的原因；
+3) 将场景的 analysis_approach 与用户问题逐项映射到指标、来源表、查询和支撑数值。对每个小节用 run_query 直取完整口径的正式指标，以 tables_used 核对来源并定位具体事实行；明细样本仅供核对字段。实际、目标、完成率、同比、差额、贡献、总计与预测必须直取，禁止在 SQL、前端或 LLM 中补算，缺失显示 —。跨表仅在验证粒度后关联或透视原值；
+4) get_style_rules(业务场景) 获取 reporting_rules（独立的事实与离线交付约束）及视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并）。样式调整不能豁免 reporting_rules；
 5) 将逐表指标、分析项与证据的映射、缺口、章节、筛选和展示要求写入业务 Markdown 模板。用 save_report_template(template_type="business", ...) 保存，并用 get_report_template 读取指定版本。
-6) 用 run_query(snapshot=true) 保存各组报告数据，与全量口径的证据查询对账。Agent 在 HTML 中内联 CSS、JavaScript 与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。用 preview_report_html 展开数据，在浏览器逐小节核对默认及代表性筛选下的结论和汇总值，再用 save_report 提交相同 HTML 并关联模板版本；服务端内联快照数据，下载仍为离线单文件。
+6) 用 run_query(snapshot=true) 保存各组报告数据，与同口径的直接事实对账。Agent 在 HTML 中内联 CSS、JavaScript、所用图表运行时与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。用 preview_report_html 展开数据，在浏览器逐小节核对默认及代表性筛选下的结论和源端总计，再用 save_report 提交相同 HTML 并关联模板版本；服务端内联快照数据，下载仍为离线单文件。打开、浏览与筛选不得触发取数、生成或保存。
 修改已有报告时用 get_report(include_html=true, omit_snapshot_data=true) 读取选中的版本，显式指定的 version 优先。预览和 revise_report 均传入读取的 revision 作为 base_version，可复用基准版本的数据块。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
@@ -294,10 +294,18 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
 
 
 @mcp.tool()
-def get_skill_guide(include_example: bool = False) -> str:
+def get_skill_guide(include_example: bool = False,
+                    reference: Literal["fact-contract", "green-energy-september-facts"] | None = None) -> str:
     """返回 smart-report 技能全文：报告生成的完整流程（a-f）、分析与设计方法、权限处理与最终回复格式。
-    适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。"""
+    适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。
+    reference 可按需附带 fact-contract（事实取数细则）或 green-energy-september-facts（附件的绿能九月场景参考，未经本次验证）。"""
     text = _skill_body()
+    if reference is not None:
+        # 仅允许已维护的参考名，不能把客户端参数当作任意文件路径读取。
+        files = {"fact-contract": "fact-contract.md", "green-energy-september-facts": "green-energy-september-facts.md"}
+        if reference not in files:
+            raise ValueError("不支持的技能参考文档")
+        text += "\n\n---\n\n" + (SKILL_DIR / "references" / files[reference]).read_text(encoding="utf-8")
     if include_example:
         text += "\n\n## 附：筛选联动与结论动态着色的 HTML 示例\n\n```html\n" + EXAMPLE_FILE.read_text(encoding="utf-8") + "```\n"
     return text
@@ -321,7 +329,8 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
     """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置经营报告主题，合并为一份 specified，
     作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
     文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
-    builtin_style 提供可选用的内联 CSS 和组件说明。最终生效顺序：你的决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。
+    reporting_rules 为独立的事实直取、缺失不补算及离线单文件约束，不参与视觉样式覆盖。
+    builtin_style 提供可选用的内联 CSS 和组件说明。视觉样式生效顺序：你的决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。
     将适用的样式和展示要求落实到生成的 HTML 中。"""
     try:
         p = _principal(ctx)
@@ -335,11 +344,13 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
         "ok": True,
         "business_scenario": res["business_scenario"],
         "precedence": res["precedence"],
+        "reporting_rules": res["reporting_rules"],
         "specified": res["specified"],
         # 自编 HTML 可以直接复用内置组件样式；指定主题和展示要求仍通过原有字段返回。
         "builtin_style": design.builtin_style(res["specified"]["theme"]),
         "rules": rules,
-        "note": ("specified 合并了业务场景、通用及内置样式。直接编写 HTML 时，请将适用的 theme 和 items 落实到 CSS、图表配置与脚本。"
+        "note": ("reporting_rules 独立约束事实取数与离线交付，不能因样式调整豁免。"
+                 "specified 合并了业务场景、通用及内置样式。直接编写 HTML 时，请将适用的 theme 和 items 落实到 CSS、图表配置与脚本。"
                  "采用内置样式时，可以内联 builtin_style.css 并参考组件说明；同类卡片复用 CSS 与图表配置。"
                  "items 各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
                  "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。确有理由时可调整展示要求并在回复中说明。"
