@@ -54,9 +54,9 @@ INSTRUCTIONS = """SmartReportGen 智能报告 MCP（使用海尔 IAM access toke
 1) search_business_scenarios(用户需求) 在你有权限的业务场景中混合检索 → get_dataset_tables(dataset_id) 获取数据表和场景的分析思路；
 2) 多表场景先用 describe_tables 列出所有授权表，逐张用 describe_table 和单表事实查询核实可用指标、粒度、关联键及覆盖范围，记录每张表的指标或无法使用的原因；
 3) 将场景的 analysis_approach 与用户问题逐项映射到指标、来源表、查询和支撑数值。对每个小节用 run_query 直取完整口径的正式指标，以 tables_used 核对来源并定位具体事实行；明细样本仅供核对字段。实际、目标、完成率、同比、差额、贡献、总计与预测必须直取，禁止在 SQL、前端或 LLM 中补算，缺失显示 —。跨表仅在验证粒度后关联或透视原值；
-4) get_style_rules(业务场景) 获取 reporting_rules（独立的事实与离线交付约束）及视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并）。样式调整不能豁免 reporting_rules；
+4) get_style_rules(业务场景) 获取 reporting_rules（独立的事实与离线交付约束）及视觉样式和展示要求 specified（业务场景 ≥ 通用 ≥ 内置 合并）。当前用户明确展示要求优先；低层条目及智能体判断不能豁免高层规则。按技能 R-01–R-10 编制生效规则表；
 5) 将逐表指标、分析项与证据的映射、缺口、章节、筛选和展示要求写入业务 Markdown 模板。用 save_report_template(template_type="business", ...) 保存，并用 get_report_template 读取指定版本。
-6) 用 run_query(snapshot=true) 保存各组报告数据，与同口径的直接事实对账。Agent 在 HTML 中内联 CSS、JavaScript、所用图表运行时与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。用 preview_report_html 展开数据，在浏览器逐小节核对默认及代表性筛选下的结论和源端总计，再用 save_report 提交相同 HTML 并关联模板版本；服务端内联快照数据，下载仍为离线单文件。打开、浏览与筛选不得触发取数、生成或保存。
+6) 用 run_query(snapshot=true) 保存各组报告数据，与同口径的直接事实对账。Agent 在 HTML 中内联 CSS、统一格式化模块、所用图表运行时与页面资源，并用独立的 application/json 数据块引用各 snapshot_id。按技能先执行源文档门禁，再用 preview_report_html 展开数据，在浏览器逐小节核对事实与六类展示面，完成边界、离线和筛选验证后执行展开后门禁；全部通过才用 save_report 提交相同源 HTML 并关联模板版本。服务端内联快照数据，下载仍为离线单文件。打开、浏览与筛选不得触发取数、生成或保存。
 修改已有报告时用 get_report(include_html=true, omit_snapshot_data=true) 读取选中的版本，显式指定的 version 优先。预览和 revise_report 均传入读取的 revision 作为 base_version，可复用基准版本的数据块。
 遇到“无权访问”时不要尝试绕过，应告知用户需要申请哪些表的权限。"""
 
@@ -295,14 +295,24 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
 
 @mcp.tool()
 def get_skill_guide(include_example: bool = False,
-                    reference: Literal["fact-contract", "green-energy-september-facts"] | None = None) -> str:
+                    reference: Literal["fact-contract", "green-energy-september-facts", "display-contract"] | None = None,
+                    asset: Literal["report-formatters.js", "audit_report.py"] | None = None) -> str:
     """返回 smart-report 技能全文：报告生成的完整流程（a-f）、分析与设计方法、权限处理与最终回复格式。
     适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。
-    reference 可按需附带 fact-contract（事实取数细则）或 green-energy-september-facts（附件的绿能九月场景参考，未经本次验证）。"""
+    reference 可附带 fact-contract、green-energy-september-facts 或 display-contract（展示断言、统一入口与保存门禁）。
+    asset 单独返回格式化模块或可执行审计脚本的完整原文，供没有本地技能的 agent 保存到同一目录；不可与其他选项并用。"""
+    if asset is not None:
+        # 固定资产白名单，不开放客户端任意路径读取，也不在返回代码前混入技能正文。
+        if asset not in {"report-formatters.js", "audit_report.py"}:
+            raise ValueError("不支持的技能资产")
+        if reference is not None or include_example:
+            raise ValueError("asset 不能与 reference 或 include_example 同时使用")
+        return (SKILL_DIR / "assets" / asset).read_text(encoding="utf-8")
     text = _skill_body()
     if reference is not None:
         # 仅允许已维护的参考名，不能把客户端参数当作任意文件路径读取。
-        files = {"fact-contract": "fact-contract.md", "green-energy-september-facts": "green-energy-september-facts.md"}
+        files = {"fact-contract": "fact-contract.md", "green-energy-september-facts": "green-energy-september-facts.md",
+                 "display-contract": "display-contract.md"}
         if reference not in files:
             raise ValueError("不支持的技能参考文档")
         text += "\n\n---\n\n" + (SKILL_DIR / "references" / files[reference]).read_text(encoding="utf-8")
@@ -330,8 +340,9 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
     作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
     文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
     reporting_rules 为独立的事实直取、缺失不补算及离线单文件约束，不参与视觉样式覆盖。
-    builtin_style 提供可选用的内联 CSS 和组件说明。视觉样式生效顺序：你的决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。
-    将适用的样式和展示要求落实到生成的 HTML 中。"""
+    builtin_style 提供可选用的内联 CSS 和组件说明。展示顺序：当前用户明确要求 > 业务场景规则 > 通用规则 > 内置默认值。
+    低优先级条目及智能体判断不能豁免高优先级规则；仅章节、图表、筛选维度及未指定装饰样式可裁量。
+    将生效要求落实到全部展示面，按技能门禁通过后保存。"""
     try:
         p = _principal(ctx)
         res = repo.style_rules_for(business_scenario, query or None, owner=p.emp_no)
@@ -353,7 +364,9 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "") -> di
                  "specified 合并了业务场景、通用及内置样式。直接编写 HTML 时，请将适用的 theme 和 items 落实到 CSS、图表配置与脚本。"
                  "采用内置样式时，可以内联 builtin_style.css 并参考组件说明；同类卡片复用 CSS 与图表配置。"
                  "items 各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
-                 "章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。确有理由时可调整展示要求并在回复中说明。"
+                 "当前用户明确展示要求优先，低层许可不能豁免高层禁止；不得以智能体判断放宽数字格式、单位、口径、缺失处理和状态色。"
+                 "章节、图表类型、筛选维度及未指定的装饰样式由用户需求和数据证据决定。"
+                 "保存前按技能执行源文档审计、展开后六类展示面及边界复核和最终门禁，失败不得保存。"
                  "使用服务端结构化模板渲染时，theme 会自动应用。"),
         "warnings": res["warnings"],
     })

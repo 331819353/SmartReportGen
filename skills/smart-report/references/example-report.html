@@ -7,8 +7,6 @@
   <style>
     :root {
       font-family: system-ui, sans-serif;
-      --positive: #047857;
-      --negative: #b91c1c;
     }
     /* 此处的排版仅用于阅读示例；报告的默认版式由样式工具提供。 */
     body { margin: 1rem; }
@@ -18,8 +16,12 @@
     th, td { padding: .5rem; border-bottom: 1px solid #e5e7eb; text-align: right; }
     th:first-child { text-align: left; }
     .metric { font-weight: 700; font-variant-numeric: tabular-nums; }
-    .metric[data-state="positive"] { color: var(--positive); }
-    .metric[data-state="negative"] { color: var(--negative); }
+    /* 与卡片、表格及图表共用语义变量，色值只在展示契约中定义。 */
+    .srg-up { color: var(--srg-up); }
+    .srg-down { color: var(--srg-down); }
+    .srg-neutral { color: var(--srg-neutral); }
+    .srg-met { color: var(--srg-met); }
+    .srg-miss { color: var(--srg-miss); }
   </style>
 </head>
 <body>
@@ -56,6 +58,9 @@
       <p id="empty-evidence" hidden>当前筛选没有数据。</p>
     </section>
   </main>
+  <script type="application/json" id="srg-display-contract">
+    {"version":1,"fixture":true,"rate_symbols":"percent-only","rule_sources":["示例约定：率值与源端率差仅用百分号，非正式报告默认"],"colors":{"up":"#047857","down":"#B91C1C","neutral":"#475569","met":"#047857","miss":"#B91C1C"}}
+  </script>
   <script type="application/json" id="report-data">
     [
       {"scope":"total","region":"全部","current":420,"prior":380,"target":400,"yoy":0.1053,"attainment":1.05},
@@ -66,7 +71,71 @@
       {"scope":"detail","region":"东北","current":120,"prior":80,"target":100,"yoy":null,"attainment":null}
     ]
   </script>
+  <script id="srg-formatters">
+/* 唯一展示入口：必须原文内联；业务值由源端直接提供，这里只处理显示和状态。 */
+(() => {
+  'use strict';
+  const contract = JSON.parse(document.getElementById('srg-display-contract').textContent);
+  const root = document.documentElement;
+  const states = ['up', 'down', 'neutral', 'met', 'miss'];
+  if (!['percent-only', 'semantic'].includes(contract.rate_symbols)) throw new Error('未确认率值符号约定');
+  for (const state of states) {
+    const color = contract.colors[state];
+    if (!/^#[\da-f]{6}$/i.test(color)) throw new Error(`状态色无效：${state}`);
+    root.style.setProperty(`--srg-${state}`, color);
+  }
+  const finite = value => typeof value === 'number' && Number.isFinite(value);
+  const precision = digits => Number.isInteger(digits) && digits >= 0 && digits <= 6;
+  const number = (value, digits, signed) => new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: digits, maximumFractionDigits: digits,
+    signDisplay: signed ? 'exceptZero' : 'auto'
+  }).format(Object.is(value, -0) ? 0 : value);
+
+  function fmtNum(value, { digits = 2, divisor = 1, unit = '', signed = false } = {}) {
+    // divisor 只能使用模板中已确认的单位换算系数；未知单位不使用默认推断。
+    if (!finite(value) || !finite(divisor) || divisor <= 0 || !precision(digits)) return '—';
+    return number(value / divisor, digits, signed) + unit;
+  }
+
+  function fmtPct(value, { scale, digits = 2, signed = false } = {}) {
+    // decimal: 0.0978；percent: 9.78。必须显式传入尺度，不能按值猜测。
+    if (!finite(value) || !['decimal', 'percent'].includes(scale) || !precision(digits)) return '—';
+    return number(scale === 'decimal' ? value * 100 : value, digits, signed) + '%';
+  }
+
+  function fmtDelta(value, { kind, scale, digits = 2, divisor = 1, unit = '' } = {}) {
+    // 只格式化源端差额，不接收两个业务值做减法；率差的语义由 kind 明确保留。
+    if (kind === 'number') return fmtNum(value, { digits, divisor, unit, signed: true });
+    if (kind !== 'rate') return '—';
+    const label = fmtPct(value, { scale, digits, signed: true });
+    if (label === '—' || contract.rate_symbols === 'percent-only') return label;
+    return label.slice(0, -1) + 'pp';
+  }
+
+  function metricState(value, { kind, scale, threshold } = {}) {
+    // 非唯一事实在取数绑定处置为 null；未知尺度及缺阈值不能残留旧判断。
+    if (!finite(value) || !['decimal', 'percent', 'number'].includes(scale)) return 'neutral';
+    if (kind === 'trend') return value > 0 ? 'up' : value < 0 ? 'down' : 'neutral';
+    if (kind === 'attainment' && scale !== 'number' && finite(threshold)) return value >= threshold ? 'met' : 'miss';
+    return 'neutral';
+  }
+
+  function stateColor(state) {
+    return contract.colors[states.includes(state) ? state : 'neutral'];
+  }
+
+  function applyMetric(element, text, state = 'neutral') {
+    // 每次移除全部历史状态；空值仍有中性色，不能沿用上一次的红绿判断。
+    element.classList.remove(...states.map(value => `srg-${value}`));
+    element.classList.add(`srg-${text === '—' || !states.includes(state) ? 'neutral' : state}`);
+    element.textContent = text;
+  }
+
+  window.SrgDisplay = Object.freeze({ fmtNum, fmtPct, fmtDelta, metricState, stateColor, applyMetric });
+})();
+  </script>
   <script>
+    const { fmtNum, fmtPct, metricState, applyMetric } = SrgDisplay;
     const rows = JSON.parse(document.getElementById('report-data').textContent);
     const filters = document.getElementById('filters');
     const region = document.getElementById('region');
@@ -75,18 +144,6 @@
     const evidence = document.getElementById('evidence');
     const emptyEvidence = document.getElementById('empty-evidence');
     const targetThreshold = 1;
-    const percent = new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 });
-    const signedPercent = new Intl.NumberFormat('zh-CN', {
-      style: 'percent', maximumFractionDigits: 1, signDisplay: 'exceptZero'
-    });
-
-    function showMetric(element, text, state = '') {
-      // 每次重写状态，避免筛到空结果或零值时保留上一次的颜色。
-      element.textContent = text;
-      if (state) element.dataset.state = state;
-      else delete element.dataset.state;
-    }
-
     function render() {
       const filteredRows = rows.filter(row => row.scope === 'detail' && (!region.value || row.region === region.value));
       // 总体与明细分开选取；缺少或重复的事实不能通过求和、取首条或相除补齐。
@@ -101,7 +158,7 @@
         name.textContent = row.region;
         tr.append(name);
         for (const key of ['current', 'prior', 'target']) {
-          tr.insertCell().textContent = Number.isFinite(row[key]) ? row[key] : '—';
+          tr.insertCell().textContent = fmtNum(row[key], {digits: 0});
         }
         return tr;
       }));
@@ -110,19 +167,19 @@
       const change = fact?.yoy;
       const targetRatio = fact?.attainment;
       if (!Number.isFinite(change)) {
-        showMetric(yoy, '—');
+        applyMetric(yoy, '—');
       } else {
-        const label = change > 0 ? '增长' : change < 0 ? '下降' : '持平';
-        const state = change > 0 ? 'positive' : change < 0 ? 'negative' : '';
-        showMetric(yoy, `${signedPercent.format(change)}（${label}）`, state);
+        const state = metricState(change, {kind: 'trend', scale: 'decimal'});
+        const label = {up: '增长', down: '下降', neutral: '持平'}[state];
+        applyMetric(yoy, `${fmtPct(change, {scale: 'decimal', digits: 1, signed: true})}（${label}）`, state);
       }
       if (!Number.isFinite(targetRatio)) {
-        showMetric(attainment, '—');
+        applyMetric(attainment, '—');
       } else {
         // 直接使用原始完成率比较，即使显示金额看起来相除得到其他数值也不覆盖源比率。
-        const reached = targetRatio >= targetThreshold;
-        const label = reached ? '达标' : '未达标';
-        showMetric(attainment, `${percent.format(targetRatio)}（${label}）`, reached ? 'positive' : 'negative');
+        const state = metricState(targetRatio, {kind: 'attainment', scale: 'decimal', threshold: targetThreshold});
+        const label = state === 'met' ? '达标' : '未达标';
+        applyMetric(attainment, `${fmtPct(targetRatio, {scale: 'decimal', digits: 1})}（${label}）`, state);
       }
     }
 

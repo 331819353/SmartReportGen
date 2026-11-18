@@ -52,12 +52,23 @@ class BuiltinReportingRulesTest(unittest.TestCase):
         with patch.object(mcp_server, "SKILL_DIR", skill_dir), \
                 patch.object(mcp_server, "SKILL_FILE", skill_dir / "SKILL.md"):
             body = mcp_server.get_skill_guide()
-            for reference in ("fact-contract", "green-energy-september-facts"):
+            for reference in ("fact-contract", "green-energy-september-facts", "display-contract"):
                 with self.subTest(reference=reference):
                     contents = (skill_dir / "references" / f"{reference}.md").read_text(encoding="utf-8")
                     self.assertEqual(mcp_server.get_skill_guide(reference=reference), body + "\n\n---\n\n" + contents)
             with self.assertRaises(ValueError):
                 mcp_server.get_skill_guide(reference="../../config")
+            # MCP-only 客户端取得可直接保存运行的原文，不能混入指南或读取任意路径。
+            for asset in ("report-formatters.js", "audit_report.py"):
+                with self.subTest(asset=asset):
+                    contents = (skill_dir / "assets" / asset).read_text(encoding="utf-8")
+                    self.assertEqual(mcp_server.get_skill_guide(asset=asset), contents)
+            with self.assertRaises(ValueError):
+                mcp_server.get_skill_guide(asset="../../config.py")
+            with self.assertRaises(ValueError):
+                mcp_server.get_skill_guide(asset="audit_report.py", include_example=True)
+            with self.assertRaises(ValueError):
+                mcp_server.get_skill_guide(asset="audit_report.py", reference="display-contract")
 
 
 if __name__ == "__main__":

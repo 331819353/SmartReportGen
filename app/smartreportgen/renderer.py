@@ -40,8 +40,8 @@ def _scenario_of(tpl: Template, dataset_id: int | None) -> str | None:
 
 
 def resolve_theme(tpl: Template, dataset_id: int | None = None, owner: str | None = None) -> tuple[dict, list[str]]:
-    """生效顺序：智能体决定（模板 theme）≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式。
-    规则合并出的指定样式是约束，智能体可以按自己的判断在模板中覆盖。返回 (渲染用完整取值, 提示)。"""
+    """兼容已有结构化模板的 theme 覆盖，返回 (渲染用完整取值, 提示)。
+    模板覆盖只实现语法兼容，不构成展示规则变更授权；Agent 须按当前生效契约验证。"""
     rules = repo.style_rules_for(_scenario_of(tpl, dataset_id), owner=owner)
     specified = rules["specified"]["theme"]
     chosen, warns = design.resolve_overrides(tpl.theme)
@@ -49,7 +49,7 @@ def resolve_theme(tpl: Template, dataset_id: int | None = None, owner: str | Non
     overridden = sorted(k for k in chosen if k in specified and chosen[k] != specified[k])
     if overridden:
         warns.append("提示：模板 theme 覆盖了指定样式 " + "、".join(f"{k}（原为{sources.get(k, '')}）" for k in overridden)
-                     + "，按智能体的决定展示；请确认这是有意为之")
+                     + "；此兼容覆盖不构成规则豁免，须核对当前用户明确要求及生效展示契约")
     theme = {**specified, **chosen}
     return design.full(theme), warns
 

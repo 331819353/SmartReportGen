@@ -603,7 +603,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `general_rules`、`scenario_rules` | 生效的通用规则和当前用户个人场景规则数组。规则的 `items` 附 `category_label`。有检索命中时规则附 `relevance`，结构同业务场景检索命中去掉 `dataset` |
 | `warnings` | 字符串数组，例如相关度检索的向量降级提示 |
 
-`reporting_rules` 由代码内置，不写入样式规则表，不能通过规则 CRUD 删除或修改。MCP `get_style_rules` 同样返回该字段；`get_skill_guide(reference="fact-contract")` 可读事实取数细则，`reference="green-energy-september-facts"` 可读附件的绿能九月场景参考。后者不代表本次已验证数据或复现样式。规则指导 Agent 直取事实、保留缺失并交付离线单文件，不是任意 SQL、JavaScript 或自然语言结论的自动合规校验器。
+`reporting_rules` 由代码内置，不写入样式规则表，不能通过规则 CRUD 删除或修改。MCP `get_style_rules` 同样返回该字段；`get_skill_guide(reference="fact-contract")` 可读事实取数细则，`reference="green-energy-september-facts"` 可读附件的绿能九月场景参考，`reference="display-contract"` 可读展示断言、统一入口与保存门禁。MCP-only 客户端可分别用 `asset="report-formatters.js"`、`asset="audit_report.py"` 读取完整代码并保存到同一目录；asset 不与 reference/include_example 混用。后者不代表本次已验证数据或复现样式。规则指导 Agent 直取事实、保留缺失并交付离线单文件，不是任意 SQL、JavaScript 或自然语言结论的自动合规校验器。技能要求 Agent 在保存前执行本地源文档/展开文件审计及浏览器复核；保存接口本身不验证该本地审计记录。
 
 **`effective` 与 `preview` 请求示例**
 

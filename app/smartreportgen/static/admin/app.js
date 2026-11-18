@@ -1556,7 +1556,7 @@ const Styles = {
       <div v-else-if="viewLoading" class="collection-state" role="status">正在加载生效样式…</div>
       <div v-else class="style-editor"><div class="pane-left">
         <div class="card card-pad"><h3>展示要求（合并后）</h3>
-          <p class="small muted" style="margin:0 0 8px">业务场景规则 ≥ 通用规则 合并为一份，作为约束交给智能体；同类要求中排在前面的优先。智能体可按自己的判断调整，没有涉及的方面由智能体自由决定。</p>
+          <p class="small muted" style="margin:0 0 8px">当前用户明确要求优先于业务场景、通用及内置默认值；同类要求中排在前面的优先。低层条目不能豁免高层要求；智能体仅可决定章节、选图、筛选维度及未指定的装饰样式。</p>
           <ul class="rule-items" v-if="viewRules.length"><li v-for="it in viewRules"><span class="cat">{{it.category_label}}</span>{{it.text}} <span class="src" :class="it.level">{{it.source}}</span></li></ul>
           <p v-else class="muted small">没有指定的展示要求。</p></div>
         <div class="card card-pad" style="margin-top:12px" v-if="eff"><h3>视觉样式</h3><TokenGroups :meta="meta" :effective="eff.theme" :sources="eff.sources" :readonly="true"/></div>
