@@ -28,6 +28,7 @@ import duckdb
 import httpx
 
 from .base import Connector, ConnectorError, ensure_readonly, norm_columns, norm_value, value_options
+from ..telemetry import measure
 
 _TABLE_REF = re.compile(r'\b(?:from|join)\s+("?)([\w./-]+)\1', re.I)
 
@@ -58,12 +59,16 @@ def _flatten(rec: dict, prefix: str = "", depth: int = 0) -> dict:
     return out
 
 
+def _ndjson(recs: list[dict]) -> str:
+    return "".join(json.dumps(rec, ensure_ascii=False, default=str) + "\n" for rec in recs)
+
+
 class APIConnector(Connector):
     type = "api"
 
     def __init__(self, ds: dict, secret: str):
         super().__init__(ds, secret)
-        self._cache: dict[str, tuple[float, list[dict]]] = {}
+        self._cache: dict[str, tuple[float, list[dict], str]] = {}
         self._lock = threading.Lock()
 
     def _endpoint(self, table: str) -> dict:
@@ -91,12 +96,13 @@ class APIConnector(Connector):
         path = ep.get("path") or table
         url = path if path.startswith("http") else f"{(self.cfg.get('base_url') or '').rstrip('/')}/{path.lstrip('/')}"
         try:
-            r = httpx.request(
-                ep["method"].upper(), url, headers=self._headers(), params=ep.get("params") or None,
-                json=ep.get("body"), timeout=float(self.cfg.get("timeout", 30)),
-            )
-            r.raise_for_status()
-            data = r.json()
+            with measure("api.fetch"):
+                r = httpx.request(
+                    ep["method"].upper(), url, headers=self._headers(), params=ep.get("params") or None,
+                    json=ep.get("body"), timeout=float(self.cfg.get("timeout", 30)),
+                )
+                r.raise_for_status()
+                data = r.json()
         except Exception as e:  # noqa: BLE001
             raise ConnectorError(f"API 请求失败 {url}: {e}") from e
         recs = _dig(data, ep.get("records_path"))
@@ -110,24 +116,30 @@ class APIConnector(Connector):
         if not isinstance(recs, list):
             raise ConnectorError(f"未在路径 {ep.get('records_path')!r} 找到记录数组")
         recs = [_flatten(x) if isinstance(x, dict) else {"value": x} for x in recs]
+        # 缓存有效期内复用预序列化 NDJSON，避免多次 SQL 查询重复 json.dumps。
+        ndjson = _ndjson(recs)
         with self._lock:
-            self._cache[table] = (time.time(), recs)
+            self._cache[table] = (time.time(), recs, ndjson)
         return recs
 
     def _duck(self, tables: list[str]) -> duckdb.DuckDBPyConnection:
         con = duckdb.connect(":memory:")
         for t in tables:
             recs = self.fetch(t)
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=True, encoding="utf-8") as f:
-                for rec in recs:
-                    f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-                f.flush()
-                # 双写引号以保留逻辑表名，同时禁止把接口名解释成 SQL。
-                safe = t.replace('"', '""')
-                if recs:
+            # 双写引号以保留逻辑表名，同时禁止把接口名解释成 SQL。
+            safe = t.replace('"', '""')
+            if recs:
+                with self._lock:
+                    hit = self._cache.get(t)
+                    ndjson = hit[2] if hit and hit[1] is recs else None
+                if ndjson is None:
+                    ndjson = _ndjson(recs)
+                with tempfile.NamedTemporaryFile("w", suffix=".json", delete=True, encoding="utf-8") as f:
+                    f.write(ndjson)
+                    f.flush()
                     con.execute(f"CREATE TABLE \"{safe}\" AS SELECT * FROM read_json_auto('{f.name}', format='newline_delimited')")
-                else:
-                    con.execute(f'CREATE TABLE "{safe}" (value VARCHAR)')
+            else:
+                con.execute(f'CREATE TABLE "{safe}" (value VARCHAR)')
         # 数据载入后禁止访问本地文件与网络（read_csv('/etc/passwd') 之类），该设置不可再打开
         con.execute("SET enable_external_access = false")
         return con

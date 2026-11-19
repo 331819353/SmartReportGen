@@ -1,6 +1,6 @@
 # SmartReportGen 报告模板语法（markdown）
 
-> 本文保留已有结构化模板的兼容语法。下文的聚合、比率公式及零售示例不构成新报告的计算授权；要求事实直取的报告采用 SKILL.md 的 Agent HTML 流程，并遵守 `references/fact-contract.md`。
+> 本文保留已有结构化模板的兼容语法。下文的聚合、比率公式及零售示例不构成新报告的计算授权；要求事实直取的报告采用[技能流程总览](../SKILL.md#流程总览)的 Agent HTML 流程，并遵守[取数与结论规则](fact-contract.md)。本文第 1–7 节描述兼容语法，不是报告生成主流程的步骤编号。
 > 下文的 `pp` 等 format 名称只描述兼容能力，不是展示规则豁免；当前生效要求禁止某个符号时不得使用，修订输出仍须通过 R-07–R-10 门禁。
 
 模板 = **YAML front matter**（数据、度量、筛选、主题）+ **markdown 正文**（章节、结论、图表）。
@@ -13,8 +13,8 @@ subtitle: 副标题（数据范围等）
 scenario: 零售销售经营分析          # 业务场景名（用于推断默认数据源）
 datasource: 演示-零售PG             # 可选；普通用户取数须使用模板关联场景的数据源
 analysis_goal: 一句话分析目标        # 显示在头部
-theme: {...}                       # 可选：设计令牌覆盖，见「主题」（样式规则会自动生效）
-filters: [...]                     # 全局筛选器，见「筛选」
+theme: {...}                       # 可选：设计令牌覆盖，见本文第 6 节「主题」（样式规则会自动生效）
+filters: [...]                     # 全局筛选器，见本文第 5 节「全局筛选（filters）与联动」
 presets: [...]                     # 预设场景（一键切换筛选组合）
 queries:                           # 必填，至少一个
   <查询id>:
@@ -95,11 +95,11 @@ note: 该图如何支撑上面的结论
 | `series_limit` | series 拆分时最多系列数（默认 8，其余合并“其他”） |
 | `x_label` / `y_label` | 轴名称 |
 | `unit` | 标题右侧单位标签；不填时由度量的 format + unit 自动推导（万元、%、单…） |
-| `status` | 健康度判定，仅 `kpi` / `gauge` / `bullet` 可用，见「健康度」 |
+| `status` | 健康度判定，仅 `kpi` / `gauge` / `bullet` 可用，见[第 6 节的健康度说明](#健康度status只有指标卡仪表盘子弹图判整卡好坏) |
 
 | type | 用途 | 必要参数 |
 |---|---|---|
-| `kpi` | 指标卡 | `y`（单个）；`sub: [度量 或 {measure: x, trend: up\|down\|none}]` 辅助读数行，见「升降色」 |
+| `kpi` | 指标卡 | `y`（单个）；`sub: [度量 或 {measure: x, trend: up\|down\|none}]` 辅助读数行，见[第 6 节的升降色说明](#升降色kpi-的-sub) |
 | `line` / `area` / `stacked_area` | 时间趋势 | `x`, `y` 或 `series` |
 | `bar` / `stacked_bar` | 分类对比 / 构成变化 | `x`, `y` 或 `series` |
 | `hbar` | 横向类别对比 | `x`, `y` |

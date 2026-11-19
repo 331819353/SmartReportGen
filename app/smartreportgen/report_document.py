@@ -20,9 +20,24 @@ RESOURCE_ATTRIBUTES = {
 LEGACY_ECHARTS = re.compile(r'<script src="(?:[^"<>]*/)?static/vendor/echarts\.min\.js"></script>')
 
 
+def skill_dir() -> Path:
+    """定位唯一技能目录：镜像内优先 docs/skill，本地开发/测试回退仓库 skills/smart-report。"""
+    packaged = Path(__file__).with_name("docs") / "skill"
+    return packaged if packaged.is_dir() else Path(__file__).resolve().parents[2] / "skills" / "smart-report"
+
+
 @cache
 def _inline_echarts() -> str:
     return (Path(__file__).with_name("static") / "vendor" / "echarts.min.js").read_text(encoding="utf-8")
+
+
+def echarts_js() -> str:
+    return _inline_echarts()
+
+
+@cache
+def formatters_js() -> str:
+    return (skill_dir() / "assets" / "report-formatters.js").read_text(encoding="utf-8")
 
 
 def inline_legacy_echarts(html: str) -> str:

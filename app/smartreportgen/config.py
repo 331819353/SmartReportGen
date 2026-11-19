@@ -36,6 +36,8 @@ class Settings:
         self.public_base_path = urlsplit(self.public_base_url).path.rstrip("/")
         self.query_max_rows = int(os.getenv("QUERY_MAX_ROWS", "50000"))
         self.query_timeout = int(os.getenv("QUERY_TIMEOUT_SECONDS", "60"))
+        # 仅缓存数据库字段结构，不缓存查询结果；设为 0 可禁用。
+        self.schema_cache_seconds = max(0, float(os.getenv("SCHEMA_CACHE_SECONDS", "300")))
         # MCP 写入查询和预览文件，管理 API 读取预览；容器部署时使用同一个私有卷。
         self.report_work_dir = os.getenv("REPORT_WORK_DIR", "/srv/report-work")
         self.seed_demo = _bool("SEED_DEMO", True)

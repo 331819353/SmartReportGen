@@ -1,6 +1,6 @@
 # 展示契约与保存门禁
 
-本文落实 SKILL.md 的 R-01、R-07–R-10。先读取生效规则，再写 HTML；不能在生成后用默认规则解释违例。静态脚本只能检测已定义的结构和已知违例，不能证明任意 JavaScript 或业务结论正确；因此浏览器复核与事实对账也是保存条件。
+本文落实[技能执行契约](../SKILL.md#执行契约强制)的 R-01、R-07–R-10，并细化主流程第 6 步的保存门禁。本文第 1–5 节为展示契约的内部章节编号。先读取生效规则，再写 HTML；不能在生成后用默认规则解释违例。静态脚本只能检测已定义的结构和已知违例，不能证明任意 JavaScript 或业务结论正确；因此浏览器复核与事实对账也是保存条件。
 
 ## 1. 将要求变为断言
 
@@ -15,14 +15,16 @@
 
 ## 2. 唯一格式化与颜色入口
 
-HTML 中顺序固定为：展示契约 JSON → 快照 JSON → 原文内联格式化模块 → 应用脚本。契约中的值从生效规则表填写，不根据示例推定其他报告的默认要求。
+HTML 中顺序固定为：展示契约 JSON → 快照 JSON → 原文内联格式化模块（或源文档占位 `<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>`）→ 应用脚本。契约中的值从生效规则表填写，不根据示例推定其他报告的默认要求。源文档也可用 `<style data-srg-style="<style_id|base>"></style>` 和 `<script data-srg-vendor="echarts"></script>` 交给服务端在 `preview_report_html` / `save_report` 时展开为离线单文件，展开后的文件仍须通过全部静态与浏览器审计。
 
 ```html
+<style data-srg-style="实际style_id"></style>
 <script type="application/json" id="srg-display-contract">
 {"version":1,"rate_symbols":"percent-only","rule_sources":["U-NUM-01：用户要求率值与率差全篇仅用百分号"],"colors":{"up":"#047857","down":"#B91C1C","neutral":"#475569","met":"#047857","miss":"#B91C1C"}}
 </script>
 <script type="application/json" id="srg-data-sales" data-srg-snapshot="实际快照ID"></script>
-<script id="srg-formatters">此处必须是 assets/report-formatters.js 文件原文</script>
+<script data-srg-vendor="echarts"></script>
+<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>
 <script>
 const { fmtNum, fmtPct, fmtDelta, metricState, stateColor, applyMetric } = SrgDisplay;
 // fact 必须来自唯一的直接事实；缺失或重复事实绑定为 null，不取首条。
@@ -32,7 +34,7 @@ applyMetric(document.getElementById('yoy'),
 </script>
 ```
 
-格式化模块位于技能的 `assets/report-formatters.js`，审计脚本为同目录 `assets/audit_report.py`。没有本地技能的 agent 分别调用 `get_skill_guide(asset="report-formatters.js")`、`get_skill_guide(asset="audit_report.py")`，将返回原文保存为同目录的两个文件。不能按记忆重写。脚本仅依赖 Python 3 标准库。静态检查放行内置 ECharts 的固定内容摘要；使用其他运行时时需先维护并测试审计脚本的精确摘要清单，不能仅加 vendor 标签来豁免。
+格式化模块位于技能的 `assets/report-formatters.js`，审计脚本为同目录 `assets/audit_report.py`。使用 `data-srg-asset="report-formatters.js"` 占位标签时标签体必须为空，服务端展开后写入完全一致的原文；直接内联时也必须保持原文一致，不能按记忆重写。没有本地技能的 agent 分别调用 `get_skill_guide(asset="report-formatters.js")`、`get_skill_guide(asset="audit_report.py")`，将返回原文保存为同目录的两个文件。脚本仅依赖 Python 3 标准库。静态检查放行内置 ECharts 的固定内容摘要；使用其他运行时时需先维护并测试审计脚本的精确摘要清单，不能仅加 vendor 标签来豁免。
 
 - `fmtNum(v, {digits, divisor, unit, signed})`：数字及已确认的单位换算；禁止用 `unit` 偷渡率值符号。
 - `fmtPct(v, {scale, digits, signed})`：率值。`scale='decimal'` 表示 0.0978 → 9.78%；`scale='percent'` 表示 9.78 → 9.78%。未知尺度返回 `—`。
@@ -105,16 +107,16 @@ HTML 注释不算展示内容。普通展示文本、aria-label、title、alt、
 
 ## 5. 可执行门禁（失败即停止保存）
 
-以下路径为示例，可使用任务工作目录的绝对路径。MCP-only agent 先按第 2 节取回两个审计资产。
+以下路径为示例，可使用任务工作目录的绝对路径。MCP-only agent 先按[本文第 2 节：唯一格式化与颜色入口](#2-唯一格式化与颜色入口)取回两个审计资产。
 
 ```sh
-# ① 含快照引用的源文档，必须先通过静态门禁。
+# ① 含快照及内置资产引用的源文档，必须先通过静态门禁。
 python3 skills/smart-report/assets/audit_report.py /tmp/report-source.html --phase source
-# ② 用 preview_report_html 展开并下载为 /tmp/report-preview.html，再创建待填复核记录。
+# ② 用 preview_report_html 展开（记下 preview_id）并下载为 /tmp/report-preview.html，再创建待填复核记录。
 # 此步预期返回 1：pending 记录不构成通过，也不会覆盖已存在的记录。
 python3 skills/smart-report/assets/audit_report.py /tmp/report-preview.html --source /tmp/report-source.html --write-review /tmp/report-review.json
-# ③ 完成离线浏览器、事实、六类落地面及全部边界复核，逐项填写 status 和 evidence。
-# ④ 最终门禁：必须返回 0，才可提交记录绑定的源文档。
+# ③ 在单次集中浏览器会话完成离线、事实、六类落地面及全部边界复核，逐项填写 status 和 evidence。
+# ④ 最终门禁：必须返回 0，才可提交记录绑定的源文档（或直接传该次预览的 preview_id）。
 python3 skills/smart-report/assets/audit_report.py /tmp/report-preview.html --source /tmp/report-source.html --review /tmp/report-review.json
 ```
 
@@ -126,4 +128,4 @@ python3 skills/smart-report/assets/audit_report.py /tmp/report-preview.html --so
 
 此门禁由 skill 工作流执行；现有 `save_report`/`revise_report` 接口不会验证本地审计记录。不得将本地通过描述为服务端强制校验，也不得因此省略工作流门禁。
 
-`references/example-report.html` 是明确标注的独立夹具，可用 `--phase source --fixture` 检查。`--fixture` 的通过结果不能作为正式报告保存依据；正式门禁拒绝契约中的夹具标记。
+[example-report.html](example-report.html) 是明确标注的独立夹具，可用 `--phase source --fixture` 检查。`--fixture` 的通过结果不能作为正式报告保存依据；正式门禁拒绝契约中的夹具标记。

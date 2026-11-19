@@ -10,6 +10,7 @@ from .connectors import ConnectorError, get_connector, profile
 from .renderer import render
 from .report_document import inline_legacy_echarts, merge_report_documents, report_document_error
 from .scenario_filters import query_in_scenario, table_sql
+from .telemetry import measure
 
 
 def datasource_for_dataset(ds: dict) -> dict:
@@ -19,11 +20,13 @@ def datasource_for_dataset(ds: dict) -> dict:
 
 
 def describe_table(ds_row: dict, table: str, sample_rows: int = 5, profile_rows: int = 2000,
-                   *, dataset: dict | None = None, allowed: set[str] | None = None) -> dict:
+                   *, dataset: dict | None = None, allowed: set[str] | None = None,
+                   include_count: bool = True, include_extrema: bool = True,
+                   refresh_schema: bool = False) -> dict:
     conn = get_connector(ds_row)
     out: dict = {"datasource": ds_row["name"], "datasource_type": ds_row["type"], "table": table}
     try:
-        out["columns"] = conn.columns(table)
+        out["columns"] = conn.cached_columns(table, refresh=refresh_schema)
     except ConnectorError as e:
         out["columns"] = []
         out["columns_error"] = str(e)
@@ -35,28 +38,45 @@ def describe_table(ds_row: dict, table: str, sample_rows: int = 5, profile_rows:
     def query(sql: str, n: int) -> dict:
         return query_in_scenario(ds_row, dataset, sql, n, conn, allowed) if rules else conn.query(sql, n)
 
-    n = max(sample_rows, profile_rows)
+    # MCP 的轻量模式跳过全范围统计；管理 API 仍沿用完整模式的默认行为。
+    sample_rows = max(0, sample_rows)
+    n = max(sample_rows, max(0, min(profile_rows, 2000)))
+    out["row_count"] = None
+    out["row_count_status"] = "not_requested"
     if rules:
         out["row_filters"] = rules
-        out["row_count"] = query(f"SELECT COUNT(*) FROM {source}", 1)["rows"][0][0]
-        sample = query(f"SELECT * FROM {source}", n)
-    else:
-        out["row_count"] = conn.count(table)
-        sample = conn.sample(table, n)
+    if include_count:
+        with measure("describe.count"):
+            if rules:
+                out["row_count"] = query(f"SELECT COUNT(*) FROM {source}", 1)["rows"][0][0]
+            else:
+                out["row_count"] = conn.count(table)
+        out["row_count_status"] = "exact" if out["row_count"] is not None else "unavailable"
+    # 明确请求零样本时不再隐式读取 2,000 行；字段结构来自独立元数据。
+    sample = {"columns": [c["name"] for c in out["columns"]], "rows": []}
+    if n:
+        with measure("describe.sample"):
+            sample = query(f"SELECT * FROM {source}", n) if rules else conn.sample(table, n)
     out["sample_columns"] = sample["columns"]
     out["sample_rows"] = sample["rows"][:sample_rows]
-    out["profile"] = profile(sample["columns"], sample["rows"])
+    with measure("describe.profile"):
+        out["profile"] = profile(sample["columns"], sample["rows"])
+    out["profile_sample_size"] = len(sample["rows"])
     out["profile_basis"] = f"基于前 {len(sample['rows'])} 行样本"
+    out["extrema_status"] = "not_requested" if not include_extrema else "unavailable"
+    out["coverage_note"] = "样本画像不证明业务覆盖、唯一键或全量指标；须通过直接事实查询核实。"
     # 样本只覆盖前若干行：对日期/数值列补充全表最值，避免误判时间范围
     span_cols = [p["column"] for p in out["profile"] if p["kind"] in ("datetime", "number")][:30]
-    if span_cols and (rules or re.fullmatch(r"[\w.$#]+", table)):
+    if include_extrema and span_cols and (rules or re.fullmatch(r"[\w.$#]+", table)):
         exprs = ", ".join(f"MIN({c}) AS mn_{i}, MAX({c}) AS mx_{i}" for i, c in enumerate(span_cols))
         try:
-            row = query(f"SELECT {exprs} FROM {source}", 1)["rows"][0]
+            with measure("describe.extrema"):
+                row = query(f"SELECT {exprs} FROM {source}", 1)["rows"][0]
             for i, c in enumerate(span_cols):
                 p = next(p for p in out["profile"] if p["column"] == c)
                 p["full_min"], p["full_max"] = row[2 * i], row[2 * i + 1]
             out["profile_basis"] += "；日期/数值列另附取数范围内的最值 full_min/full_max"
+            out["extrema_status"] = "exact"
         except (ConnectorError, IndexError):
             pass
     comments = {c["name"]: c.get("comment") for c in out["columns"]}
@@ -73,7 +93,8 @@ def run_query(ds_row: dict, sql: str, limit: int | None = None,
     max_rows = max(1, settings.query_max_rows) if snapshot else 5000
     limit = max(1, min(int(limit or (max_rows if snapshot else 200)), max_rows))
     conn = get_connector(ds_row)
-    res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed) if dataset else conn.query(sql, limit)
+    with measure("query.execute"):
+        res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed) if dataset else conn.query(sql, limit)
     return {"datasource": ds_row["name"], "dialect": ds_row["type"], **res, "row_count": len(res["rows"])}
 
 

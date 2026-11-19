@@ -2,7 +2,7 @@
 
 本指南面向调用 SmartReportGen 的开发者。管理台、HTTP API 和 MCP 共用一个服务入口。接口路径均相对于部署地址 `BASE_URL`，例如 `https://report.example.com/api/me`。域名、工号、资源 ID 和数据都是示例。部署实例的 Swagger 在 `$BASE_URL/docs`，OpenAPI 文档在 `$BASE_URL/openapi.json`，本指南的在线版在 `$BASE_URL/api-guide`。
 
-[首次调用](#quickstart) · [获取凭证](#authentication) · [生成并下载报告](#report-quickstart) · [常见问题](#troubleshooting) · [接口参考](#api-reference)
+[首次调用](#quickstart) · [获取凭证](#authentication) · [运行结构化模板并下载报告](#report-quickstart) · [常见问题](#troubleshooting) · [接口参考](#api-reference)
 
 <a id="quickstart"></a>
 
@@ -13,7 +13,7 @@
 | 需要确认 | 向谁确认 | 用途 |
 |---|---|---|
 | 调用机器可达的 HTTPS 部署地址 `BASE_URL`，以及是否需要企业内网或 VPN | 部署方 | 拼接 `/healthz`、`/api/me` 等路径。`http://localhost:18600` 仅适用于服务就在本机的场景 |
-| 测试海尔账号，以及获得该账号 IAM access token 的方式 | IAM 或集成负责人 | 服务端调用使用 Bearer。已有 IAM 登录的系统使用其获得的用户令牌，自建登录按下节对接 IAM |
+| 测试海尔账号，以及获得该账号 IAM access token 的方式 | IAM 或集成负责人 | 服务端调用使用 Bearer。已有 IAM 登录的系统使用其获得的用户令牌，自建登录按[获取凭证](#authentication)一节对接 IAM |
 | 测试工号是否已启用，以及可用业务场景和表 | SmartReportGen 管理员 | 生成报告需要相应表权限。只查看已有报告时，请创建人或管理员分享该报告 |
 
 先检查连通性。把下列 `BASE_URL` 的值替换成部署方提供的地址，末尾不带 `/`。预期响应为 `200` 和 `{"ok":true}`。
@@ -450,7 +450,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 结构校验通过且 `execute:true` 时返回 `queries` 和 `filters`，分别按查询 ID 和筛选器 ID 索引。查询结果的 `rows` 为行数，`sample` 最多 5 行，列顺序与 `columns` 一致，`ms` 为执行毫秒数。筛选器项为 `{"distinct":2,"examples":["在线客服","电话"]}`，`examples` 最多 12 个。指定 `execute:false` 或存在结构错误时，响应只含 `ok`、`errors`、`warnings` 和 `summary`。普通用户实际执行的 SQL 须通过表级权限检查，查询权限失败会出现在 `errors` 中。
 
-已有 UTF-8 Markdown 文件时，可用 `jq --rawfile markdown template.md` 构造请求。完整调用见 [生成并下载报告](#report-quickstart)。HTTP 生成使用模板创建人的个人样式，报告归属模板创建人。报告保存生成时的数据和样式，浏览器在这份数据上执行交互筛选。
+已有 UTF-8 Markdown 文件时，可用 `jq --rawfile markdown template.md` 构造请求。完整调用见[运行结构化模板并下载报告](#report-quickstart)。HTTP 生成使用模板创建人的个人样式，报告归属模板创建人。报告保存生成时的数据和样式，浏览器在这份数据上执行交互筛选。
 
 ## 报告库
 

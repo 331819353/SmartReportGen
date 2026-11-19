@@ -154,6 +154,77 @@ class SkillDisplayAuditTest(unittest.TestCase):
             invalid = subprocess.run(command + ['--review', str(work / 'missing.json')], capture_output=True, text=True)
             self.assertEqual(invalid.returncode, 2)
 
+    def test_placeholder_assets_and_expanded_audit_cli(self):
+        vendor_file = ROOT / 'app/smartreportgen/static/vendor/echarts.min.js'
+        formatter_text = (ASSETS / 'report-formatters.js').read_text(encoding='utf-8')
+        css = ''.join(f'.srg-{state} {{ color: var(--srg-{state}); }}' for state in audit.STATES)
+        contract = {'version': 1, 'rate_symbols': 'percent-only', 'rule_sources': ['U-NUM-01：测试规则'],
+                    'colors': {'up': '#047857', 'down': '#B91C1C', 'neutral': '#475569',
+                               'met': '#047857', 'miss': '#B91C1C'}}
+        source_html = (
+            f'<!doctype html><html><head><style data-srg-style="style-uuid"></style>'
+            f'<style>{css}</style></head><body><p>毛利率 9.78%</p>'
+            f'<script type="application/json" id="srg-display-contract">{json.dumps(contract)}</script>'
+            f'<script type="application/json" id="srg-data" data-srg-snapshot="snap-uuid"></script>'
+            f'<script data-srg-vendor="echarts"></script>'
+            f'<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>'
+            f'<script>const {{fmtPct}} = SrgDisplay;</script></body></html>'
+        )
+        self.assertEqual(audit.audit_html(source_html, expanded=False), [])
+        # 展开后未展开任何占位符都应阻断。
+        self.assertTrue(audit.audit_html(source_html, expanded=True))
+        # 伪造或夹带非空代码不能绕过 R-06/R-08 扫描。
+        for forged in (
+            source_html.replace('<script data-srg-vendor="echarts"></script>',
+                                '<script data-srg-vendor="echarts">const x = v.toFixed(2);</script>'),
+            source_html.replace('<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>',
+                                '<script id="srg-formatters" data-srg-asset="report-formatters.js">const x = v.toFixed(2);</script>'),
+            source_html.replace('<style data-srg-style="style-uuid"></style>',
+                                '<style data-srg-style="style-uuid">body{color:red}</style>'),
+            source_html.replace('<script data-srg-vendor="echarts"></script>',
+                                '<script data-srg-vendor="embedded">fetch("/api")</script>'),
+            source_html.replace('<script data-srg-vendor="echarts"></script>',
+                                '<script data-srg-vendor="echarts" data-srg-asset="report-formatters.js"></script>'),
+            source_html.replace('<script data-srg-vendor="echarts"></script>',
+                                '<script id="other-id" data-srg-asset="report-formatters.js"></script>'),
+        ):
+            with self.subTest(forged=forged):
+                self.assertTrue(audit.audit_html(forged, expanded=False))
+
+        expanded_html = (
+            source_html
+            .replace('<style data-srg-style="style-uuid"></style>',
+                     '<style data-srg-style="embedded">.rf-wrap{width:100%}</style>')
+            .replace('<script type="application/json" id="srg-data" data-srg-snapshot="snap-uuid"></script>',
+                     '<script type="application/json" id="srg-data" data-srg-snapshot="embedded">{"columns":["v"],"rows":[[1]]}</script>')
+            .replace('<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>',
+                     f'<script id="srg-formatters" data-srg-asset="embedded">{formatter_text}</script>')
+        )
+        if vendor_file.exists():
+            expanded_html = expanded_html.replace(
+                '<script data-srg-vendor="echarts"></script>',
+                f'<script data-srg-vendor="embedded">{vendor_file.read_text(encoding="utf-8")}</script>',
+            )
+        else:
+            expanded_html = expanded_html.replace('<script data-srg-vendor="echarts"></script>', '')
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            src_path, exp_path, rev_path = work / 'source.html', work / 'expanded.html', work / 'review.json'
+            src_path.write_text(source_html, encoding='utf-8')
+            exp_path.write_text(expanded_html, encoding='utf-8')
+            src_run = subprocess.run([sys.executable, str(ASSETS / 'audit_report.py'), str(src_path), '--phase', 'source'],
+                                     capture_output=True, text=True)
+            self.assertEqual(src_run.returncode, 0, src_run.stdout)
+            review = audit.review_template(expanded_html, source_html)
+            for group in ('surfaces', 'behaviors'):
+                for entry in review[group].values():
+                    entry.update(status='pass', evidence='占位符展开门禁测试夹具')
+            rev_path.write_text(json.dumps(review, ensure_ascii=False), encoding='utf-8')
+            exp_run = subprocess.run([sys.executable, str(ASSETS / 'audit_report.py'), str(exp_path),
+                                      '--source', str(src_path), '--review', str(rev_path)],
+                                     capture_output=True, text=True)
+            self.assertEqual(exp_run.returncode, 0, exp_run.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

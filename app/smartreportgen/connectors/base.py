@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal
+from copy import deepcopy
 import math
 import re
+import threading
+from time import monotonic
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from typing import Any
+
+from ..config import settings
+from ..telemetry import measure
 
 
 class ConnectorError(RuntimeError):
@@ -157,6 +163,32 @@ class Connector:
         self.ds = ds
         self.cfg = ds.get("config") or {}
         self.secret = secret
+        # 缓存只随连接器存活；数据源修改会替换连接器，权限仍由每次工具调用先行校验。
+        self._columns_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+        self._columns_lock = threading.Lock()
+
+    def cached_columns(self, table: str, *, refresh: bool = False) -> list[dict]:
+        """复用短期字段元数据，不缓存业务事实；返回副本防止调用方污染后续请求。"""
+        ttl = settings.schema_cache_seconds
+        # API 字段类型来自记录推断，沿用它已有的接口数据缓存，避免再延长类型陈旧时间。
+        if self.type == "api" or ttl <= 0:
+            with measure("schema.read"):
+                return self.columns(table)
+        with self._columns_lock:
+            hit = self._columns_cache.get(table)
+            if not refresh and hit and monotonic() - hit[0] < ttl:
+                self._columns_cache.move_to_end(table)
+                with measure("schema.cache_hit"):
+                    return deepcopy(hit[1])
+        # 网络查询不持有缓存锁，避免慢表阻塞同一数据源的其他字段探查。
+        with measure("schema.read"):
+            columns = self.columns(table)
+        with self._columns_lock:
+            self._columns_cache[table] = (monotonic(), deepcopy(columns))
+            self._columns_cache.move_to_end(table)
+            while len(self._columns_cache) > 256:
+                self._columns_cache.popitem(last=False)
+        return columns
 
     def test(self) -> dict:
         raise NotImplementedError

@@ -160,6 +160,106 @@ class ReportSnapshotsTest(unittest.TestCase):
         self.assertEqual(report_data.embed(revised, "editor", old),
                          old.replace('<section id="forecast">', '<section id="forecast-section">'))
 
+    def test_placeholder_style_vendor_asset_embed_and_for_edit(self):
+        with patch.object(mcp_server, "_principal", return_value=self.owner), \
+                patch.object(mcp_server.repo, "style_rules_for", return_value={
+                    "business_scenario": "测试场景", "precedence": "p", "reporting_rules": [],
+                    "specified": {"theme": {"color-brand": "#123456"}, "theme_sources": {}, "items": []},
+                    "general_rules": [], "scenario_rules": [], "warnings": [],
+                }):
+            compact = mcp_server.get_style_rules("测试场景", None, include_css=False)
+        self.assertTrue(compact["ok"], compact)
+        self.assertNotIn("css", compact["builtin_style"])
+        style_id = compact["builtin_style"]["style_id"]
+        snap = report_data.save_query(self.owner.emp_no, ["v"], [[7]], 0)["snapshot_id"]
+        draft = (
+            f'<!doctype html><html><head><meta charset="utf-8">'
+            f'<style data-srg-style="{style_id}"></style>'
+            f'<style>.srg-up{{color:var(--srg-up)}}</style></head><body>'
+            f'<script type="application/json" id="d" data-srg-snapshot="{snap}"></script>'
+            f'<script data-srg-vendor="echarts"></script>'
+            f'<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>'
+            f'<script>const x = 1;</script></body></html>'
+        )
+        expanded = report_data.embed(draft, self.owner.emp_no)
+        self.assertIn('data-srg-style="embedded"', expanded)
+        self.assertIn("#123456", expanded)
+        self.assertIn('data-srg-vendor="embedded"', expanded)
+        self.assertIn('echarts', expanded)
+        self.assertIn('data-srg-asset="embedded"', expanded)
+        self.assertIn("SrgDisplay", expanded)
+        skeleton = report_data.for_edit(expanded)
+        self.assertIn('data-srg-style="base"', skeleton)
+        self.assertIn('data-srg-snapshot="base"', skeleton)
+        self.assertIn('data-srg-vendor="echarts"', skeleton)
+        self.assertIn('data-srg-asset="report-formatters.js"', skeleton)
+        self.assertEqual(report_data.embed(skeleton, "editor", expanded), expanded)
+        # 基准存在多个无 id 的内嵌样式块时，未指定 id 的 data-srg-style="base" 应拒绝。
+        ambiguous_base = expanded.replace("</head>", '<style data-srg-style="embedded">body{margin:1px}</style></head>')
+        with self.assertRaisesRegex(report_data.ReportDataError, "样式块"):
+            report_data.embed(skeleton, "editor", ambiguous_base)
+
+    def test_preview_id_save_and_revise_reuse_and_isolation(self):
+        snap = mcp_server.run_query(1, "SELECT * FROM Targets", None, snapshot=True, sample_rows=0)
+        draft = document(block("targets", snap["snapshot_id"]))
+        preview = mcp_server.preview_report_html(draft, None)
+        self.assertTrue(preview["ok"], preview)
+        self.assertIn("preview_id", preview)
+        self.assertEqual(len(preview["source_sha256"]), 64)
+        self.assertEqual(len(preview["html_sha256"]), 64)
+        # 跨工号不能复用他人 preview_id。
+        other_access = Access(Principal("other-user"), tables={1: {"orders", "targets"}})
+        with patch.object(mcp_server, "_access", return_value=other_access):
+            denied = mcp_server.save_report("盗用预览", ctx=None, preview_id=preview["preview_id"])
+            self.assertFalse(denied["ok"])
+            self.assertIn("预览源码不可用", denied["error"])
+        # 使用 preview_id 保存报告，传给 repo.save_report 的正是同一份源 HTML。
+        with patch.object(mcp_server.repo, "save_report", return_value={
+            "id": 99, "revision": 1, "meta": {"html_bytes": preview["html_bytes"]},
+        }) as save_mock:
+            saved = mcp_server.save_report("新报告", ctx=None, preview_id=preview["preview_id"])
+        self.assertTrue(saved["ok"], saved)
+        self.assertEqual(save_mock.call_args.args[1], draft)
+        # 传参互斥校验。
+        both = mcp_server.save_report("冲突", html=draft, ctx=None, preview_id=preview["preview_id"])
+        neither = mcp_server.save_report("缺失", ctx=None)
+        self.assertFalse(both["ok"])
+        self.assertFalse(neither["ok"])
+
+        # 基于已有报告预览后的 preview_id 只能用于 revise_report，且校验 report_id 与 base_version。
+        expanded = report_data.embed(draft, self.owner.emp_no)
+        base_report = {"id": 99, "revision": 2, "access_level": "edit", "html": expanded, "meta": {"single_file": True}}
+        revised_draft = document(block("targets", "base")).replace("</script>", "</script><!--v3-->", 1)
+        with patch.object(mcp_server.repo, "get_report", return_value=base_report):
+            rev_preview = mcp_server.preview_report_html(revised_draft, None, report_id=99, base_version=2)
+        self.assertTrue(rev_preview["ok"], rev_preview)
+        wrong_save = mcp_server.save_report("误调新建", ctx=None, preview_id=rev_preview["preview_id"])
+        self.assertFalse(wrong_save["ok"])
+        self.assertIn("revise_report", wrong_save["error"])
+        mismatch_report = mcp_server.revise_report(100, "错报告", None, preview_id=rev_preview["preview_id"])
+        mismatch_ver = mcp_server.revise_report(99, "错版本", None, base_version=1, preview_id=rev_preview["preview_id"])
+        self.assertFalse(mismatch_report["ok"])
+        self.assertFalse(mismatch_ver["ok"])
+        with patch.object(mcp_server.services, "revise_report", return_value={
+            "id": 99, "revision": 3, "url": "u", "content_url": "c", "download_url": "d",
+        }) as rev_mock:
+            ok_rev = mcp_server.revise_report(99, "修订报告", None, preview_id=rev_preview["preview_id"])
+        self.assertTrue(ok_rev["ok"], ok_rev)
+        self.assertEqual(rev_mock.call_args.kwargs["html"], revised_draft)
+        self.assertEqual(rev_mock.call_args.kwargs["base_version"], 2)
+
+    def test_snapshot_query_returns_up_to_200_sample_rows_without_truncation(self):
+        big_connector = APIConnector(self.source, "")
+        big_rows = {"Orders": [{"id": i, "region": "华东", "value": i} for i in range(1, 101)]}
+        big_connector.fetch = big_rows.__getitem__
+        with patch.object(mcp_server.services, "get_connector", return_value=big_connector):
+            res = mcp_server.run_query(1, "SELECT id, region, value FROM Orders ORDER BY id",
+                                       None, snapshot=True, sample_rows=100)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["row_count"], 100)
+        self.assertEqual(len(res["sample_rows"]), 100)
+        self.assertFalse(res["sample_limited"])
+
 
 if __name__ == "__main__":
     unittest.main()

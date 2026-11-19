@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import URL, Engine
 
 from ..config import settings
+from ..telemetry import measure
 from .base import Connector, ConnectorError, ensure_readonly, norm_columns, norm_value, value_options
 
 DEFAULT_PORTS = {"mysql": 3306, "starrocks": 9030, "postgresql": 5432, "oracle": 1521}
@@ -84,7 +85,8 @@ class SQLConnector(Connector):
     # ---------------- helpers ----------------
     def _run(self, sql: str, params: Any = None, limit: int | None = None, *, normalize: bool = True) -> tuple[list[str], list[list]]:
         try:
-            with self.engine.connect() as c:
+            # 包含连接池等待、执行和取回结果；不把 SQL 文本或查询参数写入计时日志。
+            with measure("sql.execute"), self.engine.connect() as c:
                 if params is None:
                     res = c.execution_options(no_parameters=True).exec_driver_sql(sql)
                 else:

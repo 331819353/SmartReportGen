@@ -1,6 +1,6 @@
 # SmartReportGen 部署文档
 
-本文覆盖：环境要求 → 部署 → 配置 → **单点登录（海尔 IAM）** → 生产加固 → 初始化 → 接入 Agent（Claude Code / Codex / 其他）→ 运维 → 故障排查。
+本文按章节顺序覆盖：架构 → 环境要求 → 快速部署 → 配置说明 → **单点登录与身份（海尔 IAM）** → 生产加固 → 内网 / 离线部署 → 初始化 → 运维 → 接入 Agent（Claude Code / Codex / 其他）→ 故障排查。
 
 ---
 
@@ -45,7 +45,7 @@
 | Docker | Docker Engine ≥ 24，Compose v2（`docker compose`） |
 | 资源 | 最低 2 vCPU / 4 GB 内存 / 10 GB 磁盘。空闲时实测内存约：api 135 MB、mcp 130 MB、postgres 40 MB；报告渲染时按查询数据量增加 |
 | 镜像体积 | `smartreportgen` 约 630 MB，`pgvector/pgvector:pg16` 约 965 MB |
-| 构建期网络 | 访问 PyPI（或内网镜像，见 §6）；Docker Hub（或内网镜像仓库） |
+| 构建期网络 | 访问 PyPI（或内网镜像，见[第 7 节：内网 / 离线部署](#7-内网--离线部署)）；Docker Hub（或内网镜像仓库） |
 | 运行期网络 | 容器能访问：业务数据源、AI 网关（向量接口）、海尔 IAM（`HAIER_IAM_HOST`）。用户浏览器能访问 IAM 登录页。报告页面的 ECharts 已内置，**浏览器无需外网** |
 | IAM 应用 | 在海尔 IAM 为 SmartReportGen 申请（或复用）应用，取得 Client ID / Secret，并登记回调地址 `{PUBLIC_BASE_URL}/auth/iam/callback` |
 
@@ -144,12 +144,37 @@ docker compose logs -f api # 首次启动可看到建表、迁移与向量化日
 |---|---|---|
 | `QUERY_MAX_ROWS` | 50000 | 报告单个查询的最大行数。快照模式超出时返回截断标记，调整查询后再创建快照 |
 | `QUERY_TIMEOUT_SECONDS` | 60 | 数据源查询超时 |
+| `SCHEMA_CACHE_SECONDS` | 300 | 数据库字段元数据缓存秒数，0 禁用；不缓存业务查询或权限 |
 | `SEED_DEMO` | true | 首次启动是否写入演示数据源、数据集、员工与授权 |
 | `DEMO_READER_PASSWORD` | demo_reader_pwd | 演示只读账号密码 |
 
 修改 `.env` 后执行 `docker compose up -d` 使其生效（会重建对应容器）。
 
-快照查询把 JSON 写入 `/srv/report-work` 对应的私有 Compose 卷 `report-work`。MCP 写入查询快照和预览 HTML，管理 API 只读访问预览文件。工作文件按工号隔离，24 小时后失效，后续写入时清理。每个 JSON 快照上限为 32 MiB。独立部署时可用 `REPORT_WORK_DIR` 指定共享目录。报告保存时完整数据已内联到该版本的 HTML 中。
+快照查询把 JSON 写入 `/srv/report-work` 对应的私有 Compose 卷 `report-work`（同时保存临时样式文件 `.css`、预览文件 `.html` 及预览源元信息 `.meta.json`）。MCP 写入工作文件，管理 API 只读访问预览文件。工作文件按工号隔离，24 小时后失效，后续写入时清理。每个 JSON 快照上限为 32 MiB。独立部署时可用 `REPORT_WORK_DIR` 指定共享目录。报告保存时完整数据与内置资源已内联到该版本的 HTML 中。
+
+#### 探查成本与耗时排查
+
+报告生成优先调用 `describe_tables(dataset_id, include_profile=true)`：每页最多 20 张授权表，服务内部对单页多表使用有界并发（最多 4 并发）一次返回各表字段、样本和轻量画像，默认每表最多读取 100 行，不执行 `COUNT` 或全范围 `MIN/MAX`。`describe_table` 默认也使用 `mode="light"`；需要总行数与数值/日期字段最值时显式传 `mode="full"`，恢复最多 2,000 行画像及全范围统计。两种模式都必须另行用直接事实核实业务覆盖、唯一性和结论；`row_count_status="not_requested"` 表示未查询，不是零行。
+
+`sample_rows` 控制响应展示行数，`profile_rows` 控制画像采样行数（0–2,000）；默认轻量模式下 `sample_rows=0` 且省略 `profile_rows` 时不执行样本查询。`run_query(snapshot=true, sample_rows=...)` 最多可返回 200 行样本（样本预览字节预算按需扩展至 64 KiB），≤200 行的正式事实查询可一次同时取得完整核数证据与 `snapshot_id`。数据库的 `LIMIT` 约束读取结果；HTTP API 数据源在 `cache_seconds` 有效期内复用预序列化的 NDJSON 文本以减少重复序列化开销，但首次拉取仍须读取源接口记录后再载入 DuckDB，100 行画像不等于源接口只传输 100 行。管理台的 HTTP 探查接口继续使用完整模式，保留既有调用行为。
+
+此外，推荐 Agent 调用 `get_style_rules(..., include_css=false)` 获取 `style_id`，在源 HTML 中使用 `<style data-srg-style>`、`<script data-srg-vendor="echarts">` 与 `<script id="srg-formatters" data-srg-asset="report-formatters.js">` 占位标签交由服务端展开，并在通过审核门禁后于 `save_report` / `revise_report` 中直接传入预览返回的 `preview_id`，减少大文本往返传输。
+
+字段缓存随数据源连接器隔离，数据源修改后自动更换连接器；每次工具调用仍先校验当前权限。数据库字段发生变化时用 `refresh_schema=true` 刷新探查结果，或将 `SCHEMA_CACHE_SECONDS` 设为 0；API 字段来自记录推断，不叠加字段缓存。
+
+MCP 同步工具在线程池中执行，慢查询不会占用整个事件循环。成功的字典响应附带 `timing`：
+
+```json
+{"timing":{"request_id":"调用标识","elapsed_ms":123.4,"stages":{"query.execute":{"calls":1,"elapsed_ms":110.2},"snapshot.write":{"calls":1,"elapsed_ms":2.1}}}}
+```
+
+每次工具执行都会写入 `event="tool_timing"` 日志，包括失败；字符串指南和代码资产保持原文，错误响应保持原协议，通过日志定位计时。日志只记录工具名、调用标识、状态和耗时，不记录 SQL、业务值或令牌。
+
+```sh
+docker compose logs --since=1h --timestamps mcp | rg '"event": "tool_timing"'
+```
+
+`elapsed_ms` 是工具在线程池内的执行时间，不含线程池排队、IAM 验证、网络传输和模型思考；`sql.execute` 含数据库连接池等待、执行和取回结果。各阶段可能嵌套或重复调用，不能相加当作端到端耗时。网关日志的 `request_time` 与 `upstream_time` 用于识别 HTTP 层等待；同时记录 Agent 取数、模板、HTML 开发、浏览器验收的阶段起止时间，才能判断一份报告的完整耗时。已有展示门禁和修订后的完整复核要求保持生效。
 
 ## 5. 单点登录与身份
 
@@ -168,7 +193,7 @@ docker compose logs -f api # 首次启动可看到建表、迁移与向量化日
 1. 在 IAM 为 SmartReportGen 申请应用（或经同意复用已有应用），登记回调地址：`{PUBLIC_BASE_URL}/auth/iam/callback`（如 `https://report.example.com/auth/iam/callback`）。
 2. 在 `.env` 填 `HAIER_IAM_CLIENT_ID`、`HAIER_IAM_CLIENT_SECRET`、`IAM_BOOTSTRAP_ADMINS`，然后 `docker compose up -d`。
 3. 首批管理员用 IAM 登录 → 「员工与授权」中为员工或角色授权。员工首次使用 IAM Bearer 接入或首次登录时会自动注册为普通用户（角色 `user`，无权限）；若希望全员都能看某些数据，对角色 `user` 授权即可。
-4. 员工在 Codex CLI 运行 `codex mcp login smartreportgen`，按浏览器提示完成海尔 IAM 登录。其他客户端的配置见「接入 Agent」。
+4. 员工在 Codex CLI 运行 `codex mcp login smartreportgen`，按浏览器提示完成海尔 IAM 登录。其他客户端的配置见[第 10 节：接入 Agent](#10-接入-agent)。
 
 IAM 接口约定（与海尔 IAM 实际行为一致）：
 - 登录跳转：`{HOST}/oauth/authorize`
@@ -203,7 +228,7 @@ IAM 接口约定（与海尔 IAM 实际行为一致）：
    ```bash
    docker compose exec postgres psql -U report -d smartreportgen -c "DROP SCHEMA demo_retail, demo_supply CASCADE; DROP ROLE demo_reader;"
    ```
-8. **备份**：按 §9.2 配置每日 `pg_dump`。
+8. **备份**：按[第 9.2 节：备份与恢复](#92-备份与恢复)配置每日 `pg_dump`。
 
 ### 反向代理（Nginx 示例）
 
@@ -389,7 +414,7 @@ curl -s -X POST https://report.example.com/mcp \
 
 | 现象 | 可能原因与处理 |
 |---|---|
-| 构建时 pip 报 SSL / 超时 | 网络不稳或无法访问 PyPI：重试，或按 §7 使用 `PIP_INDEX_URL` 镜像 |
+| 构建时 pip 报 SSL / 超时 | 网络不稳或无法访问 PyPI：重试，或按[第 7 节：内网 / 离线部署](#7-内网--离线部署)使用 `PIP_INDEX_URL` 镜像 |
 | `api` 一直 unhealthy | `docker compose logs api`：数据库未就绪、`.env` 配置错误、端口占用 |
 | 端口被占用 | 应用入口修改 `API_HOST_PORT`，并同步调整对外地址与 IAM 回调。数据库运维端口使用 `PG_HOST_PORT` |
 | agent 调 MCP 返回 401 | Codex CLI 可重新运行 `codex mcp login smartreportgen`，并确认 IAM 已配置。使用 Bearer 配置的客户端应检查启动时是否设置了有效令牌。响应体中有具体原因 |

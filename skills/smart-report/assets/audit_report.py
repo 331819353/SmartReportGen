@@ -14,6 +14,7 @@ SURFACES = ('prose', 'cards', 'tables', 'charts', 'formatters', 'empty')
 BEHAVIORS = ('facts', 'filters_reset', 'sign_threshold_boundaries', 'missing_zero_duplicate_scale',
              'offline', 'desktop_narrow')
 STATES = ('up', 'down', 'neutral', 'met', 'miss')
+EXPAND_MARKERS = ('data-srg-snapshot', 'data-srg-vendor', 'data-srg-asset', 'data-srg-style')
 # 仅固定版本的纯库脚本可跳过应用格式化扫描；改名、data 属性及未知摘要均不能豁免。
 VENDOR_HASHES = {'52958d5fee0a05e911c340b414836f8a23c383b24fd69fdc2a8a2bff2b362692'}
 BANNED = re.compile(r'百分点|(?<![\w])(?:pp|pct)(?![\w])|(?<=[\d%])(?:pp|pct)(?![a-z])', re.I)
@@ -34,10 +35,12 @@ class Document(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.scripts: list[dict] = []
         self.styles: list[str] = []
+        self.style_tags: list[dict] = []
         self.visible: list[str] = []
         self.errors: list[str] = []
         self.ids: set[str] = set()
         self.current: dict | None = None
+        self.current_style: dict | None = None
         self.in_style = False
         self.feed(text)
         self.close()
@@ -54,6 +57,8 @@ class Document(HTMLParser):
             if 'src' in attrs:
                 self.errors.append('R-06 脚本必须内联原文，不能用 data URL 绕过代码审计')
         if tag == 'style':
+            self.current_style = {'attrs': attrs, 'text': ''}
+            self.style_tags.append(self.current_style)
             self.in_style = True
         if any(key.lower().startswith('on') for key in attrs):
             self.errors.append('R-08 禁止行内事件脚本；请放入统一应用脚本')
@@ -85,12 +90,15 @@ class Document(HTMLParser):
             self.current = None
         if tag == 'style':
             self.in_style = False
+            self.current_style = None
 
     def handle_data(self, data):
         if self.current is not None:
             self.current['text'] += data
         elif self.in_style:
             self.styles.append(data)
+            if self.current_style is not None:
+                self.current_style['text'] += data
         else:
             self.visible.append(data)
 
@@ -122,19 +130,59 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
         errors.append('R-09 缺少完整的 up/down/neutral/met/miss 六位色值')
     canonical = Path(__file__).with_name('report-formatters.js').read_text(encoding='utf-8').strip()
     helpers = [s for s in doc.scripts if s['attrs'].get('id') == 'srg-formatters']
-    if len(helpers) != 1 or helpers[0]['text'].strip() != canonical or helpers[0]['attrs'].get('type', '') not in (
-            '', 'text/javascript', 'application/javascript'):
-        errors.append('R-08 必须原文内联唯一 report-formatters.js，禁止局部改写或伪造入口')
+
+    def _valid_helper(script: dict, *, allow_placeholder: bool) -> bool:
+        hattrs = script['attrs']
+        htext = script['text'].strip()
+        asset_ref = hattrs.get('data-srg-asset')
+        htype = hattrs.get('type', '').split(';', 1)[0].strip().lower()
+        if 'src' in hattrs or htype not in ('', 'text/javascript', 'application/javascript'):
+            return False
+        if htext == canonical and asset_ref in (None, 'embedded'):
+            return True
+        if allow_placeholder and asset_ref == 'report-formatters.js' and htext == '':
+            return True
+        return False
+
+    if len(helpers) != 1 or not _valid_helper(helpers[0], allow_placeholder=not expanded):
+        if len(helpers) == 1 and expanded and helpers[0]['attrs'].get('data-srg-asset') == 'report-formatters.js':
+            errors.append('R-08 展开文件必须原文内联 report-formatters.js，不能保留未展开的 data-srg-asset')
+        else:
+            errors.append('R-08 必须原文内联唯一 report-formatters.js，禁止局部改写或伪造入口')
     elif contracts and doc.scripts.index(contracts[0]) > doc.scripts.index(helpers[0]):
         errors.append('R-08 展示契约必须位于格式化模块之前')
     if contract.get('rate_symbols') == 'percent-only':
         # 逐节点及合并文本都扫描，捕捉“百<span>分</span>点”等拆分文案。
         if any(BANNED.search(s) for s in doc.visible) or BANNED.search(''.join(doc.visible)):
             errors.append('R-07 展示文字/属性包含 pp、百分点或 pct')
+    for style_tag in doc.style_tags:
+        sattrs, stext = style_tag['attrs'], style_tag['text'].strip()
+        if any(m in sattrs for m in ('data-srg-snapshot', 'data-srg-vendor', 'data-srg-asset')):
+            errors.append('R-06 <style> 标签不支持脚本展开属性')
+        if 'data-srg-style' in sattrs:
+            style_ref = (sattrs.get('data-srg-style') or '').strip()
+            if not style_ref:
+                errors.append('R-06 data-srg-style 缺少样式引用值')
+            elif expanded:
+                if style_ref != 'embedded' or not stext:
+                    errors.append('R-06 展开文件仍有未展开的 data-srg-style 引用')
+            else:
+                if style_ref != 'embedded' and stext:
+                    errors.append('R-06 源文档待展开的 data-srg-style 标签正文必须为空')
+                elif style_ref == 'embedded' and not stext:
+                    errors.append('R-06 data-srg-style="embedded" 样式内容为空')
     snapshot_count = 0
     for script in doc.scripts:
         attrs, code = script['attrs'], script['text']
+        if len([m for m in EXPAND_MARKERS if m in attrs]) > 1:
+            errors.append('R-06 单个标签不能同时使用多种 data-srg 展开属性')
+        if 'data-srg-style' in attrs:
+            errors.append('R-06 data-srg-style 只能用于 <style> 标签')
+        if 'data-srg-asset' in attrs and attrs.get('id') != 'srg-formatters':
+            errors.append('R-08 data-srg-asset 仅允许用于 id="srg-formatters" 的格式化脚本')
         if attrs.get('type') == 'application/json':
+            if 'data-srg-vendor' in attrs or 'data-srg-asset' in attrs:
+                errors.append('R-06 运行时/格式化模块不能使用 application/json 类型')
             # 原始 JSON 字段名、单位与规则原文不当作已展示的标签；绑定后的输出仍须浏览器复核。
             if attrs.get('data-srg-snapshot'):
                 snapshot_count += 1
@@ -146,9 +194,21 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
                     except (ValueError, AttributeError):
                         errors.append('R-06 展开文件仍有空引用或无效快照')
             continue
-        if attrs.get('id') == 'srg-formatters' and code.strip() == canonical:
+        if attrs.get('id') == 'srg-formatters' and _valid_helper(script, allow_placeholder=not expanded):
             continue
-        if digest(code.strip()) in VENDOR_HASHES:
+        script_type = attrs.get('type', '').split(';', 1)[0].strip().lower()
+        if 'data-srg-vendor' in attrs:
+            vendor_ref = attrs.get('data-srg-vendor')
+            valid_vtype = 'src' not in attrs and script_type in ('', 'text/javascript', 'application/javascript')
+            if not expanded and vendor_ref == 'echarts' and not code.strip() and valid_vtype:
+                continue
+            if vendor_ref == 'embedded' and digest(code.strip()) in VENDOR_HASHES and valid_vtype:
+                continue
+            if expanded and vendor_ref == 'echarts':
+                errors.append('R-06 展开文件仍有未展开的内置运行时引用 data-srg-vendor')
+            else:
+                errors.append('R-06 非法或伪造的 data-srg-vendor 内置运行时引用')
+        elif 'data-srg-asset' not in attrs and digest(code.strip()) in VENDOR_HASHES:
             continue
         if helpers and doc.scripts.index(script) < doc.scripts.index(helpers[0]):
             errors.append('R-08 应用脚本必须位于格式化模块之后')

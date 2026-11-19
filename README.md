@@ -6,13 +6,13 @@
 用户需求 ──► Skill（smart-report，编排流程与分析方法）
               │  Authorization: Bearer <海尔 IAM access token>
               ▼ MCP（smartreportgen，Streamable HTTP）── 工号 → 权限表 → 可用业务场景/数据表（默认拒绝）
-   a 混合检索业务场景 → 获取数据表      search_business_scenarios / get_dataset_tables
-   b 探查各表并获取证据与数据快照          describe_tables / describe_table / run_query
-   c 全局筛选（级联 / 预设 / 图表点击联动）
-   d 通用规则（设计令牌）+ 场景规则        get_style_rules
-   d 与 e 之间 整理并保存业务 Markdown 模板  save_report_template / get_report_template
-   e Agent 编写引用快照的 HTML，预览验证后保存     preview_report_html / save_report（关联模板版本）
-   f 查看或修订报告                     get_report / revise_report
+   1. 混合检索业务场景 → 获取数据表       search_business_scenarios / get_dataset_tables
+   2. 探查各表并获取证据与数据快照         describe_tables / describe_table / run_query
+   3. 全局筛选（级联 / 预设 / 图表点击联动）
+   4. 通用规则（设计令牌）+ 场景规则       get_style_rules
+   5. 整理并保存业务 Markdown 模板       save_report_template / get_report_template
+   6. Agent 编写引用快照的 HTML，预览验证后保存  preview_report_html / save_report（关联模板版本）
+   7. 查看或修订报告                    get_report / revise_report
               │
               ▼
    PostgreSQL + pgvector（按类型分 schema）  ◄──  管理台（数据源 / 数据集 / 报告模板 / 报告 / 样式规则 / 员工与授权）

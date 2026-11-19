@@ -4,7 +4,7 @@
 Codex CLI 可运行 `codex mcp login smartreportgen` 完成海尔 IAM 登录。下方 Bearer 配置示例从环境变量 `SMARTREPORT_TOKEN` 读取令牌或由客户端交互输入。令牌应存放在本机的凭证存储中。
 令牌来源：客户端或 agent 宿主从海尔 IAM 取得 access token（服务端向 IAM 核实）。
 若宿主把 IAM 票放在自定义头里，可配置为 `X-IAM-Access-Token: <IAM 票>`（如 Codex 的 `env_http_headers`）。
-详细步骤见 [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) 的「接入 Agent」一节。
+详细步骤见[部署文档第 10 节：接入 Agent](../docs/DEPLOYMENT.md#10-接入-agent)。报告流程见[技能流程总览](../skills/smart-report/SKILL.md#流程总览)，新报告按第 1–6 步执行，查看或修订已有报告使用第 7 步。
 
 | Agent | MCP 配置放在 | 本目录模板 | 技能目录 | 验证情况 |
 |---|---|---|---|---|
