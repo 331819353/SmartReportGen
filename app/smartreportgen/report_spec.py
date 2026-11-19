@@ -19,13 +19,67 @@ from .report_queries import FieldName, Key, QueryPlan, Scalar, StrictModel, scop
 
 ASSET = Path(__file__).with_name("static") / "report" / "compiled.js"
 TOKEN = re.compile(r"\{\{([a-z][a-z0-9_]{0,47})(\.state)?\}\}")
-BARE_NUMBER = re.compile(r"\d|[零〇一二两三四五六七八九十百千万亿]+(?:元|吨|件|家|人|台|个|成|倍|%|％|个百分点)")
+_INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]+")
+_CHINESE_DIGITS = "零〇一二两三四五六七八九十壹贰叁肆伍陆柒捌玖拾"
+CHINESE_VALUE = re.compile(
+    rf"[{_CHINESE_DIGITS}][{_CHINESE_DIGITS}百佰千仟万萬亿億]*(?:[万萬亿億]?元|吨|千克|公斤|件|台|套|单|笔|家|人|个|成|倍|[%％]|个百分点|百分点)"
+    rf"|[百千万萬]分之[{_CHINESE_DIGITS}]"
+)
+_COMMON_CODES = re.compile(
+    r"(?<![A-Za-z0-9])(?:B2B|B2C|C2C|C2M|O2O|D2C|G2B|2B|2C|3C|4G|5G|6G|IPv6|Web3|Tier\s*\d+|Top\s*\d+|L[1-5]|P[0-4]|N-\d+|T\+\d+|[ckm]?m[²³]|CO₂)(?![A-Za-z0-9%％])",
+    re.I,
+)
+_LABEL_CALENDAR = re.compile(
+    r"(?<![\d.])20\d{2}年(?:\d{1,2}月(?:\d{1,2}日)?)?"
+    r"|(?<![\d.])20\d{2}[-/.](?:0?[1-9]|1[0-2])(?:[-/.](?:0?[1-9]|[12]\d|3[01]))?(?![\d%％])"
+    r"|(?<!\d)20\d{2}(?:0[1-9]|1[0-2])(?![\d%％])"
+    r"|(?<![A-Za-z0-9])(?:20\d{2}\s*)?(?:Q[1-4]|H[12])(?![A-Za-z0-9%％])"
+    r"|第[一二三四五六七八九十\d]{1,2}(?:季度|章|节|部分|阶段|梯队|步|周)"
+    r"|(?<![\d.个])(?:1[0-2]|[1-9])月(?:份|\d{1,2}日)?(?![\d%％])"
+)
+_LABEL_INDEX = re.compile(r"^\s*(?:[（(]?\d{1,2}[)）]|[①-⑳]|\d{1,2}[.、])(?=\s*[^\d.%％\s])")
+_PROSE_CALENDAR = re.compile(
+    r"(?<![\d.])20\d{2}年(?:\d{1,2}月(?:\d{1,2}日)?)?"
+    r"|(?<![A-Za-z0-9])(?:20\d{2}\s*)?(?:Q[1-4]|H[12])(?![A-Za-z0-9%％])"
+    r"|(?<![\d.个])(?:1[0-2]|[1-9])月(?:份|\d{1,2}日)?(?![\d%％])"
+)
+_PROSE_LIST = re.compile(r"(?:^|[\n；;。！？：:|])\s*(?:[（(]\d{1,2}[)）]|[①-⑳]|\d{1,2}[.、])(?=\s*(?:[^\d.%％\s]|$))")
+_PROSE_ORDINAL = re.compile(r"第[一二三四五六七八九十\d]{1,2}(?:季度|章|节|部分|阶段|梯队|步|周)")
+_PROSE_IDIOM = re.compile(
+    r"再上一个台阶|更上一层楼|一家独大|成千上万|百倍信心|十倍努力|九成把握|三位一体|合二为一|一分为二|独当一面|举一反三|三令五申|五湖四海|千家万户|万无一失|百尺竿头"
+    r"|个性化|个人|个别|个体"
+    r"|[一二两三四五六七八九十]+个(?:维度|方面|阶段|问题|核心|关键|抓手|方向|层次|层级|特征|特点|原则|结论|章节|模块|部分|环节|步骤|口径|视角|假设|原因|因素|建议|动作|策略|目标|指标|场景)"
+)
 DECIMAL = Annotated[str, Field(pattern=r"^[+-]?\d+(?:\.\d+)?$", max_length=100)]
 Text = Annotated[str, Field(min_length=1, max_length=300)]
 HEX = Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")]
 State = Literal["up", "down", "neutral", "met", "miss", "warning"]
 CHART_TYPES = ("bar", "line", "area", "pie", "donut", "combo", "waterfall")
 RADIAL_TYPES = ("pie", "donut")
+
+
+def check_unbound_numbers(text: str, where: str, *, mode: Literal["prose", "label", "unit"] = "prose") -> None:
+    """精准拦截未绑定的业务数字与中文定量表达；放行日历账期、列表序号、通用代号和结构量词。"""
+    cleaned = _INVISIBLE.sub("", text)
+    if mode == "unit":
+        compact = re.sub(r"\s+", "", cleaned)
+        if CHINESE_VALUE.search(compact) or any(char.isdecimal() for char in compact):
+            raise ValueError(f"{where} 含未绑定数字，请使用数据槽位")
+        return
+    if mode == "label":
+        cleaned = _LABEL_CALENDAR.sub(" ", cleaned)
+        cleaned = _COMMON_CODES.sub(" ", cleaned)
+        cleaned = _LABEL_INDEX.sub(" ", cleaned)
+        cleaned = _PROSE_IDIOM.sub(" ", cleaned)
+    else:
+        cleaned = _PROSE_IDIOM.sub(" ", cleaned)
+        cleaned = _PROSE_CALENDAR.sub(" ", cleaned)
+        cleaned = _COMMON_CODES.sub(" ", cleaned)
+        cleaned = _PROSE_ORDINAL.sub(" ", cleaned)
+        cleaned = _PROSE_LIST.sub(" ", cleaned)
+    compact = re.sub(r"\s+", "", cleaned)
+    if CHINESE_VALUE.search(compact) or any(char.isnumeric() and not char.isalpha() for char in compact):
+        raise ValueError(f"{where} 含未绑定数字，请使用数据槽位")
 
 
 def resolve_report_theme(values: dict) -> dict:
@@ -137,12 +191,20 @@ class WaterfallStyle(StrictModel):
         return self
 
 
+class CardSource(StrictModel):
+    query: Key
+    by: dict[Key, FieldName] = Field(default_factory=dict, max_length=8)
+    where: dict[FieldName, Scalar] = Field(default_factory=dict, max_length=8)
+
+
 class Card(StrictModel):
     title: Text
     type: Literal["kpi", "table", "bar", "line", "area", "pie", "donut", "combo", "waterfall"]
     metric: Key | None = None
     query: Key | None = None
     by: dict[Key, FieldName] = Field(default_factory=dict, max_length=8)
+    where: dict[FieldName, Scalar] = Field(default_factory=dict, max_length=8)
+    sources: list[CardSource] = Field(default_factory=list, max_length=16)
     columns: list[Column] = Field(default_factory=list, max_length=12)
     limit: int = Field(default=50, ge=1, le=200)
     span: int | None = Field(default=None, ge=1, le=12)
@@ -150,15 +212,27 @@ class Card(StrictModel):
     chart: ChartStyle | None = None
     waterfall: WaterfallStyle | None = None
 
+    def resolved_sources(self) -> list[CardSource]:
+        if self.sources:
+            return self.sources
+        if self.query is not None:
+            return [CardSource(query=self.query, by=self.by, where=self.where)]
+        return []
+
     @model_validator(mode="after")
     def validate_card(self):
         if self.waterfall is not None and self.type != "waterfall":
             raise ValueError("waterfall 配置只适用于瀑布图")
         if self.type == "kpi":
-            if not self.metric or self.query or self.columns or self.by:
+            if not self.metric or self.query or self.sources or self.columns or self.by or self.where:
                 raise ValueError("指标卡只引用一个 metric")
-        elif self.metric or not self.query or not self.columns:
-            raise ValueError("图表、表格须声明 query 和 columns")
+        else:
+            has_single = self.query is not None
+            has_multi = bool(self.sources)
+            if self.metric or has_single == has_multi or not self.columns:
+                raise ValueError("图表、表格须声明 columns，且 query 与 sources 必须选择一种")
+            if has_multi and (self.by or self.where):
+                raise ValueError("使用 sources 时，筛选映射与固定条件请写在各 source 内")
         if self.type not in CHART_TYPES:
             if self.chart is not None or any(c.series or c.axis != "primary" for c in self.columns):
                 raise ValueError("chart、series 与 axis 只适用于图表卡片")
@@ -216,7 +290,7 @@ class ReportDefinition(StrictModel):
     colors: dict[State, HEX] = Field(default_factory=dict)
     theme: dict[str, Any] = Field(default_factory=dict, max_length=100)
 
-    def validate_bindings(self, used_metrics: set[str], *, allow_text: bool = False):
+    def validate_bindings(self, used_metrics: set[str], *, allow_text: bool = True):
         self.theme = resolve_report_theme(self.theme)
         filters = {f.id for f in self.filters}
         if len(filters) != len(self.filters):
@@ -228,9 +302,11 @@ class ReportDefinition(StrictModel):
                 raise ValueError(f"指标 {key} 包含重复、未知筛选映射或不受支持的文本格式")
         aliases = set()
         for _, card in self.card_outputs():
-            if set(card.by) - filters:
-                raise ValueError(f"卡片「{card.title}」含未知筛选器")
-            aliases.add(card.query)
+            sources = card.resolved_sources()
+            variants = {frozenset(src.by) for src in sources}
+            if len(variants) != len(sources) or any(v - filters for v in variants):
+                raise ValueError(f"卡片「{card.title}」含重复或未知筛选器映射")
+            aliases.update(src.query for src in sources)
         if used_metrics - self.metrics.keys():
             raise ValueError(f"页面引用未定义指标 {sorted(used_metrics - self.metrics.keys())}")
         if self.metrics.keys() - used_metrics:
@@ -249,19 +325,23 @@ class ReportSpec(ReportDefinition):
     def card_outputs(self):
         for index, section in enumerate(self.sections, 1):
             for number, card in enumerate(section.cards):
-                if card.query is not None:
+                if card.type != "kpi":
                     yield f"card-{index}-{number}", card
 
     @model_validator(mode="after")
     def validate_layout(self):
         used_metrics = set()
         for section in self.sections:
-            plain = TOKEN.sub("", section.narrative)
-            if "{{" in plain or "}}" in plain or BARE_NUMBER.search(plain):
+            plain = TOKEN.sub("\uFFFC", section.narrative)
+            if "{{" in plain or "}}" in plain:
                 raise ValueError(f"章节「{section.title}」的定量正文须通过 {{{{metric}}}} 绑定")
+            try:
+                check_unbound_numbers(plain, f"章节「{section.title}」", mode="prose")
+            except ValueError as exc:
+                raise ValueError(f"章节「{section.title}」的定量正文须通过 {{{{metric}}}} 绑定") from exc
             used_metrics.update(match[1] for match in TOKEN.finditer(section.narrative))
             used_metrics.update(card.metric for card in section.cards if card.metric is not None)
-        self.validate_bindings(used_metrics)
+        self.validate_bindings(used_metrics, allow_text=True)
         return self
 
 
@@ -295,7 +375,7 @@ def decode_template(markdown: str) -> tuple[ReportDefinition, int] | None:
 
 
 def validate_scopes(scopes: list[dict], principal) -> None:
-    """交付前验证当前表授权以及当时的场景行范围，无法证明包含时拒绝交付。"""
+    """交付前验证当前表授权、物理来源指纹及场景行范围，改密码或无关配置不影响历史报告。"""
     from . import repo
 
     acc = access_for(principal)
@@ -314,7 +394,13 @@ def validate_scopes(scopes: list[dict], principal) -> None:
             if ds_source not in sources:
                 sources[ds_source] = repo.get_datasource(ds_source)
             source = sources[ds_source]
-            if not source["enabled"] or scope_for(ds_id, dataset, source, recorded["tables"]) != recorded:
+            current = scope_for(ds_id, dataset, source, recorded["tables"])
+            if (not source["enabled"]
+                    or current["dataset_id"] != recorded.get("dataset_id")
+                    or current["source_id"] != recorded.get("source_id")
+                    or current["tables"] != recorded.get("tables")
+                    or current["scope_sha256"] != recorded.get("scope_sha256")
+                    or ("source_target" in recorded and current["source_target"] != recorded["source_target"])):
                 raise PermissionDenied("报告数据源或行范围已变化，请重新取数")
         except repo.NotFound as exc:
             raise PermissionDenied("报告来源已删除，无法核实该版本的数据权限") from exc
@@ -328,10 +414,11 @@ def _get_fields(spec: ReportDefinition) -> dict[str, set[str]]:
         for source in metric.sources:
             required.setdefault(source.query, set()).update({source.field, *source.by.values(), *source.where})
     for _, card in spec.card_outputs():
-        selection = required.setdefault(card.query, set())
-        selection.update({*card.by.values(), *(c.field for c in card.columns)})
-        if card.waterfall and card.waterfall.role_field:
-            selection.add(card.waterfall.role_field)
+        for src in card.resolved_sources():
+            selection = required.setdefault(src.query, set())
+            selection.update({*src.by.values(), *src.where, *(c.field for c in card.columns)})
+            if card.waterfall and card.waterfall.role_field:
+                selection.add(card.waterfall.role_field)
     return required
 
 
@@ -348,13 +435,17 @@ def _project(spec: ReportDefinition, snapshots: dict[str, dict], dataset_id: int
         batches = {origin.get("batch") for origin in origins.values()}
         if len(batches) != 1 or None in batches:
             raise ValueError("多个快照必须来自同一次一致性取数计划")
-    for binding, fmt in [(source, metric.format) for metric in spec.metrics.values() for source in metric.sources] + [
-        (Source(query=c.query, field=column.field), column.format)
-        for _, c in spec.card_outputs() for column in c.columns
-    ]:
-        official = origins[binding.query].get("scales", {}).get(binding.field)
+    bindings = [
+        (source.query, source.field, metric.format)
+        for metric in spec.metrics.values() for source in metric.sources
+    ] + [
+        (src.query, column.field, column.format)
+        for _, c in spec.card_outputs() for src in c.resolved_sources() for column in c.columns
+    ]
+    for query_name, field_name, fmt in bindings:
+        official = origins[query_name].get("scales", {}).get(field_name)
         if official is not None and (fmt.scale != official or fmt.kind == "text"):
-            raise ValueError(f"字段 {binding.field} 的展示尺度与官方指标配置不一致")
+            raise ValueError(f"字段 {field_name} 的展示尺度与官方指标配置不一致")
     output = {}
     for name, selection in fields.items():
         payload = snapshots[name]
@@ -371,6 +462,11 @@ def _project(spec: ReportDefinition, snapshots: dict[str, dict], dataset_id: int
 
 def _script_json(data) -> str:
     return json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).replace("<", "\\u003c")
+
+
+@cache
+def _compiled_runtime() -> str:
+    return ASSET.read_text(encoding="utf-8")
 
 
 @cache
@@ -438,7 +534,7 @@ def _structured_layout(spec, theme, controls):
 def _document(spec, data, scopes, theme, rules, body, layout_css):
     # 离线文件只执行内置脚本，业务数据通过 JSON 进入运行时。
     css = report_data._escape_style_text(design.report_css(theme))
-    runtime = ASSET.read_text(encoding="utf-8")
+    runtime = _compiled_runtime()
     outputs = list(spec.card_outputs())
     charts = any(card.type in CHART_TYPES for _, card in outputs)
     vendor = '<script data-srg-vendor="echarts"></script>' if charts else ''

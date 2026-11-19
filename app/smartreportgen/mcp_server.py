@@ -30,11 +30,13 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from psycopg.errors import UniqueViolation
+
 from . import auth, db, design, repo, report_data, report_free, report_pipeline, report_queries, report_spec, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
-from .permission import Access, PermissionDenied, access_for
+from .permission import Access, PermissionDenied, access_for, source_scene_tables
 from .scenario_filters import effective_filters
 from .renderer import RenderError, validate as validate_md
 from .report_document import inline_legacy_echarts, report_document_error, skill_dir
@@ -61,10 +63,10 @@ def _skill_body() -> str:
 
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP。用 get_skill_guide 获取从报告分流到验收保存的主流程。
 先区分新建与修订。修订用报告链接或 list_reports 定位，多个匹配候选先请用户确认，再按 get_report 返回的 revision 锁定基准。
-新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景时，给出 scenario_management_url，引导用户选已有授权的数据源构建场景。
-已知场景后先读 get_dataset_tables 的分析思路，再用批量画像、查询与样式规则设计模板。优先直取正式汇总结果，
-派生采用场景负责人登记的官方指标，多组报告数据使用同批快照。结构化模板用 save_report_spec。自由版式用 save_free_report_template 保存 HTML/CSS 和受管绑定，
-用 patch_free_report_template 按模块修改。用对应的 preview_report_spec 或 preview_free_report 整页验收，再提交验收通过的 preview_id。
+新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景时，可用 list_scene_datasources 查看开放数据源与固定范围并配合 save_business_scenario 协助建场景，或给出 scenario_management_url 引导用户配置。
+已知场景后优先调用 prepare_report_context 一步加载分析思路、表画像、生效样式与模板契约，再以 query_report_data 同批次取数或核对证据。
+派生采用场景负责人登记的官方指标，多组报告数据使用同批快照。结构化模板用 save_report_spec（可选 expected_version）。自由版式用 save_free_report_template 保存 HTML/CSS 和受管绑定，
+用 patch_free_report_template 按模块修改。用对应的 preview_report_spec 或 preview_free_report 整页验收，核对返回 warnings 后提交验收通过的 preview_id。
 采用海尔 IAM，场景及事实来源受当前员工授权约束。"""
 
 mcp = FastMCP("smartreportgen", instructions=INSTRUCTIONS, stateless_http=True, json_response=True)
@@ -235,7 +237,116 @@ def list_business_scenarios(ctx: Context) -> dict:
         for d in repo.list_datasets() if d["enabled"] and acc.can_dataset(d["id"])]})
 
 
+@_tool()
+def list_scene_datasources(ctx: Context) -> dict:
+    """列出当前员工可用于构建业务场景的数据源及开放表清单（含固定行范围）。"""
+    try:
+        acc = _access(ctx)
+        items = []
+        for row in repo.list_datasources():
+            if not row.get("enabled", True):
+                continue
+            catalog = source_scene_tables(row) if acc.all else source_scene_tables(row, acc.principal)
+            if not acc.all and not catalog:
+                continue
+            tables = [{"table_name": name, "description": entry.get("description", ""),
+                       "row_filters": entry.get("row_filters", [])} for name, entry in catalog.items()]
+            items.append({"datasource_id": row["id"], "name": row["name"], "type": row["type"],
+                          "description": row.get("description", ""), "tables": tables, "all_tables": acc.all})
+        return _ok({"ok": True, "datasources": items, "scenario_management_url": f"{settings.public_base_url}/#datasets"})
+    except _EXPECTED as e:
+        return _err(e)
+
+
+@_tool()
+def save_business_scenario(
+    business_scenario: str,
+    business_description: str,
+    datasource_id: int,
+    tables: list[dict[str, Any]],
+    ctx: Context,
+    dataset_id: int | None = None,
+    analysis_approach: str = "",
+    tags: list[str] | None = None,
+    semantic_metrics: dict[str, Any] | None = None,
+) -> dict:
+    """按当前员工数据源授权新建或更新个人业务场景（含分析思路、逐表筛选和官方指标）。"""
+    try:
+        acc = _access(ctx)
+        payload: dict[str, Any] = {
+            "business_scenario": business_scenario,
+            "business_description": business_description,
+            "datasource_id": datasource_id,
+            "tables": tables,
+            "enabled": True,
+        }
+        if dataset_id is None:
+            payload["analysis_approach"] = analysis_approach
+            payload["tags"] = tags or []
+            payload["semantic_metrics"] = semantic_metrics or {}
+        else:
+            if analysis_approach:
+                payload["analysis_approach"] = analysis_approach
+            if tags is not None:
+                payload["tags"] = tags
+            if semantic_metrics is not None:
+                payload["semantic_metrics"] = semantic_metrics
+        try:
+            saved = (repo.update_dataset(dataset_id, payload, acc.principal) if dataset_id is not None
+                     else repo.create_dataset(payload, acc.principal))
+        except UniqueViolation as exc:
+            raise repo.Invalid("业务场景名称已存在，请更换名称或传入 dataset_id 更新") from exc
+        refreshed = access_for(acc.principal)
+        return _ok({"ok": True, **_dataset_brief(saved, refreshed)})
+    except _EXPECTED as e:
+        return _err(e)
+
+
 # ============================== 2. 数据探查 ==============================
+def _describe_tables_page(acc: Access, dataset_id: int, *, ds: dict | None = None,
+                          table_names: list[str] | None = None, offset: int = 0, limit: int = 10,
+                          include_profile: bool = False, sample_rows: int = 5,
+                          profile_rows: int | None = None, refresh_schema: bool = False) -> dict:
+    ds = ds or repo.get_dataset(dataset_id)
+    scope = {table["table_name"]: table for table in ds["tables"]}
+    names = [name for name in scope if acc.can_table(dataset_id, name)]
+    if table_names is not None:
+        names = list(dict.fromkeys(table_names))
+        for name in names:
+            if name not in scope or not acc.can_table(dataset_id, name):
+                raise PermissionDenied(f"数据表或视图不在授权的场景范围内：{name}")
+    offset = max(0, offset)
+    stop = offset + max(1, min(limit, 20))
+    ds_row = services.datasource_for_dataset(ds)
+    conn = services.get_connector(ds_row)
+    allowed = None if acc.all else acc.tables.get(dataset_id, set())
+    sample_rows = max(0, min(sample_rows, 50))
+    profile_rows = max(0, min(profile_rows if profile_rows is not None else (100 if sample_rows else 0), 2000))
+
+    def _inspect_table(name: str) -> dict:
+        item = {"table_name": name, "table_description": scope[name]["table_description"]}
+        try:
+            if include_profile:
+                item.update(services.describe_table(ds_row, name, sample_rows, profile_rows,
+                                                    dataset=ds, allowed=allowed, include_count=False,
+                                                    include_extrema=False, refresh_schema=refresh_schema))
+            else:
+                item["columns"] = conn.cached_columns(name, refresh=refresh_schema)
+        except ConnectorError as exc:
+            # 单表元数据失败时保留错误和其他表的结构，便于定位尚未覆盖的分析。
+            item["profile_error" if include_profile else "columns_error"] = str(exc)
+        return item
+
+    page_names = names[offset:stop]
+    if len(page_names) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(page_names))) as pool:
+            futures = [pool.submit(contextvars.copy_context().run, _inspect_table, name) for name in page_names]
+            tables = [future.result() for future in futures]
+    else:
+        tables = [_inspect_table(name) for name in page_names]
+    return {"tables": tables, "total": len(names), "next_offset": stop if stop < len(names) else None}
+
+
 @_tool()
 def describe_tables(dataset_id: int, ctx: Context, table_names: list[str] | None = None,
                     offset: int = 0, limit: int = 10, include_profile: bool = False,
@@ -247,45 +358,38 @@ def describe_tables(dataset_id: int, ctx: Context, table_names: list[str] | None
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
+        return _ok({"ok": True, **_describe_tables_page(
+            acc, dataset_id, table_names=table_names, offset=offset, limit=limit,
+            include_profile=include_profile, sample_rows=sample_rows, profile_rows=profile_rows,
+            refresh_schema=refresh_schema)})
+    except _EXPECTED as e:
+        return _err(e)
+
+
+@_tool()
+def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
+                           mode: Literal["structured", "free"] = "structured",
+                           sample_rows: int = 5, profile_rows: int = 100) -> dict:
+    """一步加载业务场景（分析思路、授权表、官方指标）、前 10 张表轻量画像、生效样式（含 style_id）与模板契约。"""
+    try:
+        acc = _access(ctx)
+        _require_dataset(acc, dataset_id)
         ds = repo.get_dataset(dataset_id)
-        scope = {table["table_name"]: table for table in ds["tables"]}
-        names = [name for name in scope if acc.can_table(dataset_id, name)]
-        if table_names is not None:
-            names = list(dict.fromkeys(table_names))
-            for name in names:
-                if name not in scope or not acc.can_table(dataset_id, name):
-                    raise PermissionDenied(f"数据表或视图不在授权的场景范围内：{name}")
-        offset = max(0, offset)
-        stop = offset + max(1, min(limit, 20))
-        ds_row = services.datasource_for_dataset(ds)
-        conn = services.get_connector(ds_row)
-        allowed = None if acc.all else acc.tables.get(dataset_id, set())
-        sample_rows = max(0, min(sample_rows, 50))
-        profile_rows = max(0, min(profile_rows if profile_rows is not None else (100 if sample_rows else 0), 2000))
-
-        def _inspect_table(name: str) -> dict:
-            item = {"table_name": name, "table_description": scope[name]["table_description"]}
-            try:
-                if include_profile:
-                    item.update(services.describe_table(ds_row, name, sample_rows, profile_rows,
-                                                        dataset=ds, allowed=allowed, include_count=False,
-                                                        include_extrema=False, refresh_schema=refresh_schema))
-                else:
-                    item["columns"] = conn.cached_columns(name, refresh=refresh_schema)
-            except ConnectorError as exc:
-                # 单表元数据失败时保留错误和其他表的结构，便于定位尚未覆盖的分析。
-                item["profile_error" if include_profile else "columns_error"] = str(exc)
-            return item
-
-        page_names = names[offset:stop]
-        if len(page_names) > 1:
-            with ThreadPoolExecutor(max_workers=min(4, len(page_names))) as pool:
-                futures = [pool.submit(contextvars.copy_context().run, _inspect_table, name) for name in page_names]
-                tables = [future.result() for future in futures]
-        else:
-            tables = [_inspect_table(name) for name in page_names]
-        return _ok({"ok": True, "tables": tables, "total": len(names),
-                    "next_offset": stop if stop < len(names) else None})
+        tables_page = _describe_tables_page(
+            acc, dataset_id, ds=ds, offset=0, limit=10, include_profile=True,
+            sample_rows=sample_rows, profile_rows=profile_rows,
+        )
+        style = _resolve_style(acc.principal, ds["business_scenario"], query=query, include_css=False)
+        contract = get_free_report_spec() if mode == "free" else get_report_spec()
+        return _ok({
+            "ok": True,
+            "scenario": _dataset_brief(ds, acc),
+            "tables": tables_page["tables"],
+            "total_tables": tables_page["total"],
+            "next_offset": tables_page["next_offset"],
+            "style": style,
+            "contract": contract,
+        })
     except _EXPECTED as e:
         return _err(e)
 
@@ -402,35 +506,21 @@ def get_template_spec() -> str:
 
 
 # ============================== 4. 样式规则 ==============================
-@_tool()
-def get_style_rules(business_scenario: str, ctx: Context, query: str = "", include_css: bool = True) -> dict:
-    """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置经营报告主题，合并为一份 specified，
-    作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
-    文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
-    reporting_rules 为独立的事实直取、缺失不补算及离线单文件约束，不参与视觉样式覆盖。
-    builtin_style 提供 style_id（可通过 <style data-srg-style="style_id"></style> 由服务端展开）及组件说明；
-    传 include_css=false 可省略 22KB 内置 CSS 原文以减少上下文占用。
-    展示顺序：当前用户明确要求 > 业务场景规则 > 通用规则 > 内置默认值。
-    低优先级条目及智能体判断不能豁免高优先级规则；仅章节、图表、筛选维度及未指定装饰样式可裁量。
-    将生效要求落实到全部展示面，按技能门禁通过后保存。"""
-    try:
-        p = _principal(ctx)
-        res = repo.style_rules_for(business_scenario, query or None, owner=p.emp_no)
-        builtin = design.builtin_style(res["specified"]["theme"])
-        if include_css:
-            try:
-                builtin["style_id"] = report_data.save_style(p.emp_no, builtin["css"])
-            except report_data.ReportDataError:
-                pass
-        else:
-            css = builtin.pop("css")
-            builtin["style_id"] = report_data.save_style(p.emp_no, css)
-    except _EXPECTED as e:
-        return _err(e)
+def _resolve_style(principal: Principal, business_scenario: str, query: str = "", include_css: bool = True) -> dict:
+    res = repo.style_rules_for(business_scenario, query or None, owner=principal.emp_no)
+    builtin = design.builtin_style(res["specified"]["theme"])
+    if include_css:
+        try:
+            builtin["style_id"] = report_data.save_style(principal.emp_no, builtin["css"])
+        except report_data.ReportDataError:
+            pass
+    else:
+        css = builtin.pop("css")
+        builtin["style_id"] = report_data.save_style(principal.emp_no, css)
     rules = [{"id": r["id"], "name": r["name"], "scope": r["scope"],
               **({"relevance": r["relevance"]} if r.get("relevance") else {})}
              for r in res["general_rules"] + res["scenario_rules"]]
-    return _ok({
+    return {
         "ok": True,
         "business_scenario": res["business_scenario"],
         "precedence": res["precedence"],
@@ -448,7 +538,25 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "", inclu
                  "保存前按技能执行源文档审计、展开后六类展示面及边界复核和最终门禁，失败不得保存。"
                  "使用服务端结构化模板渲染时，theme 会自动应用。"),
         "warnings": res["warnings"],
-    })
+    }
+
+
+@_tool()
+def get_style_rules(business_scenario: str, ctx: Context, query: str = "", include_css: bool = True) -> dict:
+    """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置经营报告主题，合并为一份 specified，
+    作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
+    文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
+    reporting_rules 为独立的事实直取、缺失不补算及离线单文件约束，不参与视觉样式覆盖。
+    builtin_style 提供 style_id（可通过 <style data-srg-style="style_id"></style> 由服务端展开）及组件说明；
+    传 include_css=false 可省略 22KB 内置 CSS 原文以减少上下文占用。
+    展示顺序：当前用户明确要求 > 业务场景规则 > 通用规则 > 内置默认值。
+    低优先级条目及智能体判断不能豁免高优先级规则；仅章节、图表、筛选维度及未指定装饰样式可裁量。
+    将生效要求落实到全部展示面，按技能门禁通过后保存。"""
+    try:
+        p = _principal(ctx)
+        return _ok(_resolve_style(p, business_scenario, query=query, include_css=include_css))
+    except _EXPECTED as e:
+        return _err(e)
 
 
 # ============================== 5–7. 模板与报告 ==============================
@@ -530,17 +638,20 @@ def get_report_spec() -> dict:
 
 @_tool()
 def save_report_spec(name: str, dataset_id: int, spec: report_spec.ReportSpec, ctx: Context,
-                     template_id: int | None = None, business_summary: str = "") -> dict:
-    """保存有固定场景、字段和筛选映射的声明式模板；传 template_id 更新本人的模板版本。"""
+                     template_id: int | None = None, expected_version: int | None = None,
+                     business_summary: str = "") -> dict:
+    """保存有固定场景、字段和筛选映射的声明式模板；传 template_id 更新本人的模板版本，可用 expected_version 检查并发版本。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
         if template_id is not None:
             _check_owner(acc, repo.get_template(template_id)["created_by"], "报告模板")
+        elif expected_version is not None:
+            raise repo.Invalid("指定 expected_version 时须同时提供 template_id")
         content = report_spec.encode_template(spec, dataset_id)
         row = repo.save_template({"name": name, "dataset_id": dataset_id, "markdown": content,
                                   "business_summary": business_summary, "created_by": acc.principal.emp_no,
-                                  "template_type": "business"}, template_id)
+                                  "template_type": "business"}, template_id, expected_version=expected_version)
         return _ok({"ok": True, "template_id": row["id"], "version": row["version"], "summary": row["summary"]})
     except _EXPECTED as e:
         return _err(e)
@@ -611,7 +722,7 @@ def patch_free_report_template(template_id: int, expected_version: int,
 
 @_tool()
 def query_report_data(dataset_id: int, queries: dict[report_queries.Key, report_queries.QueryPlan], ctx: Context,
-                      parameters: dict[report_queries.Key, report_queries.Scalar] | None = None,
+                      parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
                       sample_rows: Annotated[int, Field(ge=0, le=200)] = 5) -> dict:
     """同一批次取数，可信结果可用于多快照报告。只允许投影字段或调用场景登记的官方指标。"""
     try:
@@ -635,7 +746,7 @@ def query_report_data(dataset_id: int, queries: dict[report_queries.Key, report_
 def preview_report_spec(ctx: Context, template_id: int | None = None, template_version: int | None = None,
                         spec: report_spec.ReportSpec | None = None, dataset_id: int | None = None,
                         bindings: dict[report_queries.Key, str] | None = None,
-                        parameters: dict[report_queries.Key, report_queries.Scalar] | None = None,
+                        parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
                         report_id: int | None = None, base_version: int | None = None,
                         theme_overrides: dict[str, Any] | None = None) -> dict:
     """编译并验收离线报告。用 theme_overrides 和报告基准版本直接复用原数据调整样式；换图可提交编辑后的 spec。"""
@@ -647,7 +758,7 @@ def preview_report_spec(ctx: Context, template_id: int | None = None, template_v
 def preview_free_report(ctx: Context, template_id: int | None = None, template_version: int | None = None,
                         free_report: report_free.FreeReport | None = None, dataset_id: int | None = None,
                         bindings: dict[report_queries.Key, str] | None = None,
-                        parameters: dict[report_queries.Key, report_queries.Scalar] | None = None,
+                        parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
                         report_id: int | None = None, base_version: int | None = None) -> dict:
     """整页验收自由版式。修订时指定基准并省略取数参数及绑定可复用原数据，重跑传新账期参数。"""
     return _preview_report(ctx, report_free.FreeReport, free_report, dataset_id, template_id, template_version,
@@ -735,7 +846,7 @@ def list_report_templates(ctx: Context, keyword: str = "") -> dict:
 
 @_tool()
 def render_report_html(template_id: int, ctx: Context, report_name: str = "",
-                       parameters: dict[report_queries.Key, report_queries.Scalar] | None = None,
+                       parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
                        template_version: Annotated[int, Field(ge=1)] | None = None) -> dict:
     """以当前权限执行本人模板。声明式模板传账期参数，服务端验收后直接保存报告。"""
     try:

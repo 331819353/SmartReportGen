@@ -829,11 +829,18 @@ def tpl_update(request: Request, tpl_id: int, data: dict = Body(...)):
     _check_owner(request, tpl.get("created_by"), "报告模板")
     dataset_id = data.get("dataset_id", tpl["dataset_id"])
     _require_dataset(request, dataset_id)
+    expected_version = data.get("expected_version")
+    if expected_version is not None and (type(expected_version) is not int or expected_version < 1):
+        raise repo.Invalid("expected_version 须为正整数")
     if "spec" in data:
         if type(dataset_id) is not int or dataset_id < 1:
             raise repo.Invalid("声明式模板须指定 dataset_id")
         data = {**data, "markdown": report_spec.encode_template(report_spec.ReportSpec.model_validate(data["spec"]), dataset_id)}
-    return J(repo.save_template({k: v for k, v in data.items() if k != "created_by"}, tpl_id))
+    return J(repo.save_template(
+        {k: v for k, v in data.items() if k not in ("created_by", "expected_version")},
+        tpl_id,
+        expected_version=expected_version,
+    ))
 
 
 @app.delete("/api/templates/{tpl_id}")

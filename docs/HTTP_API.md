@@ -326,7 +326,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | 方法与路径 | 权限 | 请求 | 响应 |
 |---|---|---|---|
 | `GET /api/datasets` | 登录 | 可选查询参数 `q`，按场景名、业务描述或标签做不区分大小写的包含搜索 | 场景摘要数组，按 ID 升序。普通用户可见本人创建的场景及另行获授权的启用场景 |
-| `POST /api/datasets` | 登录 | JSON 场景配置。必填 `business_scenario`、`business_description`、`datasource_id`，可选 `analysis_approach`、`tags`、`enabled`、`tables`。普通用户至少选一张已开放的表 | 场景详情。缺字段、空表名或重复表名返回 `400`，重名或引用冲突返回 `409` |
+| `POST /api/datasets` | 登录 | JSON 场景配置。必填 `business_scenario`、`business_description`、`datasource_id`，可选 `analysis_approach`、`tags`、`enabled`、`tables`、`semantic_metrics`。普通用户至少选一张已开放的表 | 场景详情。缺字段、空表名或重复表名返回 `400`，重名或引用冲突返回 `409` |
 | `GET /api/datasets/{dataset_id}` | 登录 | 路径 `dataset_id` | 场景详情。普通用户仅见获授权的表。不存在或不可见返回 `404` |
 | `PUT /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`。JSON 传要修改的字段，传入 `tables` 时整体替换，个人场景至少保留一张可引用的表 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
 | `DELETE /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true}`，删除场景及其表清单和授权，已关联的模板解除场景关联 |
@@ -385,7 +385,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `POST /api/templates/validate` | 登录 | JSON 传 `markdown`，可选整数 `dataset_id`、布尔值 `execute`（默认 `true`） | 校验结果。结构、SQL 或字段校验失败仍返回 `200`，以 `ok:false` 及 `errors` 表示。对请求中指定的场景无权访问时返回 `403` |
 | `POST /api/templates/preview` | 登录 | JSON 传 `markdown`，可选整数 `dataset_id`。管理员可传 `owner`（工号）按其个人样式预览 | `200 text/html`，即时渲染的报告页面。源码、SQL 或渲染失败返回 `400`，无权使用指定场景返回 `403` |
 | `GET /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id` | 模板详情，额外附 `versions`。不存在返回 `404`，非本人且非管理员返回 `403` |
-| `PUT /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`。JSON 提交 `spec` 或 `markdown`，可同时更新管理字段 | 更新后的模板详情，源码变化时新增版本。不存在返回 `404`，权限或校验失败同新增及详情 |
+| `PUT /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`。JSON 提交 `spec` 或 `markdown`，可同时更新管理字段或传正整数 `expected_version` | 更新后的模板详情，源码变化时新增版本。版本冲突返回 `409`，不存在返回 `404`，权限或校验失败同新增及详情 |
 | `DELETE /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`，无请求体 | `{"ok":true}`，删除模板及历史版本，已生成的报告保留。不存在返回 `404`，越权返回 `403` |
 | `GET /api/templates/{tpl_id}/versions/{version}` | 本人 | 路径 `tpl_id`、`version` | `{"version":1,"markdown":"历史 Markdown 源码","created_at":"2026-01-01T00:00:00+00:00"}`。模板或版本不存在返回 `404`，越权返回 `403` |
 | `POST /api/templates/{tpl_id}/render` | 本人 | 路径 `tpl_id`。可省略请求体，或传 `name`、`template_version` 与模板声明的 `parameters` | 运行声明式模板并验收保存。旧格式、取数或验收失败返回 `400`，越权返回 `403`，模板不存在返回 `404` |

@@ -438,6 +438,73 @@ const Datasources = {
 
 // ------------------------------------------------------------ 数据集
 let sceneTableKey = 0;
+const METRIC_OPS = [
+  { value: 'sum', label: '求和（sum）' },
+  { value: 'avg', label: '均值（avg）' },
+  { value: 'min', label: '最小值（min）' },
+  { value: 'max', label: '最大值（max）' },
+  { value: 'count_distinct', label: '去重计数（count_distinct）' },
+  { value: 'ratio_of_sums', label: '总和比率（ratio_of_sums）' },
+  { value: 'difference_of_sums', label: '总和差额（difference_of_sums）' },
+  { value: 'growth_of_sums', label: '增长率（growth_of_sums）' },
+];
+const BINARY_METRIC_OPS = new Set(['ratio_of_sums', 'difference_of_sums', 'growth_of_sums']);
+const RATIO_METRIC_OPS = new Set(['ratio_of_sums', 'growth_of_sums']);
+
+function metricDraftFromEntry(name = '', m = {}) {
+  const extra = {};
+  if (m.when && Object.keys(m.when).length) extra.when = m.when;
+  if (m.denominator_when && Object.keys(m.denominator_when).length) extra.denominator_when = m.denominator_when;
+  return {
+    id: ++sceneTableKey,
+    name,
+    table: m.table || '',
+    op: m.op || 'sum',
+    field: m.field || '',
+    denominator: m.denominator || '',
+    dimsTxt: (m.dimensions || []).join(', '),
+    filterDimsTxt: Array.isArray(m.filter_dimensions) ? m.filter_dimensions.join(', ') : '',
+    hasFilterDims: Array.isArray(m.filter_dimensions),
+    scale: m.scale || 'number',
+    description: m.description || '',
+    extra,
+  };
+}
+function metricsToDrafts(raw = {}) {
+  return Object.entries(raw || {}).map(([name, m]) => metricDraftFromEntry(name, m || {}));
+}
+function draftsToMetrics(drafts = []) {
+  const out = {};
+  for (const row of drafts) {
+    const name = (row.name || '').trim();
+    if (!name) throw new Error('请填写每项官方指标的英文标识（如 revenue），或移除空白项。');
+    if (!/^[a-z][a-z0-9_]{0,47}$/.test(name)) throw new Error(`指标标识「${name}」须以小写字母开头，仅含小写字母、数字和下划线。`);
+    if (Object.hasOwn(out, name)) throw new Error(`官方指标标识重复：${name}`);
+    const table = (row.table || '').trim();
+    const field = (row.field || '').trim();
+    if (!table || !field) throw new Error(`官方指标「${name}」须选择数据表并填写分子/主字段。`);
+    const entry = {
+      table,
+      op: row.op || 'sum',
+      field,
+      dimensions: (row.dimsTxt || '').split(/[,，]/).map(s => s.trim()).filter(Boolean),
+      scale: RATIO_METRIC_OPS.has(row.op) ? 'decimal' : (row.scale || 'number'),
+      description: row.description || '',
+    };
+    if (BINARY_METRIC_OPS.has(entry.op)) {
+      const den = (row.denominator || '').trim();
+      if (!den) throw new Error(`官方指标「${name}」采用 ${entry.op} 公式，须填写分母字段。`);
+      entry.denominator = den;
+    }
+    if (row.hasFilterDims || (row.filterDimsTxt || '').trim()) {
+      entry.filter_dimensions = (row.filterDimsTxt || '').split(/[,，]/).map(s => s.trim()).filter(Boolean);
+    }
+    if (row.extra?.when) entry.when = row.extra.when;
+    if (row.extra?.denominator_when) entry.denominator_when = row.extra.denominator_when;
+    out[name] = entry;
+  }
+  return out;
+}
 function sceneTableDraft(table = {}) {
   return { table_name: '', table_description: '', ...table, key: ++sceneTableKey, expanded: false,
     columns: null, loadingColumns: false, columnError: '', row_filters: (table.row_filters || []).map(rule => ({
@@ -446,13 +513,20 @@ function sceneTableDraft(table = {}) {
 }
 function sceneFormSnapshot(f) {
   if (!f) return '';
+  let metrics = f.metricsTxt || '{}';
+  if (f.metricsMode === 'visual') {
+    metrics = JSON.stringify((f.metricDrafts || []).map(m => ({
+      name: m.name, table: m.table, op: m.op, field: m.field, denominator: m.denominator,
+      dimsTxt: m.dimsTxt, filterDimsTxt: m.filterDimsTxt, scale: m.scale, description: m.description, extra: m.extra,
+    })));
+  }
   return JSON.stringify({
     business_scenario: f.business_scenario || '',
     datasource_id: f.datasource_id ?? null,
     business_description: f.business_description || '',
     analysis_approach: f.analysis_approach || '',
     tagsTxt: f.tagsTxt || '',
-    metricsTxt: f.metricsTxt || '{}',
+    metrics,
     enabled: !!f.enabled,
     tables: (f.tables || []).map(t => ({
       table_name: t.table_name || '',
@@ -605,10 +679,56 @@ const Datasets = {
         <p class="field-help" id="scene-approach-help">说明先看什么、怎么比较、需要验证哪些假设。也可补充报告应回答的问题、适合的图表和需要切换的筛选条件。</p>
         <textarea id="scene-approach" class="in" v-model="form.analysis_approach" rows="4" aria-describedby="scene-approach-help" placeholder="例如：先比较各渠道的销售增速，再找出毛利下降的主要品类，核对促销前后的变化。"></textarea></div>
       <div class="field"><label>标签 <small>用逗号分隔，帮助同事查找场景</small></label><input class="in" v-model="form.tagsTxt"></div>
-      <details class="field"><summary>官方指标配置（JSON）</summary>
-        <label for="scene-metrics">指标、计算规则和允许的维度</label>
-        <textarea id="scene-metrics" class="in mono" v-model="form.metricsTxt" rows="5" spellcheck="false"></textarea>
-        <a :href="appPath('/api-guide')" target="_blank" rel="noopener">查看配置字段</a></details>
+      <div class="field">
+        <div class="scene-metrics-head">
+          <label>官方指标 <small>登记聚合公式和允许分组维度（选填）</small></label>
+          <div class="seg" role="group" aria-label="官方指标编辑模式">
+            <button type="button" :class="{on: form.metricsMode === 'visual'}" @click="switchMetricsMode('visual')">可视化编辑</button>
+            <button type="button" :class="{on: form.metricsMode === 'json'}" @click="switchMetricsMode('json')">JSON 源码</button>
+          </div>
+        </div>
+        <div v-if="form.metricsError" class="msg err" role="alert">{{form.metricsError}}</div>
+        <div v-if="form.metricsMode === 'visual'" class="scene-metrics-panel">
+          <p class="field-help">供模型在明细表上做受控求和、比率和增长率计算，所有聚合均先应用数据权限与行过滤。</p>
+          <div v-for="(m, idx) in form.metricDrafts" :key="m.id" class="scene-metric-row">
+            <div class="scene-metric-grid">
+              <label>指标标识 <input class="in mono" v-model.trim="m.name" placeholder="如 attainment"></label>
+              <label>所属表
+                <select class="in mono" v-model="m.table">
+                  <option value="" disabled>选择表</option>
+                  <option v-if="m.table && !form.tables.some(t => t.table_name === m.table)" :value="m.table">{{m.table}}</option>
+                  <option v-for="t in form.tables" :key="t.key" :value="t.table_name">{{t.table_name}}</option>
+                </select>
+              </label>
+              <label>公式类型
+                <select class="in" v-model="m.op" @change="onMetricOpChange(m)">
+                  <option v-for="op in METRIC_OPS" :key="op.value" :value="op.value">{{op.label}}</option>
+                </select>
+              </label>
+              <label>{{BINARY_METRIC_OPS.has(m.op) ? '分子字段' : '度量字段'}} <input class="in mono" v-model.trim="m.field" placeholder="如 actual"></label>
+              <label v-if="BINARY_METRIC_OPS.has(m.op)">分母字段 <input class="in mono" v-model.trim="m.denominator" placeholder="如 target"></label>
+              <label>比例尺度
+                <select class="in" v-model="m.scale" :disabled="RATIO_METRIC_OPS.has(m.op)">
+                  <option value="number">数值（number）</option>
+                  <option value="decimal">小数比例（decimal）</option>
+                  <option value="percent">百分数（percent）</option>
+                </select>
+              </label>
+              <label>允许分组维度 <input class="in mono" v-model="m.dimsTxt" placeholder="逗号分隔，如 region, month"></label>
+              <label>说明 <input class="in" v-model="m.description" placeholder="如 实际/目标完成率"></label>
+            </div>
+            <div class="scene-metric-foot">
+              <span v-if="m.extra?.when || m.extra?.denominator_when" class="badge blue">含条件聚合（when）</span>
+              <button class="link danger" type="button" @click="form.metricDrafts.splice(idx, 1)">移除指标</button>
+            </div>
+          </div>
+          <div class="actions"><button class="btn sm" type="button" @click="addMetric" :disabled="form.metricDrafts.length >= 100">添加官方指标</button></div>
+        </div>
+        <div v-else>
+          <textarea id="scene-metrics" class="in mono" v-model="form.metricsTxt" rows="6" spellcheck="false"></textarea>
+          <a :href="appPath('/api-guide')" target="_blank" rel="noopener">查看配置字段</a>
+        </div>
+      </div>
       <section class="field" aria-labelledby="scene-tables-label"><h3 id="scene-tables-label" class="scene-tables-label">表和视图 <small class="muted">{{form.tables.length}} 项</small></h3>
         <p class="field-help">按需设置各表的取值范围。场景取数时自动应用这些条件。</p>
         <div v-for="(t,i) in form.tables" :key="t.key" class="scene-table-entry">
@@ -673,9 +793,38 @@ const Datasets = {
     });
     async function edit(d) {
       picker.value = null; pickKw.value = ''; saveError.value = '';
-      if (d) { const full = await run(() => api(`/api/datasets/${d.id}`)); form.value = { ...full, tagsTxt: (full.tags || []).join(', '), metricsTxt: pretty(full.semantic_metrics), tables: full.tables.map(sceneTableDraft) }; }
-      else form.value = { id: null, business_scenario: '', business_description: '', analysis_approach: '', datasource_id: null, tagsTxt: '', metricsTxt: '{}', tables: [], enabled: true };
+      if (d) {
+        const full = await run(() => api(`/api/datasets/${d.id}`));
+        form.value = { ...full, tagsTxt: (full.tags || []).join(', '), metricsTxt: pretty(full.semantic_metrics),
+          metricDrafts: metricsToDrafts(full.semantic_metrics), metricsMode: 'visual', metricsError: '',
+          tables: full.tables.map(sceneTableDraft) };
+      } else {
+        form.value = { id: null, business_scenario: '', business_description: '', analysis_approach: '',
+          datasource_id: null, tagsTxt: '', metricsTxt: '{}', metricDrafts: [], metricsMode: 'visual',
+          metricsError: '', tables: [], enabled: true };
+      }
       initialSnapshot.value = sceneFormSnapshot(form.value);
+    }
+    function switchMetricsMode(mode) {
+      const f = form.value;
+      if (!f || f.metricsMode === mode) return;
+      f.metricsError = '';
+      try {
+        if (mode === 'json') {
+          f.metricsTxt = pretty(draftsToMetrics(f.metricDrafts));
+        } else {
+          f.metricDrafts = metricsToDrafts(jsonOrThrow(f.metricsTxt, '官方指标'));
+        }
+        f.metricsMode = mode;
+      } catch (e) { f.metricsError = e.message; }
+    }
+    function onMetricOpChange(m) {
+      if (RATIO_METRIC_OPS.has(m.op)) m.scale = 'decimal';
+      if (!BINARY_METRIC_OPS.has(m.op)) m.denominator = '';
+    }
+    function addMetric() {
+      const firstTable = form.value?.tables?.[0]?.table_name || '';
+      form.value.metricDrafts.push(metricDraftFromEntry('', { table: firstTable, op: 'sum', scale: 'number' }));
     }
     function closeForm() {
       if (busy.value) return;
@@ -693,8 +842,9 @@ const Datasets = {
           });
           return { table_name: t.table_name, table_description: t.table_description, row_filters };
         });
+        const semantic_metrics = f.metricsMode === 'visual' ? draftsToMetrics(f.metricDrafts) : jsonOrThrow(f.metricsTxt, '官方指标');
         const body = { business_scenario: f.business_scenario, business_description: f.business_description, analysis_approach: f.analysis_approach,
-          datasource_id: f.datasource_id, tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables, semantic_metrics: jsonOrThrow(f.metricsTxt, '官方指标') };
+          datasource_id: f.datasource_id, tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables, semantic_metrics };
         await api(f.id ? `/api/datasets/${f.id}` : '/api/datasets', { method: f.id ? 'PUT' : 'POST', body });
         toast('已保存', 'ok'); form.value = null; load();
       } catch (e) { saveError.value = e.message; }
@@ -760,8 +910,9 @@ const Datasets = {
     function addRule(t) { t.row_filters.push({ column: '', values: [] }); }
     return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
       picker, pickKw, pickShown, pickLoading, pickError, edit, closeForm, save, del, search, reindex, pick, has, togglePick,
-      addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule, filterValueLabel, DS_LABEL, OBJECT_LABEL,
-      icon, appPath, hasMine: computed(canVisitMine) };
+      addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule,
+      switchMetricsMode, onMetricOpChange, addMetric, METRIC_OPS, BINARY_METRIC_OPS, RATIO_METRIC_OPS,
+      filterValueLabel, DS_LABEL, OBJECT_LABEL, icon, appPath, hasMine: computed(canVisitMine) };
   }
 };
 

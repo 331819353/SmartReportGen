@@ -11,7 +11,7 @@ import tinycss2
 from pydantic import Field, model_validator
 
 from .report_queries import Key, StrictModel
-from .report_spec import HEX, Card, ReportDefinition
+from .report_spec import HEX, Card, ReportDefinition, check_unbound_numbers
 
 TextHTML = Annotated[str, Field(min_length=1, max_length=32_000)]
 TextCSS = Annotated[str, Field(max_length=20_000)]
@@ -27,18 +27,11 @@ TAGS = frozenset("""
 """.split())
 VOID = {"br", "hr", "col"}
 SLOTS = {"srg-val", "srg-output", "srg-module", "srg-filters"}
-CHINESE_DIGITS = "零〇一二两三四五六七八九十壹贰叁肆伍陆柒捌玖拾"
-CHINESE_VALUE = re.compile(
-    rf"[{CHINESE_DIGITS}][{CHINESE_DIGITS}百佰千仟万萬亿億]*(?:元|吨|件|家|人|台|个|成|倍|[%％]|个百分点)"
-    rf"|[百千万萬]分之[{CHINESE_DIGITS}]"
-)
 
 
-def _author_text(text, where):
+def _author_text(text, where, *, mode="prose"):
     # 年份、账期和业务数字都可绑定事实字段。HTML 的列宽、CSS 尺寸等结构参数不走此检查。
-    compact = re.sub(r"[\s\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]+", "", text)
-    if CHINESE_VALUE.search(compact) or any(char.isnumeric() and not char.isalpha() for char in compact):
-        raise ValueError(f"{where} 含未绑定数字，请使用数据槽位")
+    check_unbound_numbers(text, where, mode=mode)
 
 
 class Grid(StrictModel):
@@ -102,10 +95,10 @@ class FreeOutput(Card):
     def validate_option(self):
         if self.type == "kpi":
             raise ValueError("自由版式指标使用 <srg-val>，指标卡外观由 HTML/CSS 决定")
-        _author_text(self.title, "图表或表格标题")
+        _author_text(self.title, "图表或表格标题", mode="label")
         for column in self.columns:
-            _author_text(column.label, "字段显示名称")
-            _author_text(column.format.unit, "字段单位")
+            _author_text(column.label, "字段显示名称", mode="label")
+            _author_text(column.format.unit, "字段单位", mode="unit")
         if self.option:
             if self.type == "table":
                 raise ValueError("ECharts option 只适用于图表")
@@ -348,11 +341,11 @@ class FreeReport(ReportDefinition):
 
     @model_validator(mode="after")
     def validate_layout(self):
-        _author_text(self.title, "报告标题")
+        _author_text(self.title, "报告标题", mode="label")
         for item in self.filters:
-            _author_text(item.label, "筛选器名称")
+            _author_text(item.label, "筛选器名称", mode="label")
         for metric in self.metrics.values():
-            _author_text(metric.format.unit, "指标单位")
+            _author_text(metric.format.unit, "指标单位", mode="unit")
         _, _, used = self.render_layout()
         self.validate_bindings(used, allow_text=True)
         return self

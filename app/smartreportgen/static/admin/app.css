@@ -305,6 +305,14 @@ pre.block{margin:0;background:#0F172A;color:#E2E8F0;padding:12px 14px;border-rad
 .scene-table-actions{margin-top:8px}
 .scene-source-picker{max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:10px}
 .scene-pick-item{display:flex;flex-wrap:wrap;min-height:36px;padding:4px 0}
+.scene-metrics-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.scene-metrics-head label{font-size:13px;font-weight:600;color:#344054}
+.scene-metrics-head label small{font-weight:400;color:var(--muted);margin-left:6px}
+.scene-metrics-panel{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px}
+.scene-metric-row{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.scene-metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:8px 12px}
+.scene-metric-grid label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+.scene-metric-foot{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:6px}
 @media(max-width:620px){
   .source-browser,.scene-table-fields,.scene-filter-rule{grid-template-columns:minmax(0,1fr)}
   .source-object-list{max-height:220px}

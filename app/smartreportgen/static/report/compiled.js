@@ -32,8 +32,12 @@
   }
 
   function match(row, by) {
-    return Object.entries(by).every(([key, name]) =>
+    return Object.entries(by || {}).every(([key, name]) =>
       selected[key] == null || token(row[name]) === token(selected[key]));
+  }
+
+  function whereMatch(row, where) {
+    return Object.entries(where || {}).every(([key, value]) => token(row[key]) === token(value));
   }
 
   // 一个指标按激活的筛选键选择对应粒度。缺少已登记粒度或同口径多行时显示缺数。
@@ -43,9 +47,21 @@
     const binding = metric.sources.find(source => Object.keys(source.by).length === active.length &&
       active.every(key => Object.hasOwn(source.by, key)));
     if (!binding) return null;
-    const facts = rows[binding.query].filter(row => match(row, binding.by) &&
-      Object.entries(binding.where).every(([key, value]) => token(row[key]) === token(value)));
+    const facts = rows[binding.query].filter(row => match(row, binding.by) && whereMatch(row, binding.where));
     return facts.length === 1 ? facts[0][binding.field] : null;
+  }
+
+  function cardFacts(card) {
+    const sources = card.sources?.length ? card.sources : null;
+    if (!sources) {
+      return rows[card.query].filter(row => match(row, card.by) && whereMatch(row, card.where));
+    }
+    const axis = new Set(sources.flatMap(source => Object.keys(source.by)));
+    const active = [...axis].filter(key => selected[key] != null);
+    const binding = sources.find(source => Object.keys(source.by).length === active.length &&
+      active.every(key => Object.hasOwn(source.by, key)));
+    if (!binding) return [];
+    return rows[binding.query].filter(row => match(row, binding.by) && whereMatch(row, binding.where));
   }
 
   function element(tag, text, className) {
@@ -325,7 +341,7 @@
       charts.get(container)?.dispose();
       charts.delete(container);
       container.replaceChildren();
-      const matches = rows[card.query].filter(row => match(row, card.by));
+      const matches = cardFacts(card);
       if (!matches.length) {
         container.append(element('p', '当前筛选无数据'));
         container.lastChild.dataset.empty = 'true';

@@ -428,3 +428,54 @@ def for_edit(html: str) -> str:
         return None
 
     return _DataBlocks(html).replace(fold)
+
+
+def deflate_static(html: str) -> str:
+    """入库前折迭与当前内置完全一致的固定静态脚本，保留业务数据与样式不变。"""
+    lower = html.lower()
+    if VENDOR_MARKER not in lower and ASSET_MARKER not in lower:
+        return html
+    parser = _DataBlocks(html)
+    echarts = report_document.echarts_js()
+    formatters = report_document.formatters_js()
+
+    def fold(block: _DataBlock) -> tuple[str, str] | None:
+        if block.fields[block.marker] != "embedded":
+            return None
+        if block.kind == "vendor":
+            expected = echarts
+            ref = "echarts"
+        elif block.kind == "asset":
+            expected = formatters
+            ref = "report-formatters.js"
+        else:
+            return None
+        if block.data != expected:
+            return None
+        attributes = " ".join(
+            f'{key}="{escape(value or "", quote=True)}"' for key, value in block.fields.items()
+        )
+        if html[block.start:block.end] != f"<{block.tag} {attributes}>{block.data}</{block.tag}>":
+            return None
+        return ref, ""
+
+    return parser.replace(fold)
+
+
+def inflate_static(html: str) -> str:
+    """读取时无损还原被折迭的内置静态脚本，确保对外字节和 SHA-256 完全一致。"""
+    lower = html.lower()
+    if f'{VENDOR_MARKER}="echarts"' not in lower and f'{ASSET_MARKER}="report-formatters.js"' not in lower:
+        return html
+
+    def expand(block: _DataBlock) -> tuple[str, str] | None:
+        ref = block.fields[block.marker] or ""
+        if block.data.strip():
+            return None
+        if block.kind == "vendor" and ref == "echarts":
+            return "embedded", report_document.echarts_js()
+        if block.kind == "asset" and ref == "report-formatters.js":
+            return "embedded", report_document.formatters_js()
+        return None
+
+    return _DataBlocks(html).replace(expand)

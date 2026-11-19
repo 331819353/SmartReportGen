@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import httpx
 
-from smartreportgen import mcp_server, repo, report_browser, report_data, report_pipeline, report_queries, report_spec
+from smartreportgen import mcp_server, repo, report_browser, report_data, report_document, report_pipeline, report_queries, report_spec
 from smartreportgen.auth import Principal
 from smartreportgen.config import settings
 from smartreportgen.connectors.api import APIConnector
@@ -279,3 +279,214 @@ class DeclarativeReportTest(unittest.TestCase):
             self.assertEqual(fetch.call_count, 2)
         with self.assertRaisesRegex(ConnectorError, "直接事实"):
             report_queries.direct_projection("select sum(actual) from facts", "api")
+
+    @unittest.skipUnless(Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file(), "需安装 Chromium")
+    def test_card_multi_source_filters_and_empty_warnings_in_chromium(self):
+        spec = report_spec.ReportSpec.model_validate({
+            "title": "区域月度趋势",
+            "filters": [{"id": "region", "label": "区域", "query": "region_dim", "field": "region"}],
+            "metrics": {"total_rev": {
+                "sources": [
+                    {"query": "overall", "field": "rev", "where": {"month": "2026-09"}},
+                    {"query": "by_region", "field": "rev", "by": {"region": "region"}, "where": {"month": "2026-09"}},
+                ],
+                "format": {"kind": "number", "digits": 0, "unit": "万元"},
+            }},
+            "sections": [{
+                "title": "趋势分析",
+                "narrative": "2026年9月围绕三个维度：1. 营业收入为 {{total_rev}}。",
+                "cards": [{
+                    "title": "月度收入趋势", "type": "line",
+                    "sources": [
+                        {"query": "overall", "by": {}},
+                        {"query": "by_region", "by": {"region": "region"}},
+                    ],
+                    "columns": [
+                        {"label": "月份", "field": "month", "format": {"kind": "text"}},
+                        {"label": "收入", "field": "rev", "format": {"kind": "number", "digits": 0, "unit": "万元"}},
+                    ],
+                }],
+            }],
+        })
+        origin = {"scope": SCOPE, "batch": "b1", "scales": {"rev": "number"}}
+        snapshots = {
+            "region_dim": {"columns": ["region"], "rows": [["华东"], ["华北"]], "origin": origin},
+            "overall": {"columns": ["month", "rev"], "rows": [["2026-08", 220], ["2026-09", 260]], "origin": origin},
+            "by_region": {"columns": ["region", "month", "rev"],
+                          "rows": [["华东", "2026-08", 120], ["华东", "2026-09", 150],
+                                   ["华北", "2026-08", 100], ["华北", "2026-09", 110]],
+                          "origin": origin},
+        }
+        _, page, _ = report_spec.compile_report(spec, snapshots, 91, {})
+        proof = report_browser.verify(page, spec, snapshots, 91)
+        self.assertEqual(proof["status"], "passed")
+        self.assertEqual(proof["warnings"], [])
+        self.assertEqual(proof["always_empty_cards"], [])
+
+        # 若图表误用未分源且全选时类别重复的快照，门禁仍返回结构化 warnings 提醒修正。
+        broken = report_spec.ReportSpec.model_validate({
+            "title": "重复类别诊断",
+            "sections": [{"title": "异常", "narrative": "收入 {{rev}}。", "cards": [
+                {"title": "未聚合明细图", "type": "bar", "query": "by_region",
+                 "columns": [{"label": "月份", "field": "month", "format": {"kind": "text"}},
+                             {"label": "收入", "field": "rev", "format": {"kind": "number", "digits": 0}}]},
+            ]}],
+            "metrics": {"rev": {"sources": [{"query": "overall", "field": "rev", "where": {"month": "2026-09"}}],
+                                "format": {"kind": "number", "digits": 0}}},
+        })
+        _, broken_page, _ = report_spec.compile_report(broken, {
+            "overall": snapshots["overall"], "by_region": snapshots["by_region"]
+        }, 91, {})
+        diag = report_browser.verify(broken_page, broken, {
+            "overall": snapshots["overall"], "by_region": snapshots["by_region"]
+        }, 91)
+        self.assertIn("未聚合明细图", diag["always_empty_cards"])
+        self.assertTrue(diag["warnings"])
+
+    @unittest.skipUnless(Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file(), "需安装 Chromium")
+    def test_text_metric_and_refined_bare_number_rules(self):
+        spec = report_spec.ReportSpec.model_validate({
+            "title": "2026年9月 Q3 经营月报",
+            "metrics": {
+                "period": {"sources": [{"query": "facts", "field": "period"}], "format": {"kind": "text"}},
+                "attainment": {"sources": [{"query": "facts", "field": "attainment"}],
+                               "format": {"kind": "rate", "scale": "decimal"}},
+            },
+            "sections": [{
+                "title": "经营概览",
+                "narrative": "2026年9月围绕三个维度：1. 账期 {{period}} 完成率为 {{attainment}}。",
+                "cards": [{"title": "完成率", "type": "kpi", "metric": "attainment"}],
+            }],
+        })
+        payload = {"columns": ["period", "attainment"], "rows": [["2026-09", 0.985]],
+                   "origin": {"scope": SCOPE, "scales": {"attainment": "decimal"}}}
+        _, page, _ = report_spec.compile_report(spec, {"facts": payload}, 91, {})
+        proof = report_browser.verify(page, spec, {"facts": payload}, 91)
+        self.assertEqual(proof["status"], "passed")
+        self.assertEqual(proof["warnings"], [])
+        for bad in ("手写完成率为 100%。", "共耗时 9个月 完成", "营收十亿元。"):
+            raw = spec.model_dump(mode="json")
+            raw["sections"][0]["narrative"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "定量正文"):
+                report_spec.ReportSpec.model_validate(raw)
+
+    def test_enhanced_query_plan_joins_and_conditional_semantic_metrics(self):
+        cfg = {"endpoints": {
+            "facts": {"path": "/facts", "complete": True, "revision_path": "ver",
+                      "column_types": {"amount": "DECIMAL(18, 4)"}},
+            "dim_org": {"path": "/orgs", "complete": True, "revision_path": "ver"},
+        }}
+        source = {**SOURCE, "config": cfg}
+        dataset = {
+            **DATASET,
+            "tables": [
+                {"table_name": "facts", "row_filters": []},
+                {"table_name": "dim_org", "row_filters": []},
+            ],
+            "semantic_metrics": {
+                "actual_amt": {"table": "facts", "op": "sum", "field": "amount",
+                               "when": {"kind": "actual"}, "dimensions": ["org_code", "month"], "scale": "number"},
+                "attainment": {"table": "facts", "op": "ratio_of_sums", "field": "amount", "denominator": "amount",
+                               "when": {"kind": "actual"}, "denominator_when": {"kind": "target"},
+                               "dimensions": ["org_code"], "scale": "decimal"},
+            },
+        }
+        items_map = {
+            "/facts": {"ver": 1, "items": [
+                {"month": "2026-06", "org_code": "A1", "kind": "actual", "amount": "999", "flag": "Y"},
+                {"month": "2026-08", "org_code": "A1", "kind": "actual", "amount": "60", "flag": "Y"},
+                {"month": "2026-09", "org_code": "A1", "kind": "actual", "amount": "40", "flag": "Y"},
+                {"month": "2026-09", "org_code": "A1", "kind": "target", "amount": "80", "flag": "Y"},
+                {"month": "2026-09", "org_code": "A1", "kind": "actual", "amount": "500", "flag": None},
+                {"month": "2026-09", "org_code": "B2", "kind": "actual", "amount": "30", "flag": "Y"},
+                {"month": "2026-09", "org_code": "B2", "kind": "target", "amount": "60", "flag": "Y"},
+            ]},
+            "/orgs": {"ver": 1, "items": [
+                {"code": "A1", "org_name": "华东大区"},
+                {"code": "B2", "org_name": "华北大区"},
+            ]},
+        }
+        connector = APIConnector(source, "")
+        self.addCleanup(connector.close)
+
+        def fake_req(method, url, **kwargs):
+            path = "/" + url.rsplit("/", 1)[-1]
+            return httpx.Response(200, request=httpx.Request(method, url), json=items_map[path])
+
+        with patch.object(report_queries, "get_connector", return_value=connector), \
+                patch("smartreportgen.connectors.api.httpx.request", side_effect=fake_req):
+            plans = {
+                "summary": report_queries.QueryPlan.model_validate({
+                    "table": "facts",
+                    "metrics": ["attainment"],
+                    "dimensions": ["org_code"],
+                    "where": {"month": {"gte": "2026-07", "lte": "2026-09"}, "flag": {"ne": None}},
+                    "parameters": {"org_code": {"in": "orgs"}},
+                    "joins": [{"table": "dim_org", "on": {"org_code": "code"}, "fields": ["org_name"]}],
+                    "order_by": [{"field": "org_code", "direction": "asc"}],
+                })
+            }
+            res = report_queries.capture(91, dataset, source, {"facts", "dim_org"}, PRINCIPAL.emp_no,
+                                         plans, {"orgs": ["A1", "B2"]}, 100, sample_rows=10)
+            self.assertEqual(res["summary"]["sample_rows"], [
+                ["A1", "华东大区", {"$decimal": "1.25"}],
+                ["B2", "华北大区", {"$decimal": "0.5"}],
+            ])
+            with self.assertRaises(PermissionDenied):
+                report_queries.capture(91, dataset, source, {"facts"}, PRINCIPAL.emp_no,
+                                       plans, {"orgs": ["A1"]}, 100)
+
+        # 未加新特性的传统计划哈希保持稳定，且预览对 run_query(snapshot=true) 给出明确提示。
+        legacy_plan = report_queries.QueryPlan(table="facts", fields=["month"], parameters={"month": "p"})
+        self.assertEqual(len(report_queries.plan_hash(legacy_plan)), 64)
+        snap = report_data.save_query(PRINCIPAL.emp_no, ["month", "attainment"], [["2026-09", 1]], 1,
+                                      origin={"scope": SCOPE, "scales": {}})
+        spec_with_query = report_spec.ReportSpec.model_validate({
+            "title": "校验测试",
+            "queries": {"facts": {"table": "facts", "fields": ["attainment"]}},
+            "metrics": {"a": {"sources": [{"query": "facts", "field": "attainment"}]}},
+            "sections": [{"title": "S", "narrative": "{{a}}", "cards": [{"title": "C", "type": "kpi", "metric": "a"}]}],
+        })
+        with patch.object(report_spec, "access_for", return_value=Access(PRINCIPAL, tables={91: {"facts"}})), \
+                patch.object(repo, "get_dataset", return_value=DATASET):
+            with self.assertRaisesRegex(repo.Invalid, "query_report_data"):
+                report_pipeline.preview(spec_with_query, 91, PRINCIPAL, bindings={"facts": snap["snapshot_id"]})
+
+    def test_scope_tolerates_secret_rotation_and_blocks_target_or_filter_change(self):
+        base_source = {"id": 12, "type": "postgresql", "enabled": True, "name": "PG主库",
+                       "description": "旧备注", "updated_at": "2026-10-01",
+                       "config": {"host": "db.internal", "port": 5432, "database": "bi"}}
+        recorded = report_queries.scope_for(91, DATASET, base_source, ["facts"])
+        access = Access(PRINCIPAL, tables={91: {"facts"}})
+        rotated_source = {**base_source, "name": "PG主库-改名", "description": "新备注", "updated_at": "2026-11-19"}
+        with patch.object(report_spec, "access_for", return_value=access), \
+                patch.object(repo, "get_dataset", return_value=DATASET), \
+                patch.object(repo, "get_datasource", return_value=rotated_source):
+            report_spec.validate_scopes([recorded], PRINCIPAL)
+        changed_host = {**rotated_source, "config": {**rotated_source["config"], "host": "other.internal"}}
+        with patch.object(report_spec, "access_for", return_value=access), \
+                patch.object(repo, "get_dataset", return_value=DATASET), \
+                patch.object(repo, "get_datasource", return_value=changed_host):
+            with self.assertRaises(PermissionDenied):
+                report_spec.validate_scopes([recorded], PRINCIPAL)
+        changed_filter = {**DATASET, "tables": [{"table_name": "facts", "row_filters": [{"column": "region", "values": ["华东"]}]}]}
+        with patch.object(report_spec, "access_for", return_value=access), \
+                patch.object(repo, "get_dataset", return_value=changed_filter), \
+                patch.object(repo, "get_datasource", return_value=rotated_source):
+            with self.assertRaises(PermissionDenied):
+                report_spec.validate_scopes([recorded], PRINCIPAL)
+
+    def test_deflate_inflate_roundtrip_and_merge_deduplicates_echarts(self):
+        spec, payload = fixture()
+        _, expanded, _ = report_spec.compile_report(spec, {"facts": payload}, 91, {})
+        deflated = report_data.deflate_static(expanded)
+        self.assertLess(len(deflated), len(expanded) - 500_000)
+        restored = report_data.inflate_static(deflated)
+        self.assertEqual(sha256(restored.encode()).hexdigest(), sha256(expanded.encode()).hexdigest())
+        self.assertEqual(restored, expanded)
+        merged = report_document.merge_report_documents("月报合集", [
+            {"name": "一", "html": expanded},
+            {"name": "二", "html": expanded},
+        ])
+        self.assertIn('id="shared-echarts"', merged)
+        self.assertLess(len(merged), len(expanded) * 1.4)

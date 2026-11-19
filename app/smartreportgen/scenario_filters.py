@@ -245,5 +245,5 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
             fmt = ":%s" if ds_type == "oracle" else "$%s"
         rendered = re.sub(rf"\b{marker}(p\d+)\b", lambda m: fmt % m[1], rendered)
         if query_binds:
-            rendered = re.sub(rf"\b{query_binds[0]}(q\d+)\b", lambda m: fmt % m[1], rendered)
+            rendered = re.sub(rf"\b{re.escape(query_binds[0])}(q\d+)\b", lambda m: fmt % m[1].lower(), rendered, flags=re.I)
     return {**connector.query(rendered, limit, params=params, tables=tables_used), "tables_used": tables_used}

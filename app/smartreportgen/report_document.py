@@ -146,6 +146,8 @@ html, body, [data-srg-merge-shell], [data-srg-merge-main] {
 
 _MERGE_SCRIPT = """
 const documents = JSON.parse(document.getElementById('documents').textContent);
+const sharedEchartsEl = document.getElementById('shared-echarts');
+const sharedEcharts = sharedEchartsEl ? JSON.parse(sharedEchartsEl.textContent) : '';
 const contentStyle = document.getElementById('content-style').textContent;
 const frames = new Map();
 const reportFooter = '.rf-footer, .report-footer, .page-footer';
@@ -161,6 +163,12 @@ const hidden = 'data-srg-merge-hidden';
 function prepareReport(source) {
   // 先在不执行脚本的文档中处理布局，图表初始化时即得到正文宽度。
   const doc = new DOMParser().parseFromString(source, 'text/html');
+  if (sharedEcharts) {
+    for (const el of doc.querySelectorAll('script[data-srg-vendor="echarts"]')) {
+      el.setAttribute('data-srg-vendor', 'embedded');
+      el.textContent = sharedEcharts;
+    }
+  }
   const body = doc.body;
   const main = body.querySelector('main:not([hidden]), [role="main"]:not([hidden])') ||
     body.querySelector('.rf-main, .report-content, #report-content, .main-content, #main-content');
@@ -277,10 +285,27 @@ for (const report of documents) {
 
 def merge_report_documents(name: str, reports: list[dict]) -> str:
     """按选定顺序纵向拼接各份报告的标题和正文，各报告在沙箱中独立运行。"""
+    echarts_code = echarts_js()
+    embedded_tag = f'<script data-srg-vendor="embedded">{echarts_code}</script>'
+    legacy_tag = f'<script>{echarts_code}</script>'
+    placeholder = '<script data-srg-vendor="echarts"></script>'
+    shared_used = False
+    items = []
+    for r in reports:
+        body = r["html"]
+        if embedded_tag in body:
+            body = body.replace(embedded_tag, placeholder)
+            shared_used = True
+        if legacy_tag in body:
+            body = body.replace(legacy_tag, placeholder)
+            shared_used = True
+        items.append({"name": r["name"], "html": body})
     # 转义小于号，防止正文里的 </script> 提前终止 JSON 并在外层页面执行。
-    documents = json.dumps(
-        [{"name": r["name"], "html": r["html"]} for r in reports], ensure_ascii=False
-    ).replace("<", "\\u003c")
+    documents = json.dumps(items, ensure_ascii=False).replace("<", "\\u003c")
+    shared_block = (
+        f'<script id="shared-echarts" type="application/json">{json.dumps(echarts_code).replace("<", "\\u003c")}</script>'
+        if shared_used else ""
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -297,6 +322,7 @@ def merge_report_documents(name: str, reports: list[dict]) -> str:
 <body>
 <main id="report-stack" aria-label="合并报告正文"></main>
 <script id="content-style" type="text/plain">{_MERGE_CONTENT_STYLE}</script>
+{shared_block}
 <script id="documents" type="application/json">{documents}</script>
 <script>{_MERGE_SCRIPT}</script>
 </body>

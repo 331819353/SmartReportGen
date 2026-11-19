@@ -97,3 +97,36 @@ class FreeReportTest(unittest.TestCase):
                         report_browser.verify(page, spec, {"facts": facts}, 91)
                 else:
                     self.assertEqual(report_browser.verify(page, spec, {"facts": facts}, 91)["status"], "passed")
+
+    def test_free_report_allows_calendar_codes_units_and_structural_quantifiers(self):
+        raw, facts = free_fixture()
+        raw["title"] = "2026年9月 Q3 经营分析"
+        raw["modules"]["summary"]["html"] = (
+            '<section class="paper"><p>2026年9月围绕三个维度：1. 期末余额<srg-val m="closing" badge></srg-val></p></section>'
+        )
+        raw["modules"]["bridge"]["outputs"]["detail"]["title"] = "2026H1对标 B2B收入"
+        raw["modules"]["bridge"]["outputs"]["detail"]["columns"][1]["label"] = "Top10金额"
+        raw["modules"]["bridge"]["outputs"]["detail"]["columns"][1]["format"]["unit"] = "元/m²"
+        spec = report_free.FreeReport.model_validate(raw)
+        _, page, _ = report_spec.compile_report(spec, {"facts": facts}, 91, {})
+        self.assertIn("2026年9月", page)
+        self.assertIn("元/m²", page)
+        if Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file():
+            self.assertEqual(report_browser.verify(page, spec, {"facts": facts}, 91)["status"], "passed")
+
+    def test_save_report_spec_supports_expected_version_conflict(self):
+        raw = {
+            "title": "并发测试",
+            "metrics": {"v": {"sources": [{"query": "facts", "field": "v"}]}},
+            "sections": [{"title": "S", "narrative": "{{v}}", "cards": [{"title": "C", "type": "kpi", "metric": "v"}]}],
+        }
+        spec = report_spec.ReportSpec.model_validate(raw)
+        with patch.object(mcp_server, "_access"), patch.object(mcp_server, "_require_dataset"), \
+                patch.object(mcp_server, "_check_owner"), \
+                patch.object(repo, "get_template", return_value={"created_by": "u1"}), \
+                patch.object(repo, "save_template", side_effect=repo.ReportConflict("版本冲突")):
+            res = mcp_server.save_report_spec("模板", 1, spec, None, template_id=5, expected_version=1)
+            self.assertEqual(res["error_type"], "conflict")
+        with patch.object(mcp_server, "_access"), patch.object(mcp_server, "_require_dataset"):
+            bad = mcp_server.save_report_spec("模板", 1, spec, None, expected_version=1)
+            self.assertFalse(bad["ok"])

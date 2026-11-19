@@ -148,14 +148,27 @@ def delete_datasource(ds_id: int) -> None:
 def _dataset_index(ds: dict, tables: list[dict]) -> dict:
     kw_a = tokenize(" ".join([ds["business_scenario"], *ds.get("tags", [])]))
     kw_a += [w for w in [ds["business_scenario"].lower(), *[t.lower() for t in ds.get("tags", [])]] if w not in kw_a]
-    kw_b = tokenize(ds.get("business_description") or "")
-    kw_c = tokenize(" ".join(f"{t['table_name'].replace('_', ' ')} {t.get('table_description') or ''}" for t in tables))
-    text = (
-        f"业务场景：{ds['business_scenario']}\n标签：{'、'.join(ds.get('tags') or [])}\n"
-        f"业务描述：{ds.get('business_description') or ''}\n数据表：\n"
-        + "\n".join(f"- {t['table_name']}：{t.get('table_description') or ''}" for t in tables)
+    approach = ds.get("analysis_approach") or ""
+    kw_b = tokenize(f"{ds.get('business_description') or ''} {approach}")
+    metrics = ds.get("semantic_metrics") or {}
+    metric_text = " ".join(f"{k.replace('_', ' ')} {m.get('description') or ''}" for k, m in metrics.items())
+    kw_c = tokenize(
+        " ".join(f"{t['table_name'].replace('_', ' ')} {t.get('table_description') or ''}" for t in tables)
+        + (" " + metric_text if metric_text else "")
     )
-    return {"kw_a": kw_a, "kw_b": kw_b, "kw_c": kw_c, "kw_all": list(dict.fromkeys(kw_a + kw_b + kw_c)), "text": text}
+    parts = [
+        f"业务场景：{ds['business_scenario']}",
+        f"标签：{'、'.join(ds.get('tags') or [])}",
+        f"业务描述：{ds.get('business_description') or ''}",
+    ]
+    if approach:
+        parts.append(f"分析思路：{approach}")
+    if metrics:
+        parts.append("官方指标：\n" + "\n".join(
+            f"- {k}：{m.get('description') or m.get('op', '')}" for k, m in metrics.items()
+        ))
+    parts.append("数据表：\n" + "\n".join(f"- {t['table_name']}：{t.get('table_description') or ''}" for t in tables))
+    return {"kw_a": kw_a, "kw_b": kw_b, "kw_c": kw_c, "kw_all": list(dict.fromkeys(kw_a + kw_b + kw_c)), "text": "\n".join(parts)}
 
 
 def _embed_or_none(text: str) -> str | None:
@@ -169,7 +182,8 @@ def _embed_or_none(text: str) -> str | None:
 def reindex_dataset(dataset_id: int) -> None:
     ds = _one(db.fetchone("SELECT * FROM dataset.dataset WHERE id=%s", (dataset_id,)), "数据集")
     tables = db.fetchall("SELECT * FROM dataset.dataset_table WHERE dataset_id=%s ORDER BY sort, id", (dataset_id,))
-    add_words([ds["business_scenario"], *ds["tags"]])
+    metric_words = [w for k in (ds.get("semantic_metrics") or {}) for w in (k, k.replace("_", " "))]
+    add_words([ds["business_scenario"], *ds["tags"], *metric_words])
     idx = _dataset_index(ds, tables)
     vec = _embed_or_none(idx["text"])
     db.execute(
@@ -680,7 +694,7 @@ def delete_template(tpl_id: int) -> None:
 REPORT_COLS = (
     "r.id, v.name, v.template_id, v.template_version, v.meta, r.created_at, r.created_by, "
     "v.version AS revision, v.base_version, v.created_at AS version_created_at, v.created_by AS version_created_by, "
-    "v.change_note, r.revision AS latest_version, length(v.html) AS size"
+    "v.change_note, r.revision AS latest_version, COALESCE((v.meta->>'html_chars')::bigint, length(v.html)) AS size"
 )
 REPORT_SHARE_JOIN = " LEFT JOIN report.report_share s ON s.report_id=r.id AND s.emp_no=%s"
 REPORT_SELECTION_JOIN = " LEFT JOIN report.report_selection sel ON sel.report_id=r.id AND sel.emp_no=%s"
@@ -797,6 +811,8 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
     if not with_source:
         del row["markdown"]
         del row["source_owner"]
+    if with_html and row.get("html"):
+        row["html"] = report_data.inflate_static(row["html"])
     return row
 
 
@@ -850,14 +866,15 @@ def save_report(name: str, html: str, template_id: int | None, template_version:
     if error := report_document_error(html):
         raise Invalid(error)
     name = _report_name(name)
-    meta = {**meta, "html_bytes": len(html.encode()), "single_file": True}
+    meta = {**meta, "html_bytes": len(html.encode()), "html_chars": len(html), "single_file": True}
+    stored_html = report_data.deflate_static(html)
     with db.conn() as c, c.transaction():
         row = c.execute(
             "INSERT INTO report.report(name, template_id, template_version, html, meta, created_by) "
             "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id, name, template_id, template_version, meta, created_at, created_by",
-            (name, template_id, template_version, html, db.jsonb(meta), created_by),
+            (name, template_id, template_version, "", db.jsonb(meta), created_by),
         ).fetchone()
-        _insert_report_version(c, row["id"], 1, None, name, html, meta, template_id, template_version,
+        _insert_report_version(c, row["id"], 1, None, name, stored_html, meta, template_id, template_version,
                                source or {}, created_by)
     return {**row, "size": len(html), "revision": 1, "latest_version": 1, "current_version": 1,
             "base_version": None, **report_links(row["id"])}
@@ -932,11 +949,12 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
                               (report_id, base_version)).fetchone(), "报告版本")
         _require_report_data({**base, "created_by": row["created_by"]}, principal)
         meta, source = (base["meta"], base) if rendered is None else rendered
+        base_html = report_data.inflate_static(base["html"])
         if rendered is None:
             # 管理台仍可更新名称或说明。业务正文变更须经过新编译和验收。
-            if html is not None and html not in (base["html"], report_data.for_edit(base["html"])):
+            if html is not None and html not in (base_html, report_data.for_edit(base_html)):
                 raise Invalid("正文变更请用声明式模板生成已验收的修订预览")
-            html = base["html"]
+            html = base_html
         else:
             if (meta.get("source") != "compiled_spec" or not meta.get("scopes") or
                     meta.get("verification", {}).get("html_sha256") != report_spec_hash(html)):
@@ -948,18 +966,19 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
                 _require_report_data({"meta": meta, "created_by": row["created_by"]}, principal_for(row["created_by"]))
         if rendered is not None and (error := report_document_error(html)):
             raise Invalid(error)
-        meta = {**meta, "html_bytes": len(html.encode()),
+        meta = {**meta, "html_bytes": len(html.encode()), "html_chars": len(html),
                 "single_file": rendered is not None or meta.get("single_file", False)}
+        stored_html = report_data.deflate_static(html) if meta["single_file"] else html
         version = row["revision"] + 1
         template_id, template_version = source.get("template_id", base["template_id"]), source["template_version"]
-        _insert_report_version(c, report_id, version, base_version, name, html, meta, template_id,
+        _insert_report_version(c, report_id, version, base_version, name, stored_html, meta, template_id,
                                template_version, source, principal.emp_no, change_note)
         # 保存后让编辑者跟随最新版本，其他员工原有的选择照常保留。
         _select_report_version(c, report_id, principal.emp_no, None)
         c.execute(
             "UPDATE report.report SET name=%s, html=%s, meta=%s, template_id=%s, template_version=%s, revision=%s "
             "WHERE id=%s",
-            (name, html, db.jsonb(meta), template_id, template_version, version, report_id),
+            (name, "", db.jsonb(meta), template_id, template_version, version, report_id),
         )
     return {**get_report(report_id, principal, with_html=False, version=version), **report_links(report_id, version)}
 
@@ -1051,11 +1070,13 @@ def reindex_all(only_stale: bool = False) -> dict:
 
 
 def load_custom_words() -> None:
-    rows = db.fetchall("SELECT business_scenario, tags FROM dataset.dataset")
+    rows = db.fetchall("SELECT business_scenario, tags, semantic_metrics FROM dataset.dataset")
     words = []
     for r in rows:
         words.append(r["business_scenario"])
         words.extend(r["tags"] or [])
+        for k in (r.get("semantic_metrics") or {}):
+            words.extend((k, k.replace("_", " ")))
     add_words(words)
 
 

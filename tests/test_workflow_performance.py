@@ -199,12 +199,73 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse({"ctx", "args", "kwargs"}.intersection(schema))
         for tool_name, expected_keys in (
             ("save_report", {"name", "html", "preview_id", "template_id", "template_version"}),
+            ("save_report_spec", {"name", "dataset_id", "spec", "template_id", "expected_version"}),
             ("revise_report", {"report_id", "name", "base_version", "html", "preview_id"}),
             ("get_style_rules", {"business_scenario", "query", "include_css"}),
+            ("prepare_report_context", {"dataset_id", "query", "mode", "sample_rows", "profile_rows"}),
+            ("list_scene_datasources", set()),
+            ("save_business_scenario", {"business_scenario", "business_description", "datasource_id", "tables", "semantic_metrics"}),
         ):
             props = tools[tool_name].inputSchema["properties"]
             self.assertTrue(expected_keys.issubset(props), tool_name)
             self.assertFalse({"ctx", "args", "kwargs"}.intersection(props), tool_name)
+
+    def test_prepare_report_context_bundles_scenario_style_and_contract(self):
+        dataset = {"id": 1, "business_scenario": "测试场景", "business_description": "描述",
+                   "analysis_approach": "先看总量", "datasource_id": 2, "datasource_name": "源",
+                   "datasource_type": "api", "tags": ["测试"], "semantic_metrics": {},
+                   "tables": [{"table_name": "Facts", "table_description": "测试事实", "row_filters": []}]}
+        access = Access(Principal("context-reader"), tables={1: {"facts"}})
+        style_stub = {"business_scenario": "测试场景", "precedence": "p", "reporting_rules": [],
+                      "specified": {"theme": {"color-brand": "#123456"}, "theme_sources": {}, "items": []},
+                      "general_rules": [], "scenario_rules": [], "warnings": []}
+        with patch.object(mcp_server, "_access", return_value=access), \
+                patch.object(mcp_server.repo, "get_dataset", return_value=dataset), \
+                patch.object(mcp_server.services, "datasource_for_dataset", return_value={"type": "api", "name": "源"}), \
+                patch.object(mcp_server.services, "get_connector", return_value=MetadataConnector()), \
+                patch.object(mcp_server.services, "describe_table", return_value={"columns": [{"name": "v"}], "sample_rows": []}), \
+                patch.object(mcp_server.repo, "style_rules_for", return_value=style_stub), \
+                patch.object(mcp_server.report_data, "save_style", return_value="style-uuid"):
+            res = mcp_server.prepare_report_context(1, None, mode="structured")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["scenario"]["analysis_approach"], "先看总量")
+        self.assertEqual(res["total_tables"], 1)
+        self.assertEqual(res["style"]["builtin_style"]["style_id"], "style-uuid")
+        self.assertNotIn("css", res["style"]["builtin_style"])
+        self.assertIn("schema", res["contract"])
+
+    def test_list_scene_datasources_and_save_business_scenario(self):
+        reader = Access(Principal("E100", roles=["analyst"]), tables={})
+        sources = [
+            {"id": 10, "name": "开放库", "type": "postgresql", "enabled": True, "description": "可用",
+             "config": {"scenario_tables": [
+                 {"table_name": "sales", "description": "销售", "roles": ["analyst"],
+                  "row_filters": [{"column": "region", "values": ["华东"]}]},
+                 {"table_name": "secret", "description": "保密", "roles": ["finance"]},
+             ]}},
+            {"id": 11, "name": "停用库", "type": "postgresql", "enabled": False, "config": {"scenario_tables": []}},
+        ]
+        with patch.object(mcp_server, "_access", return_value=reader), \
+                patch.object(mcp_server.repo, "list_datasources", return_value=sources):
+            listed = mcp_server.list_scene_datasources(None)
+        self.assertTrue(listed["ok"], listed)
+        self.assertEqual(len(listed["datasources"]), 1)
+        self.assertEqual([t["table_name"] for t in listed["datasources"][0]["tables"]], ["sales"])
+        created_ds = {"id": 55, "business_scenario": "新场景", "business_description": "说明",
+                      "analysis_approach": "口径", "datasource_id": 10, "datasource_name": "开放库",
+                      "datasource_type": "postgresql", "tags": ["经营"], "semantic_metrics": {},
+                      "tables": [{"table_name": "sales", "table_description": "销售",
+                                  "source_row_filters": [{"column": "region", "values": ["华东"]}], "row_filters": []}]}
+        after_access = Access(reader.principal, tables={55: {"sales"}})
+        with patch.object(mcp_server, "_access", return_value=reader), \
+                patch.object(mcp_server.repo, "create_dataset", return_value=created_ds) as create_mock, \
+                patch.object(mcp_server, "access_for", return_value=after_access):
+            saved = mcp_server.save_business_scenario("新场景", "说明", 10, [{"table_name": "sales"}], None,
+                                                      analysis_approach="口径", tags=["经营"])
+        self.assertTrue(saved["ok"], saved)
+        self.assertEqual(saved["dataset_id"], 55)
+        self.assertEqual(saved["tables"][0]["row_filters"], [{"column": "region", "values": ["华东"]}])
+        create_mock.assert_called_once()
 
     def test_describe_tables_runs_page_concurrently_preserving_order_and_timing(self):
         names = ["T1", "T2", "T3", "T4"]

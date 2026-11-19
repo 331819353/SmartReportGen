@@ -58,7 +58,14 @@ def preview(spec, dataset_id, principal, *, bindings=None, parameters=None, temp
             snapshots = {key: report_data.read_snapshot(principal.emp_no, item["snapshot_id"]) for key, item in refs.items()}
     if spec.queries:
         for key, plan in spec.queries.items():
-            if snapshots.get(key, {}).get("origin", {}).get("plan_sha256") != report_queries.plan_hash(plan):
+            snap_origin = snapshots.get(key, {}).get("origin", {})
+            snap_hash = snap_origin.get("plan_sha256")
+            if not snap_hash:
+                raise repo.Invalid(
+                    f"快照 {key} 来自 run_query 探查而非声明式取数计划；"
+                    "请改用 query_report_data 生成快照，或在预览时省略 bindings 直接传 parameters"
+                )
+            if snap_hash != report_queries.plan_hash(plan):
                 raise repo.Invalid(f"快照 {key} 的取数计划与模板版本不一致")
     dataset = repo.get_dataset(dataset_id)
     theme = repo.style_rules_for(dataset["business_scenario"], owner=principal.emp_no)["specified"]["theme"]
@@ -81,6 +88,7 @@ def preview(spec, dataset_id, principal, *, bindings=None, parameters=None, temp
     url = f"{settings.public_base_url}/reports/preview/{ref}"
     return {"preview_id": str(ref), "url": url, "download_url": f"{url}?download=true",
             "expires_in_seconds": report_data.TTL_SECONDS, "html_bytes": len(page.encode()), "verification": evidence,
+            "warnings": evidence.get("warnings", []),
             "template_id": meta["template_id"], "template_version": meta["template_version"], "report_id": requested_report_id,
             **{k: evidence[k] for k in ("source_sha256", "html_sha256")}}
 

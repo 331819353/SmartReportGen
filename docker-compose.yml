@@ -55,6 +55,7 @@ services:
   api:
     build: { context: ., dockerfile: app/Dockerfile }
     image: smartreportgen:latest
+    init: true
     restart: unless-stopped
     environment: *app-env
     volumes:
@@ -71,6 +72,7 @@ services:
 
   mcp:
     image: smartreportgen:latest
+    init: true
     restart: unless-stopped
     command: ["python", "-m", "smartreportgen.mcp_server"]
     environment:
