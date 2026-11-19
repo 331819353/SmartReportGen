@@ -1,15 +1,13 @@
 # Agent 接入配置示例
 
 技能（`skills/smart-report/`）与 MCP 服务（`smartreportgen`）都不绑定特定 agent。本目录是各 agent 的 MCP 配置模板；
-Codex CLI 可运行 `codex mcp login smartreportgen` 完成海尔 IAM 登录。下方 Bearer 配置示例从环境变量 `SMARTREPORT_TOKEN` 读取令牌或由客户端交互输入。令牌应存放在本机的凭证存储中。
-令牌来源：客户端或 agent 宿主从海尔 IAM 取得 access token（服务端向 IAM 核实）。
-若宿主把 IAM 票放在自定义头里，可配置为 `X-IAM-Access-Token: <IAM 票>`（如 Codex 的 `env_http_headers`）。
+MCP 仅接受 `Authorization: Bearer <海尔 IAM access token>`。客户端或宿主从海尔 IAM 取得令牌，再通过 `SMARTREPORT_TOKEN` 环境变量或客户端凭证输入配置 Bearer 请求头。
 详细步骤见[部署文档第 10 节：接入 Agent](../docs/DEPLOYMENT.md#10-接入-agent)。报告流程见[技能流程总览](../skills/smart-report/SKILL.md#流程总览)，新报告按第 1–6 步执行，查看或修订已有报告使用第 7 步。
 
 | Agent | MCP 配置放在 | 本目录模板 | 技能目录 | 验证情况 |
 |---|---|---|---|---|
-| Claude Code | 项目 `.mcp.json`（仓库已带） | — | `.claude/skills/`（仓库已链接）或 `~/.claude/skills/` | 已实测 |
-| Codex | 项目 `.codex/config.toml`（仓库已带）或 `~/.codex/config.toml` | — | `.agents/skills/`（仓库已链接）或 `~/.codex/skills/`、`~/.agents/skills/` | 已验证 IAM 登录及 MCP 调用 |
+| Claude Code | 通过 `claude mcp add --header` 配置 Bearer | 见部署文档 10.1 | `.claude/skills/`（仓库已链接）或 `~/.claude/skills/` | 已实测 |
+| Codex | `~/.codex/config.toml` 或项目 `.codex/config.toml` | 见部署文档 10.2 | `.agents/skills/`（仓库已链接）或 `~/.codex/skills/`、`~/.agents/skills/` | 已核对 CLI 参数 |
 | Cursor | `.cursor/mcp.json` 或 `~/.cursor/mcp.json` | `cursor.mcp.json` | 无技能机制时读 `AGENTS.md`，或调 `get_skill_guide` | 未实测 |
 | VS Code Copilot | `.vscode/mcp.json` | `vscode.mcp.json`（首次使用时提示输入令牌） | 同上 | 未实测 |
 | Gemini CLI | `~/.gemini/settings.json` 或项目 `.gemini/settings.json` | `gemini.settings.json` | 同上 | 未实测 |

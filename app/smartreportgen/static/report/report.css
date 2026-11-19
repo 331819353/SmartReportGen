@@ -105,14 +105,20 @@ body{margin:0;background:var(--color-bg-page);color:var(--color-text-primary);fo
 .rf-text p{margin:0 0 10px}
 .rf-text ul,.rf-text ol{margin:0 0 10px;padding-left:22px}
 .rf-text strong,.rf-summary strong{font-weight:700}
-.rf-summary strong{color:var(--color-heading)}
+.rf-summary strong:not([class*="srg-"]){color:var(--color-heading)}
 .rf-text table{border-collapse:collapse;margin:8px 0 12px;font-size:var(--rre-card-font-table-size)}
 .rf-text th,.rf-text td{border:1px solid var(--color-border-card);padding:6px 10px}
 .rf-text code{font-size:12px;background:var(--color-bg-page);padding:1px 5px;border-radius:4px}
 .rf-metric{font-weight:800;color:var(--color-heading);font-variant-numeric:tabular-nums;white-space:nowrap}
-/* 状态由报告自身的计算设置，样式仅负责按当前主题显示。 */
-:is(.rf-metric,.rf-table [data-state])[data-state=positive]{color:var(--color-trend-up)}
-:is(.rf-metric,.rf-table [data-state])[data-state=negative]{color:var(--color-trend-down)}
+/* 旧结构化报告仍使用原主题，新契约元素优先使用统一状态变量。 */
+:is(.rf-metric,.rf-table [data-state])[data-state=positive]:not([class*="srg-"]){color:var(--color-trend-up)}
+:is(.rf-metric,.rf-table [data-state])[data-state=negative]:not([class*="srg-"]){color:var(--color-trend-down)}
+.srg-up { color: var(--srg-up) }
+.srg-down { color: var(--srg-down) }
+.srg-neutral { color: var(--srg-neutral) }
+.srg-met { color: var(--srg-met) }
+.srg-miss { color: var(--srg-miss) }
+.srg-warning { color: var(--srg-warning) }
 
 /* 卡片按 60 等分计算换行宽度，再由该行的卡片分配余量；同行拉伸到最高卡片的高度。 */
 .rf-grid{--rf-grid-gap:var(--rre-card-gap);display:flex;flex-wrap:wrap;align-items:stretch;gap:var(--rf-grid-gap);margin:8px 0 4px}

@@ -105,9 +105,9 @@ def _read(owner: str, ref: UUID, suffix: str) -> str | None:
     return None
 
 
-def save_query(owner: str, columns: list[str], rows: list[list], sample_rows: int) -> dict:
+def save_query(owner: str, columns: list[str], rows: list[list], sample_rows: int, *, origin: dict | None = None) -> dict:
     """保存全部结果；只返回有字节上限的列名与前几行完整样本。"""
-    payload = _json({"columns": columns, "rows": rows})
+    payload = _json({"columns": columns, "rows": rows, **({"origin": origin} if origin else {})})
     if len(payload.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
         raise ReportDataError("查询结果超过单个快照的 32 MiB 上限，请缩小查询范围、减少字段或分批查询")
     ref = _write(owner, "json", payload)
@@ -132,17 +132,27 @@ def save_query(owner: str, columns: list[str], rows: list[list], sample_rows: in
             "expires_in_seconds": TTL_SECONDS}
 
 
+def read_snapshot(owner: str, snapshot_id: str) -> dict:
+    try:
+        payload = _read(owner, UUID(snapshot_id), "json")
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ReportDataError("快照 ID 无效") from exc
+    if payload is None:
+        raise ReportDataError("快照不可用、无权限或已过期，请重新取数")
+    return json.loads(payload)
+
+
 def save_style(owner: str, css: str) -> str:
     return str(_write(owner, "css", css))
 
 
 def save_preview(owner: str, html: str, *, source_html: str | None = None,
                  report_id: int | None = None, requested_report_id: int | None = None,
-                 base_version: int | None = None) -> UUID:
+                 base_version: int | None = None, proof: dict | None = None) -> UUID:
     ref = _write(owner, "html", html)
     if source_html is not None:
         meta = {"html": source_html, "report_id": report_id,
-                "requested_report_id": requested_report_id, "base_version": base_version}
+                "requested_report_id": requested_report_id, "base_version": base_version, "proof": proof}
         _write_ref(owner, ref, "meta.json", _json(meta))
     return ref
 
@@ -355,7 +365,8 @@ def embed(html: str, owner: str, base_html: str = "") -> str:
             if payload is None:
                 raise ReportDataError(f"数据快照不可用或已过期，请重新取数：{block_id}")
             # JSON 仍须符合 HTML 脚本标签的解析规则，防止数据中的 </script> 关闭标签。
-            return "embedded", payload.replace("<", "\\u003c")
+            body = json.loads(payload)
+            return "embedded", _json({"columns": body["columns"], "rows": body["rows"]}).replace("<", "\\u003c")
 
         if block.kind == "vendor":
             if data.strip():

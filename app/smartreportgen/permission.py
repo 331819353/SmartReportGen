@@ -50,33 +50,57 @@ class Access:
         return out
 
 
+def source_scene_tables(source: dict, principal: Principal | None = None) -> dict[str, dict]:
+    """取得数据源开放给用户建场景的表，始终以管理员配置的标识符为准。"""
+    if not source.get("enabled", True):
+        return {}
+    entries = (source.get("config") or {}).get("scenario_tables", [])
+    if not isinstance(entries, list) or any(not isinstance(item, dict) or not isinstance(item.get("table_name"), str)
+                                             for item in entries):
+        return {}
+    # 未传员工用于加载表的固定行范围。员工可选表还须匹配工号或角色。
+    if principal is None:
+        return {item["table_name"]: item for item in entries}
+    if not principal.registered:
+        return {}
+    return {item["table_name"]: item for item in entries
+            if principal.is_admin or principal.emp_no in item.get("employees", [])
+            or set(principal.roles).intersection(item.get("roles", []))}
+
+
 def access_for(p: Principal) -> Access:
     if p.is_admin:
         return Access(principal=p, all=True)
-    if not p.registered or not p.emp_no:
-        return Access(principal=p)
-    rows = db.fetchall(
-        """SELECT g.dataset_id, g.table_name FROM permission.table_grant g
-           JOIN dataset.dataset d ON d.id = g.dataset_id AND d.enabled
-           WHERE (g.subject_type='employee' AND g.subject=%s) OR (g.subject_type='role' AND g.subject = ANY(%s))""",
-        (p.emp_no, p.roles or []),
-    )
     acc = Access(principal=p)
-    wildcard = {r["dataset_id"] for r in rows if r["table_name"] == "*"}
-    if wildcard:
-        for t in db.fetchall("SELECT dataset_id, table_name FROM dataset.dataset_table WHERE dataset_id = ANY(%s)",
-                             (list(wildcard),)):
-            acc.tables.setdefault(t["dataset_id"], set()).add(t["table_name"].lower())
-    # 显式表授权仅在该表仍属于数据集时生效
-    explicit = [r for r in rows if r["table_name"] != "*"]
-    if explicit:
-        existing = {(t["dataset_id"], t["table_name"].lower()) for t in db.fetchall(
-            "SELECT dataset_id, table_name FROM dataset.dataset_table WHERE dataset_id = ANY(%s)",
-            (list({r["dataset_id"] for r in explicit}),))}
-        for r in explicit:
-            key = (r["dataset_id"], r["table_name"].lower())
-            if key in existing:
-                acc.tables.setdefault(key[0], set()).add(key[1])
+    if not p.registered or not p.emp_no:
+        return acc
+    # 历史场景按原授权处理。个人场景的作者自动获得配置的表，受邀用户还须有场景授权。
+    # 每次仍与数据源当前开放表取交集，撤销源权限后既有个人场景不再授予数据访问。
+    rows = db.fetchall(
+        """WITH grants AS (
+               SELECT DISTINCT dataset_id, table_name FROM permission.table_grant
+               WHERE (subject_type='employee' AND subject=%s) OR (subject_type='role' AND subject=ANY(%s))
+           )
+           SELECT d.id AS dataset_id, d.owner_emp_no, d.datasource_id, t.table_name,
+                  CASE WHEN d.owner_emp_no IS NOT NULL THEN s.config END AS config
+           FROM dataset.dataset d JOIN dataset.dataset_table t ON t.dataset_id=d.id
+           LEFT JOIN datasource.datasource s ON s.id=d.datasource_id
+           WHERE d.enabled AND (d.owner_emp_no IS NULL OR s.enabled)
+             AND (d.owner_emp_no=%s OR EXISTS (
+                 SELECT 1 FROM grants g WHERE g.dataset_id=d.id
+                 AND (g.table_name='*' OR lower(g.table_name)=lower(t.table_name))
+             ))""",
+        (p.emp_no, p.roles or [], p.emp_no),
+    )
+    permitted = {}
+    for row in rows:
+        if row["owner_emp_no"] is not None:
+            source_id = row["datasource_id"]
+            if source_id not in permitted:
+                permitted[source_id] = source_scene_tables(row, p)
+            if row["table_name"] not in permitted[source_id]:
+                continue
+        acc.tables.setdefault(row["dataset_id"], set()).add(row["table_name"].lower())
     return acc
 
 

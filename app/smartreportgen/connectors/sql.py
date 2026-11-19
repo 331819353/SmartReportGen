@@ -1,6 +1,8 @@
 """关系型数据库连接器：MySQL / StarRocks（MySQL 协议）/ PostgreSQL / Oracle。"""
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import re
 import time
 from typing import Any
@@ -50,6 +52,7 @@ def _build_engine(ds_type: str, cfg: dict, password: str) -> Engine:
 
         schema = oracle_schema(cfg)
         oracledb.defaults.fetch_lobs = False
+        oracledb.defaults.fetch_decimals = True
         if cfg.get("service_name"):
             url = URL.create("oracle+oracledb", user, password or None, host, port,
                              query={"service_name": cfg["service_name"]})
@@ -81,12 +84,39 @@ class SQLConnector(Connector):
         super().__init__(ds, secret)
         self.type = ds["type"]
         self.engine = _build_engine(self.type, self.cfg, secret)
+        self._report_connection = ContextVar("report_sql_connection", default=None)
+
+    @contextmanager
+    def report_batch(self):
+        """同一只读事务中采集整个报告批次，连接不跨线程或调用复用。"""
+        begin = {
+            "postgresql": ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",),
+            "mysql": ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                      "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"),
+            "oracle": ("SET TRANSACTION READ ONLY",),
+        }
+        if self.type not in begin:
+            raise ConnectorError("该数据源未提供多语句一致性读取")
+        try:
+            with self.engine.connect() as conn:
+                for statement in begin[self.type]:
+                    conn.exec_driver_sql(statement)
+                token = self._report_connection.set(conn)
+                try:
+                    yield "read_only_snapshot"
+                finally:
+                    self._report_connection.reset(token)
+        except ConnectorError:
+            raise
+        except Exception as exc:
+            raise ConnectorError(f"{self.type} 无法完成一致性批量读取") from exc
 
     # ---------------- helpers ----------------
     def _run(self, sql: str, params: Any = None, limit: int | None = None, *, normalize: bool = True) -> tuple[list[str], list[list]]:
         try:
             # 包含连接池等待、执行和取回结果；不把 SQL 文本或查询参数写入计时日志。
-            with measure("sql.execute"), self.engine.connect() as c:
+            active = self._report_connection.get()
+            with measure("sql.execute"), (nullcontext(active) if active is not None else self.engine.connect()) as c:
                 if params is None:
                     res = c.execution_options(no_parameters=True).exec_driver_sql(sql)
                 else:

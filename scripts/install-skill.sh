@@ -76,10 +76,12 @@ done
 
 cat <<'EOF'
 
-下一步：为 agent 注册 MCP 服务。Claude Code 使用 Bearer 令牌，Codex 使用海尔 IAM 浏览器登录。
-  export SMARTREPORT_TOKEN=<海尔 IAM access token>
+下一步在启动 agent 的终端中，将海尔 IAM access token 读入环境变量并注册 MCP 服务。
+  printf '海尔 IAM access token: '
+  IFS= read -r -s SMARTREPORT_TOKEN
+  printf '\n'
+  export SMARTREPORT_TOKEN
   Claude Code: claude mcp add --transport http smartreportgen http://localhost:18600/mcp --header "Authorization: Bearer $SMARTREPORT_TOKEN"
-  Codex:       codex mcp add smartreportgen --url http://localhost:18600/mcp --oauth-client-id smartreportgen-cli
-               codex mcp login smartreportgen
+  Codex:       codex mcp add smartreportgen --url http://localhost:18600/mcp --bearer-token-env-var SMARTREPORT_TOKEN
   其他 agent:  见 integrations/README.md
 EOF

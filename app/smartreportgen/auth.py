@@ -78,16 +78,14 @@ def verify_iam_token(raw: str, *, via: str = "iam", register: str | None = "mcp"
     return principal_for(account.emp_no, account.name, via=via, register=register)
 
 
-def verify_bearer(authorization: str | None, iam_token: str | None = None) -> Principal:
-    """HTTP 和 MCP 共用 IAM 核验。iam_token 兼容 MCP 宿主注入的专用请求头。"""
-    if authorization is not None:
-        scheme, _, raw = authorization.strip().partition(" ")
-        if scheme.lower() != "bearer" or not raw.strip():
-            raise AuthError("请使用 Authorization: Bearer <IAM access token>")
-        return verify_iam_token(raw.strip())
-    if iam_token and iam_token.strip():
-        return verify_iam_token(iam_token.strip())
-    raise AuthError("缺少海尔 IAM access token")
+def verify_bearer(authorization: str | None) -> Principal:
+    """从标准 Authorization 请求头读取海尔 IAM 原票，再按工号核验身份。"""
+    if authorization is None:
+        raise AuthError("缺少海尔 IAM access token")
+    scheme, _, raw = authorization.strip().partition(" ")
+    if scheme.lower() != "bearer" or not raw.strip():
+        raise AuthError("请使用 Authorization: Bearer <IAM access token>")
+    return verify_iam_token(raw.strip())
 
 
 # 浏览器 Cookie 只是会话 ID。IAM 原票留在服务端加密保存，不能用会话 ID 调 HTTP Bearer 或 MCP。

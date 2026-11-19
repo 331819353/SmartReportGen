@@ -40,6 +40,19 @@ for (const [value, state] of [[1.001, 'met'], [1, 'met'], [0.99997, 'miss']]) {
   assert.equal(f.metricState(value, {kind: 'attainment', scale: 'decimal', threshold: 1}), state);
 }
 assert.equal(f.metricState(1, {kind: 'attainment', scale: 'decimal'}), 'neutral');
+// 展示舍入不能使临界原值变为达标，反向场景保留原符号。
+const justBelow = {$decimal: '0.99999999999999999999'};
+assert.equal(f.fmtPct(justBelow, {scale: 'decimal'}), '100.00%');
+assert.equal(f.metricState(justBelow, {kind: 'attainment', scale: 'decimal', threshold: 1, warningThreshold: .95}), 'warning');
+assert.equal(f.metricState(3, {kind: 'trend', scale: 'number', direction: 'lower'}), 'down');
+assert.equal(f.metricState(-3, {kind: 'trend', scale: 'number', direction: 'lower'}), 'up');
+assert.equal(f.metricState(10, {kind: 'attainment', scale: 'number', threshold: 10, warningThreshold: 12, direction: 'lower'}), 'met');
+assert.equal(f.metricState(11, {kind: 'attainment', scale: 'number', threshold: 10, warningThreshold: 12, direction: 'lower'}), 'warning');
+assert.equal(f.fmtNum({$decimal: '9007199254740993'}, {digits: 0}), '9,007,199,254,740,993');
+// 浮动柱单独核验十进制期末，几何不反过来改写报告值。
+const bridge = f.bridgeCoordinates({$decimal: '0.1'}, [{$decimal: '0.2'}, {$decimal: '-0.1'}], {$decimal: '0.2'});
+assert.equal(JSON.stringify(bridge), '[[0,0.1],[0.1,0.3],[0.3,0.2],[0,0.2]]');
+assert.equal(f.bridgeCoordinates(100, [12, -6], 105), null);
 assert.equal(f.stateColor('up'), properties['--srg-up']);
 assert.equal(f.stateColor('unknown'), properties['--srg-neutral']);
 const classes = new Set(['metric', 'srg-down']);

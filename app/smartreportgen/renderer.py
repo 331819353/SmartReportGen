@@ -105,11 +105,16 @@ def run_queries(tpl: Template, dataset_id: int | None = None, max_rows: int | No
         except (ConnectorError, repo.NotFound, RuntimeError, PermissionError) as e:
             errors.append(f"查询 {qid} 执行失败：{e}")
             continue
-        data[qid] = {"columns": res["columns"], "rows": res["rows"]}
+        # 旧版运行时仅接收普通 JSON 标量；新版编译器完整保留 Decimal 类型。
+        rows = [[cell["$decimal"] if isinstance(cell, dict) and "$decimal" in cell else cell
+                 for cell in row] for row in res["rows"]]
+        data[qid] = {"columns": res["columns"], "rows": rows}
         stats[qid] = {"datasource": ds["name"], "rows": len(res["rows"]), "columns": res["columns"],
                       "truncated": res["truncated"], "ms": int((time.time() - t0) * 1000)}
         if res["truncated"]:
-            errors.append(f"查询 {qid} 结果超过 {max_rows} 行已截断——请在 SQL 中先聚合到图表与筛选所需的粒度")
+            errors.append(f"查询 {qid} 执行失败：超过 {max_rows} 行，请缩小查询范围")
+        if res.get("source_complete") is False:
+            errors.append(f"查询 {qid} 执行失败：API 数据未提供全量证明")
     return data, stats, errors
 
 

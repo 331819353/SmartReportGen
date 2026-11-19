@@ -13,3 +13,5 @@ markdown-it-py==3.0.0
 cryptography==45.0.3
 mcp==1.30.0
 sqlglot==30.31.0
+playwright==1.51.0
+tinycss2==1.4.0

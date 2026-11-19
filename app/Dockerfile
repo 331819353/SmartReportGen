@@ -5,6 +5,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_
 ARG PIP_INDEX_URL=https://pypi.org/simple
 WORKDIR /srv
 
+# 使用镜像内 Chromium 验收离线报告，MCP 客户端无需安装浏览器。
+RUN apt-get update && apt-get install -y --no-install-recommends chromium fonts-noto-cjk && rm -rf /var/lib/apt/lists/*
+
 COPY app/requirements.txt .
 RUN pip install --retries 10 --timeout 60 -i ${PIP_INDEX_URL} -r requirements.txt
 

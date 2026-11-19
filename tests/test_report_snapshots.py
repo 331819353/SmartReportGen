@@ -144,7 +144,7 @@ class ReportSnapshotsTest(unittest.TestCase):
                 preview = mcp_server.preview_report_html(draft, None)
                 saved = mcp_server.save_report("测试报告", draft, None)
                 self.assertFalse(preview["ok"])
-                self.assertEqual(saved, preview)
+                self.assertIn("已验收", saved["error"])
                 self.assertIn("数据块 id 与页面元素重复：forecast", preview["error"])
         # 静态 template 的普通元素不与主文档争用 id；数据块本身必须在主文档中。
         valid = document('<template><section id="forecast"></section></template>', data)
@@ -213,40 +213,23 @@ class ReportSnapshotsTest(unittest.TestCase):
             denied = mcp_server.save_report("盗用预览", ctx=None, preview_id=preview["preview_id"])
             self.assertFalse(denied["ok"])
             self.assertIn("预览源码不可用", denied["error"])
-        # 使用 preview_id 保存报告，传给 repo.save_report 的正是同一份源 HTML。
-        with patch.object(mcp_server.repo, "save_report", return_value={
-            "id": 99, "revision": 1, "meta": {"html_bytes": preview["html_bytes"]},
-        }) as save_mock:
-            saved = mcp_server.save_report("新报告", ctx=None, preview_id=preview["preview_id"])
-        self.assertTrue(saved["ok"], saved)
-        self.assertEqual(save_mock.call_args.args[1], draft)
-        # 传参互斥校验。
-        both = mcp_server.save_report("冲突", html=draft, ctx=None, preview_id=preview["preview_id"])
-        neither = mcp_server.save_report("缺失", ctx=None)
-        self.assertFalse(both["ok"])
-        self.assertFalse(neither["ok"])
-
-        # 基于已有报告预览后的 preview_id 只能用于 revise_report，且校验 report_id 与 base_version。
+        # 历史 HTML 预览是诊断草稿，不能用预览 ID 绕过服务端验收或直接替换正文。
+        with patch.object(mcp_server.repo, "save_report") as save_mock:
+            denied = mcp_server.save_report("新报告", ctx=None, preview_id=preview["preview_id"])
+        self.assertFalse(denied["ok"], denied)
+        self.assertIn("验收证据", denied["error"])
+        save_mock.assert_not_called()
+        self.assertFalse(mcp_server.save_report("冲突", html=draft, ctx=None, preview_id=preview["preview_id"])["ok"])
+        self.assertFalse(mcp_server.save_report("缺失", ctx=None)["ok"])
         expanded = report_data.embed(draft, self.owner.emp_no)
         base_report = {"id": 99, "revision": 2, "access_level": "edit", "html": expanded, "meta": {"single_file": True}}
-        revised_draft = document(block("targets", "base")).replace("</script>", "</script><!--v3-->", 1)
         with patch.object(mcp_server.repo, "get_report", return_value=base_report):
-            rev_preview = mcp_server.preview_report_html(revised_draft, None, report_id=99, base_version=2)
+            rev_preview = mcp_server.preview_report_html(document(block("targets", "base")), None, report_id=99, base_version=2)
         self.assertTrue(rev_preview["ok"], rev_preview)
-        wrong_save = mcp_server.save_report("误调新建", ctx=None, preview_id=rev_preview["preview_id"])
-        self.assertFalse(wrong_save["ok"])
-        self.assertIn("revise_report", wrong_save["error"])
-        mismatch_report = mcp_server.revise_report(100, "错报告", None, preview_id=rev_preview["preview_id"])
-        mismatch_ver = mcp_server.revise_report(99, "错版本", None, base_version=1, preview_id=rev_preview["preview_id"])
-        self.assertFalse(mismatch_report["ok"])
-        self.assertFalse(mismatch_ver["ok"])
-        with patch.object(mcp_server.services, "revise_report", return_value={
-            "id": 99, "revision": 3, "url": "u", "content_url": "c", "download_url": "d",
-        }) as rev_mock:
-            ok_rev = mcp_server.revise_report(99, "修订报告", None, preview_id=rev_preview["preview_id"])
-        self.assertTrue(ok_rev["ok"], ok_rev)
-        self.assertEqual(rev_mock.call_args.kwargs["html"], revised_draft)
-        self.assertEqual(rev_mock.call_args.kwargs["base_version"], 2)
+        with patch.object(mcp_server.repo, "update_report") as update_mock:
+            denied = mcp_server.revise_report(99, "修订报告", None, preview_id=rev_preview["preview_id"])
+        self.assertFalse(denied["ok"], denied)
+        update_mock.assert_not_called()
 
     def test_snapshot_query_returns_up_to_200_sample_rows_without_truncation(self):
         big_connector = APIConnector(self.source, "")

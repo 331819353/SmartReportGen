@@ -43,8 +43,13 @@ def table_filters(rules: object, table: str, columns: list[dict]) -> list[dict]:
     return out
 
 
+def effective_filters(table: dict) -> list[dict]:
+    # 源范围与场景条件同时满足，同字段来自不同层时也要保留两条条件。
+    return [*(table.get("source_row_filters") or []), *(table.get("row_filters") or [])]
+
+
 def has_filters(dataset: dict | None) -> bool:
-    return bool(dataset and any(t.get("row_filters") for t in dataset.get("tables", ())))
+    return bool(dataset and any(effective_filters(t) for t in dataset.get("tables", ())))
 
 
 def _table_name(name: str, dialect: str) -> exp.Table:
@@ -107,7 +112,7 @@ def _physical_tables(tree: exp.Expr) -> list[tuple[Scope, exp.Table]]:
 
 
 def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connector,
-                      allowed: set[str] | None = None) -> dict:
+                      allowed: set[str] | None = None, *, query_binds: tuple[str, dict] | None = None, validate_sql=None) -> dict:
     """先确认场景及表范围，再用参数化子查询替换所有物理表引用。"""
     ds_type = ds_row["type"]
     dialect = DIALECT[ds_type]
@@ -147,9 +152,10 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         for key in keys:
             scope_tables.setdefault(key, []).append((item, table))
 
-    params, source_tables, oracle_types = {}, {}, {}
+    params, source_tables, oracle_types = dict(query_binds[1]) if query_binds else {}, {}, {}
     marker = f"sr_{uuid4().hex}_"
     replacements = []
+    qualified = False
     for scope, table in refs:
         name = _key(table, dialect)
         matches = scope_tables.get(name, [])
@@ -161,11 +167,15 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         if allowed is not None and item["table_name"].lower() not in allowed:
             raise PermissionDenied(f"无权访问数据表或视图：{item['table_name']}")
         source_tables[item["table_name"]] = None
-        rules = item.get("row_filters")
+        rules = effective_filters(item)
         if ds_type == "api":
             # DuckDB 在 CTE 定义内也会拦截同名物理表；明确使用内存库的 main Schema。
             table.set("db", exp.to_identifier("main"))
         if not rules:
+            # 无固定行条件的简写，也必须绑定登记 Schema，防止搜索路径落到另一张同名表。
+            if ds_type != "api" and not table.db and (configured.db or default):
+                table.set("db", configured.args["db"].copy() if configured.db else exp.to_identifier(default, quoted=True))
+                qualified = True
             continue
         # 需要保留数据库特有表修饰符的查询，不能静默退回原表或改变其语义。
         if any(table.args.get(arg) for arg in table.args.keys() - {"this", "db", "catalog", "alias", "joins", "only"}):
@@ -204,7 +214,9 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
 
     # 使用已校验且去重的物理表名，让 Agent 能核对各条查询实际覆盖的场景表。
     tables_used = list(source_tables)
-    if not replacements and ds_type != "api":
+    if validate_sql is not None:
+        validate_sql(sql, ds_type)
+    if not replacements and not qualified and ds_type != "api" and not query_binds:
         return {**connector.query(sql, limit, tables=tables_used), "tables_used": tables_used}
 
     for scope, table, _, configured_name in replacements:
@@ -232,4 +244,6 @@ def query_in_scenario(ds_row: dict, dataset: dict, sql: str, limit: int, connect
         else:
             fmt = ":%s" if ds_type == "oracle" else "$%s"
         rendered = re.sub(rf"\b{marker}(p\d+)\b", lambda m: fmt % m[1], rendered)
+        if query_binds:
+            rendered = re.sub(rf"\b{query_binds[0]}(q\d+)\b", lambda m: fmt % m[1], rendered)
     return {**connector.query(rendered, limit, params=params, tables=tables_used), "tables_used": tables_used}

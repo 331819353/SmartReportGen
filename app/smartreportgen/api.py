@@ -22,13 +22,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from . import auth, db, design, embedding, iam, mcp_oauth, permission, repo, report_data, seed, services
+from . import auth, db, design, embedding, iam, permission, repo, report_data, report_pipeline, report_spec, seed, services
 from .config import settings
 from .connectors import ConnectorError, get_connector
 from .renderer import RenderError, render, standalone, validate
+from .report_document import skill_dir
 from .template_parser import TemplateError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -67,7 +68,6 @@ app = FastAPI(
         f"完整示例见 [HTTP 接入说明]({settings.public_path('/api-guide')})。"
     ),
 )
-app.include_router(mcp_oauth.router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -160,8 +160,9 @@ async def auth_middleware(request: Request, call_next):
 # 普通用户可访问的接口（默认拒绝）；接口内部再按“有权限 / 本人创建”过滤
 USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("GET", r"^/api/meta$"),
-    ("GET", r"^/api/datasources(/\d+)?$"),
+    ("GET", r"^/api/datasources(/\d+(/tables|/columns|/values)?)?$"),
     ("GET", r"^/api/datasets(/search|/\d+)?$"), ("GET", r"^/api/scenarios$"),
+    ("POST", r"^/api/datasets$"), ("PUT", r"^/api/datasets/\d+$"), ("DELETE", r"^/api/datasets/\d+$"),
     ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
     ("POST", r"^/api/style-rules(/effective|/preview)?$"), ("PUT", r"^/api/style-rules/\d+$"),
     ("DELETE", r"^/api/style-rules/\d+$"),
@@ -182,7 +183,7 @@ async def _nf(_r, e):
 
 
 for _exc in (repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeError, auth.AuthError,
-             report_data.ReportDataError):
+             report_data.ReportDataError, ValueError, ValidationError):
     app.add_exception_handler(_exc, lambda _r, e: JSONResponse({"detail": str(e)}, status_code=400))
 
 
@@ -244,6 +245,8 @@ def _api_guide_html() -> str:
     markdown = (DOCS / "HTTP_API.md").read_text(encoding="utf-8")
     markdown = markdown.replace("../skills/smart-report/references/template-spec.md",
                                 settings.public_path("/api-guide/template-spec"))
+    markdown = markdown.replace("../skills/smart-report/references/declarative-report.md",
+                                settings.public_path("/api-guide/report-spec"))
     body = renderer.render(markdown)
     home = settings.public_path("/")
     docs = settings.public_path("/docs")
@@ -264,9 +267,13 @@ def api_guide():
 
 @app.get("/api-guide/template-spec", include_in_schema=False)
 def api_template_spec():
-    spec = DOCS / "skill" / "references" / "template-spec.md"
-    if not spec.is_file():
-        spec = DOCS.parent / "skills" / "smart-report" / "references" / "template-spec.md"
+    spec = skill_dir() / "references" / "template-spec.md"
+    return Response(spec.read_text(encoding="utf-8"), media_type="text/plain")
+
+
+@app.get("/api-guide/report-spec", include_in_schema=False)
+def api_report_spec():
+    spec = skill_dir() / "references" / "declarative-report.md"
     return Response(spec.read_text(encoding="utf-8"), media_type="text/plain")
 
 
@@ -286,8 +293,7 @@ def _me(p: auth.Principal | None) -> dict:
 
 @app.get("/api/auth/config")
 def auth_config(request: Request):
-    return {"mode": "iam", "iam_configured": iam.configured(), "mcp_oauth": mcp_oauth.enabled(),
-            "me": _me(request.state.principal)}
+    return {"mode": "iam", "iam_configured": iam.configured(), "me": _me(request.state.principal)}
 
 
 @app.get("/api/auth/check")
@@ -320,8 +326,6 @@ def iam_login(request: Request, next: str = ""):
 
 @app.get("/auth/iam/callback", include_in_schema=False)
 def iam_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    if state.startswith(mcp_oauth.STATE_PREFIX):
-        return mcp_oauth.complete_iam(request, code, state, error)
     browser = request.cookies.get(auth.LOGIN_COOKIE)
     try:
         # 单独识别未带回 Cookie 的回调，便于区分浏览器会话丢失和 IAM 授权失败。
@@ -483,7 +487,10 @@ def ds_list(request: Request):
     if _is_admin(request):
         return J(rows)
     ids = _visible_datasource_ids(request)
-    return J([{k: r[k] for k in DS_PUBLIC} for r in rows if r["id"] in ids])
+    selectable = {row["id"] for row in rows if permission.source_scene_tables(row, _p(request))}
+    visible = ids | selectable
+    return J([{**{k: row[k] for k in DS_PUBLIC}, "can_build_scene": row["id"] in selectable}
+              for row in rows if row["id"] in visible])
 
 
 @app.post("/api/datasources")
@@ -497,9 +504,10 @@ def ds_get(request: Request, ds_id: int):
     r = repo.get_datasource(ds_id)
     if _is_admin(request):
         return J(r)
-    if ds_id not in _visible_datasource_ids(request):
+    selectable = bool(permission.source_scene_tables(r, _p(request)))
+    if not selectable and ds_id not in _visible_datasource_ids(request):
         raise repo.NotFound("数据源不存在")
-    return J({k: r[k] for k in DS_PUBLIC})
+    return J({**{k: r[k] for k in DS_PUBLIC}, "can_build_scene": selectable})
 
 
 @app.put("/api/datasources/{ds_id}")
@@ -538,10 +546,21 @@ def ds_test(request: Request, ds_id: int):
     return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).test())
 
 
+def _source_table_for_scene(source: dict, table: str, principal: auth.Principal) -> dict:
+    item = permission.source_scene_tables(source, principal).get(table)
+    if item is None:
+        raise permission.PermissionDenied("该表尚未授权用于创建业务场景")
+    return {"table_name": table, "source_row_filters": item.get("row_filters", [])}
+
+
 @app.get("/api/datasources/{ds_id}/tables")
 def ds_tables(request: Request, ds_id: int, schema: str | None = None):
-    _require_admin(request)
-    return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).list_tables(schema))
+    if _is_admin(request):
+        return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).list_tables(schema))
+    source = repo.get_datasource(ds_id)
+    catalog = permission.source_scene_tables(source, _p(request))
+    return J([{"name": name, "table": name, "kind": "table", "comment": item.get("description", ""),
+               "source_row_filters": item.get("row_filters", [])} for name, item in catalog.items()])
 
 
 @app.get("/api/datasources/{ds_id}/describe")
@@ -553,19 +572,25 @@ def ds_describe(request: Request, ds_id: int, table: str, sample_rows: int = 10)
 @app.get("/api/datasources/{ds_id}/columns")
 def ds_columns(request: Request, ds_id: int, table: str):
     """场景过滤编辑器只读取字段，不必扫描行数或数据画像。"""
-    _require_admin(request)
-    return J(get_connector(repo.get_datasource(ds_id, with_secret=True)).columns(table))
+    source = repo.get_datasource(ds_id, with_secret=True)
+    if not _is_admin(request):
+        _source_table_for_scene(source, table, _p(request))
+    return J(get_connector(source).columns(table))
 
 
 @app.get("/api/datasources/{ds_id}/values")
 def ds_values(request: Request, ds_id: int, table: str = Query(min_length=1, max_length=512),
               column: str = Query(min_length=1, max_length=256), q: str = Query("", max_length=120),
               limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=10000)):
-    """编辑场景时读取指定字段的原始候选值；复用数据源浏览的管理员权限。"""
-    _require_admin(request)
+    """编辑场景时读取当前账号有权看到的实际候选值。"""
     if "\x00" in table or "\x00" in column or "\x00" in q:
         raise repo.Invalid("表名、字段和搜索词不能包含空字符")
-    result = get_connector(repo.get_datasource(ds_id, with_secret=True)).distinct_values(table, column, q, limit, offset)
+    source = repo.get_datasource(ds_id, with_secret=True)
+    if _is_admin(request):
+        result = get_connector(source).distinct_values(table, column, q, limit, offset)
+    else:
+        item = _source_table_for_scene(source, table, _p(request))
+        result = services.source_scene_values(source, item, column, q, limit, offset)
     result["next_offset"] = offset + limit if result.pop("has_more") and offset + limit <= 10000 else None
     return J(result)
 
@@ -576,13 +601,23 @@ def ds_query(request: Request, ds_id: int, data: dict = Body(...)):
     return J(services.run_query(repo.get_datasource(ds_id, with_secret=True), data.get("sql", ""), data.get("limit", 200)))
 
 
-# ------------------------------------------------------------------ 数据集（管理员管理；普通用户只读、只看有权限的表）
+# ------------------------------------------------------------------ 数据集（普通用户管理本人创建的场景）
 def _scoped_dataset(request: Request, ds: dict) -> dict:
     if _is_admin(request):
         return ds
+    principal = _p(request)
+    own = ds["owner_emp_no"] == principal.emp_no
     acc = _access(request)
-    tables = [t for t in ds.get("tables", []) if acc.can_table(ds["id"], t["table_name"])]
-    return {**ds, "tables": tables, "table_count": len(tables), "read_only": True}
+    if own:
+        # 已停用的个人场景仍可编辑，表选择器只展示当前仍有来源授权的元数据。
+        source = repo.get_datasource(ds["datasource_id"])
+        eligible = permission.source_scene_tables(source, principal)
+        tables = [table for table in ds["tables"] if table["table_name"] in eligible]
+    else:
+        tables = [table for table in ds["tables"] if acc.can_table(ds["id"], table["table_name"])]
+    names = {table["table_name"] for table in tables}
+    metrics = {key: metric for key, metric in ds.get("semantic_metrics", {}).items() if metric["table"] in names}
+    return {**ds, "tables": tables, "semantic_metrics": metrics, "table_count": len(tables), "read_only": not own}
 
 
 @app.get("/api/datasets")
@@ -591,14 +626,15 @@ def dataset_list(request: Request, q: str | None = None):
     if _is_admin(request):
         return J(rows)
     acc = _access(request)
-    return J([{**d, "table_count": len(acc.tables.get(d["id"], ())), "read_only": True}
-              for d in rows if d["enabled"] and acc.can_dataset(d["id"])])
+    employee = _p(request).emp_no
+    return J([{**d, "table_count": len(acc.tables.get(d["id"], ())), "read_only": d["owner_emp_no"] != employee}
+              for d in rows if d["owner_emp_no"] == employee or (d["enabled"] and acc.can_dataset(d["id"]))])
 
 
 @app.post("/api/datasets")
 def dataset_create(request: Request, data: dict = Body(...)):
-    _require_admin(request)
-    return J(repo.create_dataset(data))
+    ds = repo.create_dataset(data, _p(request))
+    return J(_scoped_dataset(request, ds))
 
 
 @app.get("/api/datasets/search")
@@ -618,21 +654,20 @@ def dataset_reindex(request: Request):
 
 @app.get("/api/datasets/{dataset_id}")
 def dataset_get(request: Request, dataset_id: int):
-    if not _is_admin(request) and not _access(request).can_dataset(dataset_id):
+    dataset = repo.get_dataset(dataset_id)
+    if not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no and not _access(request).can_dataset(dataset_id):
         raise repo.NotFound("数据集不存在")
-    return J(_scoped_dataset(request, repo.get_dataset(dataset_id)))
+    return J(_scoped_dataset(request, dataset))
 
 
 @app.put("/api/datasets/{dataset_id}")
 def dataset_update(request: Request, dataset_id: int, data: dict = Body(...)):
-    _require_admin(request)
-    return J(repo.update_dataset(dataset_id, data))
+    return J(_scoped_dataset(request, repo.update_dataset(dataset_id, data, _p(request))))
 
 
 @app.delete("/api/datasets/{dataset_id}")
 def dataset_delete(request: Request, dataset_id: int):
-    _require_admin(request)
-    repo.delete_dataset(dataset_id)
+    repo.delete_dataset(dataset_id, _p(request))
     return {"ok": True}
 
 
@@ -754,6 +789,11 @@ def tpl_list(request: Request, q: str | None = None):
 @app.post("/api/templates")
 def tpl_create(request: Request, data: dict = Body(...)):
     _require_dataset(request, data.get("dataset_id"))
+    if "spec" in data:
+        spec = report_spec.ReportSpec.model_validate(data["spec"])
+        if type(data.get("dataset_id")) is not int or data["dataset_id"] < 1:
+            raise repo.Invalid("声明式模板须指定 dataset_id")
+        data = {**data, "template_type": "business", "markdown": report_spec.encode_template(spec, data["dataset_id"])}
     return J(repo.save_template({**data, "created_by": _p(request).emp_no}))
 
 
@@ -785,8 +825,14 @@ def tpl_get(request: Request, tpl_id: int):
 
 @app.put("/api/templates/{tpl_id}")
 def tpl_update(request: Request, tpl_id: int, data: dict = Body(...)):
-    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
-    _require_dataset(request, data.get("dataset_id"))
+    tpl = repo.get_template(tpl_id)
+    _check_owner(request, tpl.get("created_by"), "报告模板")
+    dataset_id = data.get("dataset_id", tpl["dataset_id"])
+    _require_dataset(request, dataset_id)
+    if "spec" in data:
+        if type(dataset_id) is not int or dataset_id < 1:
+            raise repo.Invalid("声明式模板须指定 dataset_id")
+        data = {**data, "markdown": report_spec.encode_template(report_spec.ReportSpec.model_validate(data["spec"]), dataset_id)}
     return J(repo.save_template({k: v for k, v in data.items() if k != "created_by"}, tpl_id))
 
 
@@ -798,7 +844,13 @@ def tpl_delete(request: Request, tpl_id: int):
 
 
 @app.get("/api/templates/{tpl_id}/versions/{version}")
-def tpl_version(request: Request, tpl_id: int, version: int):
+def tpl_version(request: Request, tpl_id: int, version: int, report_id: int | None = None,
+                report_version: int | None = None):
+    if report_id is not None:
+        tpl = repo.template_from_report(tpl_id, _p(request), report_id, report_version)
+        if tpl["version"] != version:
+            raise permission.PermissionDenied("指定模板版本与报告关联不符")
+        return J(tpl)
     _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
     return J(repo.get_template_version(tpl_id, version))
 
@@ -807,7 +859,12 @@ def tpl_version(request: Request, tpl_id: int, version: int):
 def tpl_render(request: Request, tpl_id: int, data: dict = Body(default={})):
     tpl = repo.get_template(tpl_id)
     _check_owner(request, tpl.get("created_by"), "报告模板")
-    return J(services.render_template_to_report(tpl, (data or {}).get("name"), guard=_guard(request)))
+    version = data.get("template_version")
+    if version is not None:
+        if type(version) is not int or version < 1:
+            raise repo.Invalid("template_version 须为正整数")
+        tpl = {**tpl, **repo.get_template_version(tpl_id, version)}
+    return J(services.render_template_to_report(tpl, data.get("name"), _p(request), data.get("parameters")))
 
 
 # ------------------------------------------------------------------ 报告（创建人、管理员及被分享的员工）
@@ -815,6 +872,10 @@ class ReportUpdate(BaseModel):
     name: str
     html: str | None = None
     markdown: str | None = None
+    spec: report_spec.ReportSpec | None = None
+    dataset_id: int | None = Field(default=None, ge=1)
+    parameters: dict | None = None
+    preview_id: str | None = None
     base_version: int | None = Field(default=None, ge=1, strict=True)
     expected_version: int | None = Field(default=None, ge=1, strict=True)
     revision: int | None = Field(default=None, ge=1, strict=True)
@@ -856,6 +917,9 @@ def report_merge(request: Request, data: ReportMerge):
 def report_get(request: Request, report_id: int, include_html: bool = False, include_source: bool = False,
                version: int | None = Query(default=None, ge=1)):
     r = repo.get_report(report_id, _p(request), with_html=include_html, version=version, with_source=include_source)
+    if include_source and r.get("markdown") and (decoded := report_spec.decode_template(r["markdown"])):
+        key = "spec" if isinstance(decoded[0], report_spec.ReportSpec) else "free_report"
+        r[key] = decoded[0].model_dump(mode="json")
     return J({**r, **repo.report_links(r["id"], r["revision"])})
 
 
@@ -864,10 +928,28 @@ def report_update(request: Request, report_id: int, data: ReportUpdate):
     # 旧客户端的 revision 同时锁定读取的正文与最新版本，新客户端可以从历史版本分支。
     if data.revision is not None and (data.base_version is not None or data.expected_version is not None):
         raise repo.Invalid("请使用 revision，或使用 base_version 和 expected_version")
-    return J(services.revise_report(report_id, _p(request), data.name, html=data.html, markdown=data.markdown,
-                                  base_version=data.base_version or data.revision, change_note=data.change_note,
-                                  expected_version=data.expected_version or data.revision,
-                                  guard=_guard(request) if data.markdown is not None else None))
+    base_version, expected = data.base_version or data.revision, data.expected_version or data.revision
+    if sum(item is not None for item in (data.spec, data.preview_id, data.html, data.markdown)) > 1:
+        raise repo.Invalid("正文只接受一种输入")
+    principal = _p(request)
+    preview_id = data.preview_id
+    if data.spec is not None:
+        base = repo.get_report(report_id, principal, version=base_version, with_html=False)
+        if base["access_level"] not in ("manage", "edit"):
+            raise permission.PermissionDenied("无权编辑该报告")
+        dataset_id = data.dataset_id or base["dataset_id"]
+        if not dataset_id:
+            raise repo.Invalid("声明式修订须指定业务场景")
+        _require_dataset(request, dataset_id)
+        staged = report_pipeline.preview(data.spec, dataset_id, principal, parameters=data.parameters,
+                                         base=base, requested_report_id=report_id)
+        preview_id = staged["preview_id"]
+    if preview_id:
+        return J(report_pipeline.persist(data.name, principal, preview_id, report_id=report_id,
+                                         base_version=base_version, expected_version=expected,
+                                         change_note=data.change_note))
+    return J(services.revise_report(report_id, principal, data.name, html=data.html, markdown=data.markdown,
+                                  base_version=base_version, change_note=data.change_note, expected_version=expected))
 
 
 @app.get("/api/reports/{report_id}/versions")
@@ -921,12 +1003,15 @@ def _report_attachment(content: str, name: str) -> Response:
 @app.get("/reports/preview/{ref}", response_class=HTMLResponse)
 def report_preview(request: Request, ref: UUID, download: bool = False):
     # 预览包含完整数据，必须按已认证工号读取，不能仅凭 URL 访问。
-    content = report_data.read_preview(_p(request).emp_no, ref)
-    if content is None:
-        raise repo.NotFound("预览不存在、已过期或无权访问")
+    try:
+        _, content = report_pipeline.load_preview(_p(request), str(ref))
+    except report_data.ReportDataError as exc:
+        raise repo.NotFound("预览不存在、已过期或无权访问") from exc
     if download:
         return _report_attachment(content, "报告预览")
-    return HTMLResponse(content, headers=REPORT_HTML_HEADERS)
+    return HTMLResponse(content, headers={**REPORT_HTML_HEADERS,
+        "Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; "
+                                   "style-src 'unsafe-inline'; img-src data:"})
 
 
 @app.get("/reports/{report_id}", response_class=HTMLResponse)

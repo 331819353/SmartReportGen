@@ -12,9 +12,9 @@ from .config import settings
 from .connectors import SUPPORTED_TYPES, ConnectorError, drop_connector, get_connector
 from .connectors.sql import oracle_schema
 from .embedding import EmbeddingError, embed_many, to_pgvector
-from .permission import PermissionDenied
-from .report_document import inline_legacy_echarts, report_document_error
-from .scenario_filters import table_filters
+from .permission import PermissionDenied, source_scene_tables
+from .report_document import report_document_error
+from .scenario_filters import table_filters, table_sql
 from .textproc import add_words, tokenize
 
 log = logging.getLogger(__name__)
@@ -71,6 +71,39 @@ def _validate_ds(data: dict) -> None:
     for k in ("password", "token"):
         if k in cfg:
             raise Invalid(f"不要把 {k} 放在 config 中，请使用 secret 字段")
+    _validate_source_scene_tables(data)
+
+
+def _validate_source_scene_tables(data: dict) -> None:
+    """数据源配置同时登记可供员工创建个人场景的表和不可放宽的行范围。"""
+    config = data.get("config") or {}
+    policies = config.get("scenario_tables", [])
+    if not isinstance(policies, list) or len(policies) > 500:
+        raise Invalid("可建场景的表须为数组，最多 500 项")
+    used = set()
+    for item in policies:
+        if not isinstance(item, dict) or set(item) - {"table_name", "description", "roles", "employees", "row_filters"}:
+            raise Invalid("可建场景的表须包含表名、员工或角色，以及可选的固定行范围")
+        name = item.get("table_name")
+        if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in used or "\x00" in name:
+            raise Invalid("可建场景的表名须有效且唯一")
+        used.add(name.casefold())
+        try:
+            table_sql(data["type"], name)
+            for key in ("roles", "employees"):
+                values = item.get(key, [])
+                if not isinstance(values, list) or any(not isinstance(v, str) or not v.strip() or v != v.strip()
+                                                       or "\x00" in v for v in values):
+                    raise Invalid("员工工号和角色须为有效字符串数组")
+            if not item.get("roles") and not item.get("employees"):
+                raise Invalid(f"{name}：请指定可引用该表的员工或角色")
+            if not isinstance(item.get("description", ""), str):
+                raise Invalid(f"{name}：表描述须为文本")
+            rules = item.get("row_filters", [])
+            fields = [{"name": rule.get("column")} for rule in rules if isinstance(rule, dict)] if isinstance(rules, list) else []
+            table_filters(rules, name, fields)
+        except ConnectorError as exc:
+            raise Invalid(str(exc)) from exc
 
 
 def create_datasource(data: dict) -> dict:
@@ -160,7 +193,7 @@ def list_datasets(q: str | None = None) -> list[dict]:
                  "OR EXISTS (SELECT 1 FROM unnest(d.tags) tag WHERE tag ILIKE %s)")
         params = (pattern, pattern, pattern)
     rows = db.fetchall(
-        "SELECT d.id, d.business_scenario, d.business_description, d.datasource_id, d.tags, d.enabled, "
+        "SELECT d.id, d.business_scenario, d.business_description, d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
         "d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
         "s.type AS datasource_type, (SELECT count(*) FROM dataset.dataset_table t WHERE t.dataset_id=d.id) AS table_count "
         "FROM dataset.dataset d LEFT JOIN datasource.datasource s ON s.id=d.datasource_id" + where + " ORDER BY d.id",
@@ -172,8 +205,8 @@ def list_datasets(q: str | None = None) -> list[dict]:
 def get_dataset(dataset_id: int) -> dict:
     ds = _one(
         db.fetchone(
-            "SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, d.datasource_id, d.tags, d.enabled, "
-            "d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
+            "SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, d.semantic_metrics, d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
+            "s.config AS source_config, s.enabled AS source_enabled, d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
             "s.type AS datasource_type FROM dataset.dataset d LEFT JOIN datasource.datasource s "
             "ON s.id=d.datasource_id WHERE d.id=%s",
             (dataset_id,),
@@ -185,18 +218,39 @@ def get_dataset(dataset_id: int) -> dict:
         "FROM dataset.dataset_table WHERE dataset_id=%s ORDER BY sort, id",
         (dataset_id,),
     )
+    source = {"config": ds.pop("source_config"), "enabled": ds.pop("source_enabled")}
+    if ds["owner_emp_no"] is not None:
+        catalog = source_scene_tables(source)
+        # 场景可追加自己的筛选，数据源固定范围作为独立条件只读附加。
+        ds["tables"] = [{**table, "source_row_filters": catalog[table["table_name"]].get("row_filters", [])}
+                        for table in ds["tables"] if table["table_name"] in catalog]
     return ds
 
 
+def _authorize_personal_scene(data: dict, principal: Principal | None) -> None:
+    source = get_datasource(data["datasource_id"])
+    catalog = source_scene_tables(source, principal)
+    tables = {table["table_name"].strip() for table in data["tables"]}
+    if not tables:
+        raise Invalid("请选择至少一张有权限的数据表或视图")
+    if not tables.issubset(catalog):
+        raise PermissionDenied("个人场景只能选择数据源已授权开放的表或视图")
+
+
 def _validate_dataset(data: dict) -> None:
-    if not (data.get("business_scenario") or "").strip():
-        raise Invalid("业务场景不能为空")
-    if not (data.get("business_description") or "").strip():
-        raise Invalid("业务描述不能为空（混合检索依赖它）")
+    for field, label in (("business_scenario", "业务场景"), ("business_description", "业务描述")):
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise Invalid(f"{label}须为有效文本")
     if data.get("analysis_approach") is not None and not isinstance(data["analysis_approach"], str):
         raise Invalid("分析思路须为文本")
-    if not data.get("datasource_id"):
+    if type(data.get("datasource_id")) is not int or data["datasource_id"] < 1:
         raise Invalid("请选择数据源")
+    tags = data.get("tags") or []
+    if not isinstance(tags, list) or any(not isinstance(tag, str) or "\x00" in tag for tag in tags):
+        raise Invalid("标签须为字符串数组")
+    if type(data.get("enabled", True)) is not bool:
+        raise Invalid("启用状态须为布尔值")
     tables = data.get("tables", [])
     if not isinstance(tables, list) or any(not isinstance(t, dict) for t in tables):
         raise Invalid("数据表须为对象数组")
@@ -238,34 +292,46 @@ def _save_tables(c, dataset_id: int, tables: list[dict]) -> None:
         )
 
 
-def create_dataset(data: dict) -> dict:
+def create_dataset(data: dict, principal: Principal | None = None) -> dict:
+    from .report_queries import validate_metrics
+
     _validate_dataset(data)
+    owner = principal.emp_no if principal is not None and not principal.is_admin else None
+    if owner:
+        _authorize_personal_scene(data, principal)
     tables = _prepare_tables(data)
+    metrics = validate_metrics(data.get("semantic_metrics", {}), tables)
     with db.conn() as c, c.transaction():
         row = c.execute(
-            "INSERT INTO dataset.dataset(business_scenario, business_description, analysis_approach, datasource_id, tags, enabled) "
-            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+            "INSERT INTO dataset.dataset(business_scenario, business_description, analysis_approach, datasource_id, tags, enabled, semantic_metrics, owner_emp_no) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (data["business_scenario"].strip(), data["business_description"].strip(),
              (data.get("analysis_approach") or "").strip(), data["datasource_id"],
-             [t.strip() for t in data.get("tags") or [] if t.strip()], data.get("enabled", True)),
+             [t.strip() for t in data.get("tags") or [] if t.strip()], data.get("enabled", True), db.jsonb(metrics), owner),
         ).fetchone()
         _save_tables(c, row["id"], tables)
     reindex_dataset(row["id"])
     return get_dataset(row["id"])
 
 
-def update_dataset(dataset_id: int, data: dict) -> dict:
+def update_dataset(dataset_id: int, data: dict, principal: Principal | None = None) -> dict:
+    from .report_queries import validate_metrics
+
     cur = get_dataset(dataset_id)
+    _require_scene_manager(cur, principal)
     merged = {**cur, **data}
     _validate_dataset(merged)
+    if cur["owner_emp_no"] is not None:
+        _authorize_personal_scene(merged, principal)
     tables = _prepare_tables(merged, cur) if "tables" in data or cur["datasource_id"] != merged["datasource_id"] else None
+    metrics = validate_metrics(merged["semantic_metrics"], tables if tables is not None else cur["tables"])
     with db.conn() as c, c.transaction():
         c.execute(
             "UPDATE dataset.dataset SET business_scenario=%s, business_description=%s, analysis_approach=%s, datasource_id=%s, tags=%s, "
-            "enabled=%s, updated_at=now() WHERE id=%s",
+            "enabled=%s, semantic_metrics=%s, updated_at=now() WHERE id=%s",
             (merged["business_scenario"].strip(), merged["business_description"].strip(),
              (merged["analysis_approach"] or "").strip(), merged["datasource_id"],
-             [t.strip() for t in merged.get("tags") or [] if t.strip()], merged.get("enabled", True), dataset_id),
+             [t.strip() for t in merged.get("tags") or [] if t.strip()], merged.get("enabled", True), db.jsonb(metrics), dataset_id),
         )
         if tables is not None:
             _save_tables(c, dataset_id, tables)
@@ -276,7 +342,14 @@ def update_dataset(dataset_id: int, data: dict) -> dict:
     return get_dataset(dataset_id)
 
 
-def delete_dataset(dataset_id: int) -> None:
+def _require_scene_manager(dataset: dict, principal: Principal | None) -> None:
+    if principal is not None and not principal.is_admin and dataset["owner_emp_no"] != principal.emp_no:
+        raise PermissionDenied("只能管理本人创建的业务场景")
+
+
+def delete_dataset(dataset_id: int, principal: Principal | None = None) -> None:
+    if principal is not None and not principal.is_admin:
+        _require_scene_manager(get_dataset(dataset_id), principal)
     db.execute("DELETE FROM dataset.dataset WHERE id=%s", (dataset_id,))
 
 
@@ -517,7 +590,7 @@ def template_versions(tpl_id: int) -> list[dict]:
     )
 
 
-def save_template(data: dict, tpl_id: int | None = None) -> dict:
+def save_template(data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
     from .template_parser import parse_template
 
     md = data.get("markdown")
@@ -528,6 +601,8 @@ def save_template(data: dict, tpl_id: int | None = None) -> dict:
     with db.conn() as c, c.transaction():
         cur = _one(c.execute("SELECT * FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone(),
                    "报告模板") if tpl_id is not None else None
+        if expected_version is not None and (not cur or cur["version"] != expected_version):
+            raise ReportConflict("报告模板已被修改，请读取最新版本后再提交")
         # 模板类型在创建时确定，所有历史版本沿用同一种读取和使用方式。
         template_type = data.get("template_type", cur["template_type"] if cur else "structured")
         if template_type not in ("structured", "business"):
@@ -535,10 +610,27 @@ def save_template(data: dict, tpl_id: int | None = None) -> dict:
         if cur and template_type != cur["template_type"]:
             raise Invalid("模板类型在创建后不可更改")
         if template_type == "business":
-            # 业务模板按原文保存，只从 Markdown 标题提取列表所需的摘要。
+            from .report_spec import ReportSpec, decode_template
+
+            decoded = decode_template(md)
+            # 声明式模板保存完整可执行定义。历史业务 Markdown 仍按原文归档。
             title_match = re.search(r"^#[ \t]+([^\n]+)", md, re.M)
             title = title_match[1].strip() if title_match else ""
             summary = {"title": title, "sections": [heading.strip() for heading in re.findall(r"^##[ \t]+(.+)$", md, re.M)]}
+            if decoded:
+                spec, dataset_id = decoded
+                if data.get("dataset_id", cur["dataset_id"] if cur else None) != dataset_id:
+                    raise Invalid("声明式模板内容与关联场景必须一致")
+                title = spec.title
+                if isinstance(spec, ReportSpec):
+                    summary = {"title": title, "sections": [part.title for part in spec.sections], "declarative": True}
+                else:
+                    summary = {"title": title, "modules": list(spec.modules),
+                               "declarative": True, "report_mode": "free_html"}
+            # 自由版式使用单独的模板语义，历史 Markdown 和既有结构化模板可以继续独立编辑。
+            is_free = summary.get("report_mode") == "free_html"
+            if cur and is_free != (cur["summary"].get("report_mode") == "free_html"):
+                raise Invalid("自由版式与其他模板须分别保存")
             default_goal = ""
         else:
             tpl, errors, _warn = parse_template(md)
@@ -637,9 +729,34 @@ def list_reports(principal: Principal, template_id: int | None = None, q: str | 
         params += [_contains_pattern(q)] * 4
     where = (" WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.fetchall(sql + where + " ORDER BY r.id DESC", params)
+    visible = []
     for row in rows:
+        try:
+            _require_report_data(row, principal)
+        except PermissionDenied:
+            continue
         row["access_level"] = _report_access(principal, row)
-    return rows
+        visible.append(row)
+    return visible
+
+
+def _require_report_data(row: dict, principal: Principal) -> None:
+    from .report_spec import validate_scopes
+
+    scopes = row["meta"].get("scopes")
+    if scopes:
+        validate_scopes(scopes, principal)
+    elif not principal.is_admin and row["created_by"] != principal.emp_no:
+        raise PermissionDenied("此历史报告缺少数据来源，需按当前权限重新生成后才能共享")
+
+
+def template_from_report(template_id: int, principal: Principal, report_id: int, version: int | None) -> dict:
+    # 只开放与该协作版本绑定的声明式模板；历史 Markdown 可能含业务原始值和未授权 SQL。
+    row = get_report(report_id, principal, with_html=False, version=version, with_source=True)
+    if row["access_level"] not in ("manage", "edit") or row["template_id"] != template_id or row["meta"].get("source") != "compiled_spec":
+        raise PermissionDenied("无权读取该报告关联的模板版本")
+    return {**get_template_version(template_id, row["template_version"]), "id": template_id,
+            "template_type": "business"}
 
 
 def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
@@ -664,6 +781,14 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
         raise PermissionDenied("无权查看该报告")
     if row["revision"] is None:
         raise NotFound("报告版本不存在")
+    _require_report_data(row, principal)
+    if row["access_level"] in ("manage", "edit") and row["meta"].get("source") == "compiled_spec":
+        row["source_available"] = True
+        if with_source and row["markdown"] is None:
+            # 仅在来源通过当前授权复核后开放该版本的声明式定义。
+            stored = db.fetchone("SELECT markdown FROM report.report_version WHERE report_id=%s AND version=%s",
+                                 (row["id"], row["revision"]))
+            row["markdown"] = stored["markdown"] if stored else None
     if row["access_level"] == "view":
         row["source_available"] = False
         row["markdown"] = None
@@ -677,11 +802,24 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
 
 def list_report_versions(report_id: int, principal: Principal) -> dict:
     report = get_report(report_id, principal, with_html=False)
-    report["versions"] = db.fetchall(
-        "SELECT v.version, v.base_version, v.name, v.created_at, v.created_by, v.change_note, "
+    versions = db.fetchall(
+        "SELECT v.version, v.base_version, v.name, v.created_at, v.created_by, v.change_note, v.meta, "
         "e.name AS creator_name FROM report.report_version v LEFT JOIN permission.employee e ON e.emp_no=v.created_by "
         "WHERE v.report_id=%s ORDER BY v.version DESC", (report["id"],))
+    report["versions"] = []
+    for version in versions:
+        try:
+            _require_report_data({"meta": version.pop("meta"), "created_by": report["created_by"]}, principal)
+        except PermissionDenied:
+            continue
+        report["versions"].append(version)
     return report
+
+
+def report_spec_hash(html: str) -> str:
+    from hashlib import sha256
+
+    return sha256(html.encode()).hexdigest()
 
 
 def _report_name(name: str) -> str:
@@ -705,7 +843,10 @@ def _insert_report_version(c, report_id: int, version: int, base_version: int | 
 
 def save_report(name: str, html: str, template_id: int | None, template_version: int | None, meta: dict,
                 created_by: str | None = None, *, source: dict | None = None) -> dict:
-    html = report_data.embed(html, created_by or "")
+    # 版本库只接收已验收的精确字节，旧格式可读但不能通过另一个入口发布。
+    if (not source or meta.get("source") != "compiled_spec" or not meta.get("scopes") or
+            meta.get("verification", {}).get("html_sha256") != report_spec_hash(html)):
+        raise Invalid("新报告必须提交服务端验收的预览")
     if error := report_document_error(html):
         raise Invalid(error)
     name = _report_name(name)
@@ -755,13 +896,17 @@ def _select_report_version(c, report_id: int, emp_no: str, version: int | None) 
 def select_report_version(report_id: int, principal: Principal, version: int | None) -> dict:
     with db.conn() as c, c.transaction():
         report_id, _ = _report_target(c, report_id)
-        if _locked_report_access(c, _lock_report(c, report_id), principal) is None:
+        report = _lock_report(c, report_id)
+        if _locked_report_access(c, report, principal) is None:
             raise PermissionDenied("无权查看该报告")
+        selected = _one(c.execute("SELECT meta FROM report.report_version WHERE report_id=%s AND version=%s",
+                                  (report_id, version or report["revision"])).fetchone(), "报告版本")
+        _require_report_data({**report, **selected}, principal)
         _select_report_version(c, report_id, principal.emp_no, version)
     return get_report(report_id, principal, with_html=False)
 
 
-def update_report(report_id: int, principal: Principal, name: str, html: str, base_version: int | None = None,
+def update_report(report_id: int, principal: Principal, name: str, html: str | None, base_version: int | None = None,
                   *, expected_version: int | None = None, change_note: str = "",
                   rendered: tuple[dict, dict] | None = None) -> dict:
     name = _report_name(name)
@@ -785,31 +930,36 @@ def update_report(report_id: int, principal: Principal, name: str, html: str, ba
             base_version = selected["version"] if selected else row["revision"]
         base = _one(c.execute("SELECT * FROM report.report_version WHERE report_id=%s AND version=%s",
                               (report_id, base_version)).fetchone(), "报告版本")
-        # 先确认可编辑的实际基准，再替换临时引用或复用该版本的数据块。
-        html = report_data.embed(html, principal.emp_no, base["html"])
-        # 旧报告的已知图表依赖可直接内联。正文原样保存时允许历史快照仅修改名称或说明。
-        edited = html != base["html"]
-        if rendered is None and not base["meta"].get("single_file"):
-            html = inline_legacy_echarts(html)
-        error = report_document_error(html)
-        if error and (edited or rendered is not None):
-            raise Invalid(error)
+        _require_report_data({**base, "created_by": row["created_by"]}, principal)
         meta, source = (base["meta"], base) if rendered is None else rendered
-        if rendered is None and edited:
-            # 手工改写 HTML 后，旧 Markdown 无法再现该版本。保留模板来源用于追溯。
-            source = {**source, "markdown": None}
-            meta = {**meta, "source": "html_edit"}
-        meta = {**meta, "html_bytes": len(html.encode()), "single_file": error is None}
+        if rendered is None:
+            # 管理台仍可更新名称或说明。业务正文变更须经过新编译和验收。
+            if html is not None and html not in (base["html"], report_data.for_edit(base["html"])):
+                raise Invalid("正文变更请用声明式模板生成已验收的修订预览")
+            html = base["html"]
+        else:
+            if (meta.get("source") != "compiled_spec" or not meta.get("scopes") or
+                    meta.get("verification", {}).get("html_sha256") != report_spec_hash(html)):
+                raise Invalid("修订内容与验收证据不一致")
+            _require_report_data({"meta": meta, "created_by": row["created_by"]}, principal)
+            if row["created_by"] != principal.emp_no and row["created_by"]:
+                from .auth import principal_for
+
+                _require_report_data({"meta": meta, "created_by": row["created_by"]}, principal_for(row["created_by"]))
+        if rendered is not None and (error := report_document_error(html)):
+            raise Invalid(error)
+        meta = {**meta, "html_bytes": len(html.encode()),
+                "single_file": rendered is not None or meta.get("single_file", False)}
         version = row["revision"] + 1
-        template_version = source["template_version"]
-        _insert_report_version(c, report_id, version, base_version, name, html, meta, base["template_id"],
+        template_id, template_version = source.get("template_id", base["template_id"]), source["template_version"]
+        _insert_report_version(c, report_id, version, base_version, name, html, meta, template_id,
                                template_version, source, principal.emp_no, change_note)
         # 保存后让编辑者跟随最新版本，其他员工原有的选择照常保留。
         _select_report_version(c, report_id, principal.emp_no, None)
         c.execute(
             "UPDATE report.report SET name=%s, html=%s, meta=%s, template_id=%s, template_version=%s, revision=%s "
             "WHERE id=%s",
-            (name, html, db.jsonb(meta), base["template_id"], template_version, version, report_id),
+            (name, html, db.jsonb(meta), template_id, template_version, version, report_id),
         )
     return {**get_report(report_id, principal, with_html=False, version=version), **report_links(report_id, version)}
 
@@ -857,11 +1007,16 @@ def set_report_share(report_id: int, principal: Principal, emp_no: str, access_l
         _require_report_manager(principal, report)
         if emp_no == report["created_by"]:
             raise Invalid("报告创建人已拥有管理权限")
-        # 已登记账号锁定到写入完成。未登记时只保存报告授权，仍需匹配已核验且启用的 IAM 身份。
-        employee = c.execute("SELECT emp_no, name, enabled FROM permission.employee WHERE emp_no=%s FOR SHARE",
+        employee = c.execute("SELECT emp_no, name, enabled, roles, is_admin FROM permission.employee WHERE emp_no=%s FOR SHARE",
                              (emp_no,)).fetchone()
-        if employee and not employee["enabled"]:
-            raise Invalid("该工号已停用，请确认接收人已启用")
+        if not employee or not employee["enabled"]:
+            raise Invalid("接收人需先登记并启用，才能核实报告数据权限")
+        current = c.execute("SELECT meta FROM report.report_version WHERE report_id=%s AND version=%s",
+                            (report_id, report["revision"])).fetchone()
+        if not current or not current["meta"].get("scopes"):
+            raise Invalid("报告缺少可验证来源，请通过声明式模板重新生成后分享")
+        _require_report_data({**report, **current},
+                             Principal(emp_no, is_admin=employee["is_admin"], roles=employee["roles"]))
         c.execute(
             "INSERT INTO report.report_share(report_id, emp_no, access_level) VALUES (%s,%s,%s) "
             "ON CONFLICT (report_id, emp_no) DO UPDATE SET access_level=EXCLUDED.access_level",

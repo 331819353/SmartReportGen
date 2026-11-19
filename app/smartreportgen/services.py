@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import re
+from uuid import uuid4
+
+from sqlglot import exp
 
 from . import repo
 from .auth import Principal
 from .config import settings
 from .connectors import ConnectorError, get_connector, profile
-from .renderer import render
+from .connectors.base import value_options
+from .permission import DIALECT
 from .report_document import inline_legacy_echarts, merge_report_documents, report_document_error
-from .scenario_filters import query_in_scenario, table_sql
+from .scenario_filters import _table_name, effective_filters, query_in_scenario, table_sql
 from .telemetry import measure
 
 
@@ -32,7 +36,7 @@ def describe_table(ds_row: dict, table: str, sample_rows: int = 5, profile_rows:
         out["columns_error"] = str(e)
     # 场景画像的行数、样本、最值必须来自同一取值范围，不能再回查未经筛选的原表。
     item = next((t for t in dataset["tables"] if t["table_name"] == table), None) if dataset else None
-    rules = item.get("row_filters") if item else []
+    rules = effective_filters(item) if item else []
     source = table_sql(ds_row["type"], table) if rules else table
 
     def query(sql: str, n: int) -> dict:
@@ -86,6 +90,47 @@ def describe_table(ds_row: dict, table: str, sample_rows: int = 5, profile_rows:
     return out
 
 
+def source_scene_values(source: dict, table: dict, column: str, search: str, limit: int, offset: int) -> dict:
+    """个人场景的取值选择器同样应用源行范围，然后去重、搜索和分页。"""
+    name = table["table_name"]
+    connector = get_connector(source)
+    if not effective_filters(table):
+        return connector.distinct_values(name, column, search, limit, offset)
+    field = next((item for item in connector.cached_columns(name) if item["source_name"] == column), None)
+    if not field:
+        raise ConnectorError(f"表 {name} 中没有字段 {column}")
+    kind = source["type"]
+    dialect = DIALECT[kind]
+    value = exp.column(column, quoted=True)
+    if kind == "oracle":
+        dtype = field["type"].upper()
+        # Oracle 候选时间用可回传给绑定器的 ISO 格式。
+        if dtype == "DATE" or dtype.startswith("TIMESTAMP"):
+            pattern = 'YYYY-MM-DD"T"HH24:MI:SS' + (".FF9" if dtype.startswith("TIMESTAMP") else "")
+            if "TIME ZONE" in dtype:
+                value = exp.Anonymous(this="SYS_EXTRACT_UTC", expressions=[value])
+                pattern += '"Z"'
+            value = exp.Anonymous(this="TO_CHAR", expressions=[value, exp.Literal.string(pattern)])
+    stmt = exp.select(exp.alias_(value.copy(), "candidate")).from_(_table_name(name, dialect)).distinct()
+    bindings = None
+    if search:
+        marker = f"sv_{uuid4().hex}_"
+        text_type = {"api": "VARCHAR", "postgresql": "TEXT", "oracle": "VARCHAR2(4000)",
+                     "mysql": "CHAR", "starrocks": "VARCHAR"}[kind]
+        arg = exp.func("LOWER", exp.cast(value.copy(), text_type, dialect=dialect))
+        fn = "STRPOS" if kind in ("api", "postgresql") else "INSTR"
+        match = exp.Anonymous(this=fn, expressions=[arg, exp.Var(this=marker + "q0")])
+        stmt = stmt.where(exp.GT(this=match, expression=exp.Literal.number(0)))
+        bindings = (marker, {"q0": search.lower()})
+    candidate = exp.column("candidate")
+    stmt = stmt.order_by(exp.Ordered(this=candidate, nulls_first=True)).limit(limit + 1).offset(offset)
+    result = query_in_scenario(source, {"tables": [table]}, stmt.sql(dialect=dialect), limit + 1, connector,
+                               {name.lower()}, query_binds=bindings)
+    # 查询通道用标签保留 Decimal 和长整数。候选值接口用对应原值文本。
+    rows = [[row[0]["$decimal"] if isinstance(row[0], dict) else row[0]] for row in result["rows"]]
+    return value_options(rows, limit)
+
+
 def run_query(ds_row: dict, sql: str, limit: int | None = None,
               *, dataset: dict | None = None, allowed: set[str] | None = None,
               snapshot: bool = False) -> dict:
@@ -93,45 +138,37 @@ def run_query(ds_row: dict, sql: str, limit: int | None = None,
     max_rows = max(1, settings.query_max_rows) if snapshot else 5000
     limit = max(1, min(int(limit or (max_rows if snapshot else 200)), max_rows))
     conn = get_connector(ds_row)
+    validator = None
+    if snapshot and dataset:
+        from .report_queries import direct_projection
+
+        validator = direct_projection
     with measure("query.execute"):
-        res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed) if dataset else conn.query(sql, limit)
+        res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed,
+                                validate_sql=validator) if dataset else conn.query(sql, limit)
     return {"datasource": ds_row["name"], "dialect": ds_row["type"], **res, "row_count": len(res["rows"])}
 
 
-def render_template_to_report(tpl: dict, name: str | None = None, guard=None, created_by: str | None = None) -> dict:
-    """渲染并存储报告。样式取模板创建人本人的业务场景规则；报告归属 created_by（默认同模板创建人）。"""
-    # 业务 Markdown 是 agent 的开发依据，只有结构化模板可以由服务端执行。
-    if tpl.get("template_type") == "business":
-        raise repo.Invalid("请让 agent 依据该业务模板编写完整 HTML，再使用 save_report 保存报告")
-    html, meta = render(tpl["markdown"], dataset_id=tpl.get("dataset_id"), inline_echarts=True,
-                        guard=guard, owner=tpl.get("created_by"))
-    rep = repo.save_report(name or tpl["name"], html, tpl["id"], tpl["version"], meta,
-                           created_by=created_by or tpl.get("created_by"),
-                           source={**tpl, "source_owner": tpl.get("created_by")})
-    rep["warnings"] = meta.get("warnings", [])
-    return rep
+def render_template_to_report(tpl: dict, name: str | None, principal: Principal, parameters: dict | None = None) -> dict:
+    """从版本化模板执行已授权取数，经过同一验收门禁后保存。"""
+    from . import report_pipeline, report_spec
+
+    decoded = report_spec.decode_template(tpl["markdown"]) if tpl["template_type"] == "business" else None
+    if not decoded:
+        raise repo.Invalid("请将历史模板迁移为声明式模板后生成新报告")
+    spec, dataset_id = decoded
+    staged = report_pipeline.preview(spec, dataset_id, principal, parameters=parameters or {}, template=tpl)
+    return {**report_pipeline.persist(name or tpl["name"], principal, staged["preview_id"]), "warnings": []}
 
 
 def revise_report(report_id: int, principal: Principal, name: str, *, base_version: int | None = None,
                   html: str | None = None, markdown: str | None = None, change_note: str = "",
-                  expected_version: int | None = None, guard=None) -> dict:
-    """在已确认的快照上编辑正文，或重新执行该版本的 Markdown 查询。"""
-    if (html is None) == (markdown is None):
-        raise repo.Invalid("请提供 HTML 或 Markdown 中的一种")
-    if markdown is None:
-        return repo.update_report(report_id, principal, name, html, base_version,
-                                  change_note=change_note, expected_version=expected_version)
-    base = repo.get_report(report_id, principal, with_html=False, version=base_version, with_source=True)
-    if base["access_level"] == "view":
-        raise repo.PermissionDenied("无权编辑该报告")
-    if not base["source_available"]:
-        raise repo.Invalid("当前版本没有可编辑的 Markdown 源码，请修改该版本的 HTML")
-    # 渲染沿用基准版本的业务场景，且每条查询都检查当前操作者的数据权限。
-    html, meta = render(markdown, dataset_id=base["dataset_id"], inline_echarts=True,
-                        guard=guard, owner=base["source_owner"])
-    source = {**base, "markdown": markdown}
-    return repo.update_report(base["id"], principal, name, html, base["revision"],
-                              change_note=change_note, expected_version=expected_version, rendered=(meta, source))
+                  expected_version: int | None = None) -> dict:
+    """历史 API 继续支持元数据更新。正文由通过验收的声明式预览提交。"""
+    if markdown is not None:
+        raise repo.Invalid("正文变更请提交通过验收的声明式预览")
+    return repo.update_report(report_id, principal, name, html, base_version,
+                              change_note=change_note, expected_version=expected_version)
 
 
 def merge_reports(principal: Principal, name: str, versions: list[tuple[int, int]]) -> str:

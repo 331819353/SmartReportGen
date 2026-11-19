@@ -1,26 +1,16 @@
 # SmartReportGen · 智能报告生成（Skill + MCP）
 
-用一句话需求生成**带全局筛选联动的交互式 HTML 分析报告**：
+用自然语言新建或修改**带全局筛选联动的交互式 HTML 分析报告**。典型流程：
 
-```
-用户需求 ──► Skill（smart-report，编排流程与分析方法）
-              │  Authorization: Bearer <海尔 IAM access token>
-              ▼ MCP（smartreportgen，Streamable HTTP）── 工号 → 权限表 → 可用业务场景/数据表（默认拒绝）
-   1. 混合检索业务场景 → 获取数据表       search_business_scenarios / get_dataset_tables
-   2. 探查各表并获取证据与数据快照         describe_tables / describe_table / run_query
-   3. 全局筛选（级联 / 预设 / 图表点击联动）
-   4. 通用规则（设计令牌）+ 场景规则       get_style_rules
-   5. 整理并保存业务 Markdown 模板       save_report_template / get_report_template
-   6. Agent 编写引用快照的 HTML，预览验证后保存  preview_report_html / save_report（关联模板版本）
-   7. 查看或修订报告                    get_report / revise_report
-              │
-              ▼
-   PostgreSQL + pgvector（按类型分 schema）  ◄──  管理台（数据源 / 数据集 / 报告模板 / 报告 / 样式规则 / 员工与授权）
-```
+1. 管理员部署数据源，配置员工可引用的表和固定行范围。
+2. 员工提出新建或修改报告的需求。修改从报告库定位基准，多个匹配候选由用户确认。新建先找已有场景，缺少适用场景时，由员工从已授权的数据源自行建场景并填写分析思路。
+3. 模型根据场景的分析思路、授权表元数据、数据证据和样式规则设计并保存模板。已有汇总值优先按维度筛选、直取。
+4. 以模板为基础按章节与卡片多轮调整，由服务端编译 HTML。纯展示修订可复用原快照。
+5. 服务端验收通过后，保存对应 HTML 及版本记录，交付固定链接和离线文件。
 
-`run_query(snapshot=true)` 把查询结果保存为服务端 JSON，只返回快照 ID、行数、来源表与少量样本。Agent 在 HTML 中用独立的 `<script type="application/json" id="sales" data-srg-snapshot="快照ID"></script>` 引用每组数据。预览和保存时，服务端将 JSON 内联到 `.html` 文件，下载后即可离线打开。修改快照报告时，Agent 可通过 `get_report(include_html=true, omit_snapshot_data=true)` 取得含基准引用的正文，把读取到的 `revision` 传给 `revise_report` 作为 `base_version`。
+[主流程与 MCP 用法](skills/smart-report/SKILL.md) · [报表模板、图形与样式契约](skills/smart-report/references/declarative-report.md)
 
-多表场景先逐表核实可用指标和覆盖范围，再将分析思路逐项映射到指标、来源表、查询和支撑数值。业务模板记录证据缺口和每张表的用途。
+标准布局使用结构化模板。需要自由 HTML/CSS 的报告可使用[自由版式模板](skills/smart-report/references/free-report.md)，通过 MCP 逐模块修改并由内置运行时绑定业务数字。两类模板共用正式验收和版本发布。
 
 ## 快速开始
 
@@ -32,7 +22,7 @@ docker compose up -d --build
 | 服务 | 地址 | 说明 |
 |---|---|---|
 | 管理台 + REST API | http://localhost:18600 | 接入说明 `/api-guide`，Swagger `/docs` |
-| MCP | http://localhost:18600/mcp | Streamable HTTP，**必须携带令牌** |
+| MCP | http://localhost:18600/mcp | Streamable HTTP，仅接受海尔 IAM Bearer 令牌 |
 | PostgreSQL(pgvector) | 127.0.0.1:55433 | 用户/库见 `.env` |
 
 首次启动（`SEED_DEMO=true`）写入演示数据源与数据集：零售销售（PostgreSQL，只读账号 `demo_reader`）、供应链库存（PostgreSQL）、客服工单（HTTP API）三个业务场景。
@@ -42,16 +32,19 @@ docker compose up -d --build
 
 技能独立放在 `skills/smart-report/`，与 agent 无关；MCP 服务也内置同一份技能（工具 `get_skill_guide`、提示词 `smart_report`）。
 
-使用 Bearer 配置的客户端在启动终端中设置令牌。
+从海尔 IAM 取得 access token 后，在启动 agent 的终端中将它读入环境变量。
 
 ```bash
-export SMARTREPORT_TOKEN=<客户端取得的海尔 IAM access token>
+printf '海尔 IAM access token: '
+IFS= read -r -s SMARTREPORT_TOKEN
+printf '\n'
+export SMARTREPORT_TOKEN
 ```
 
 | Agent | 在本仓库内 | 全局安装 |
 |---|---|---|
-| Claude Code | 已带 `.mcp.json` 与 `.claude/skills/` 链接，直接运行 `claude` | `claude mcp add --transport http smartreportgen <MCP地址> --header "Authorization: Bearer $SMARTREPORT_TOKEN"`，再执行 `scripts/install-skill.sh claude` |
-| Codex | 信任项目后运行 `codex mcp login smartreportgen`，在浏览器登录海尔 IAM | 用 `codex mcp add smartreportgen --url <MCP地址> --oauth-client-id smartreportgen-cli` 注册，再运行登录命令 |
+| Claude Code | 注册 MCP 服务后启动 `claude`，项目技能自动发现 | `claude mcp add --transport http smartreportgen http://localhost:18600/mcp --header "Authorization: Bearer $SMARTREPORT_TOKEN"`，再执行 `scripts/install-skill.sh claude` |
+| Codex | 注册 MCP 服务后，在同一终端启动 Codex，项目技能自动发现 | `codex mcp add smartreportgen --url http://localhost:18600/mcp --bearer-token-env-var SMARTREPORT_TOKEN`，再执行 `scripts/install-skill.sh codex` |
 | Cursor / VS Code / Gemini CLI / OpenCode / 其他 | 配置模板见 `integrations/` | 同左；无技能机制时让 agent 读 `AGENTS.md` 或调用 `get_skill_guide` |
 
 接入后可直接向 agent 提需求，例如：“帮我做一份 2026 年 1-10 月零售销售经营分析报告，重点看各大区、渠道和品类的增长与毛利变化，并和去年同期对比”。
@@ -64,8 +57,8 @@ export SMARTREPORT_TOKEN=<客户端取得的海尔 IAM access token>
 
 | 功能 | 管理员 | 普通用户 |
 |---|---|---|
-| 数据源 | 新建、编辑、测试、浏览表、SQL 查询、删除 | 只读：只看到自己有权限的数据集所用的数据源（不显示连接信息） |
-| 数据集 | 新建、编辑、删除、重建索引 | 只读：只看到有权限的业务场景，表只显示有权限的 |
+| 数据源 | 新建、编辑、测试、浏览表、SQL 查询、删除 | 可引用开放给本人或角色的表，连接配置和密钥由管理员维护 |
+| 数据集 | 新建、编辑、删除、重建索引 | 可创建和管理本人的场景，可查看另行授权的场景和表 |
 | 报告模板 / 报告 | 查看全部人的（列表显示创建人、创建时间） | 只看到、只能修改 / 删除自己创建的（显示创建时间） |
 | 样式规则 | 配置通用规则；可查看所有人的业务场景样式 | 通用规则只读；为自己有权限的业务场景配置个人样式，只对自己生成的报告生效 |
 | 员工与授权 | 可见、可管理 | 不可见（接口拒绝） |
@@ -82,15 +75,13 @@ export SMARTREPORT_TOKEN=<客户端取得的海尔 IAM access token>
   - 无法解析的 SQL、FROM 中的表函数、能在字符串里执行 SQL 或读外部数据的函数（`query_to_xml`、`dblink`、`DBMS_XMLGEN`、`read_csv` 等）一律拒绝。API 数据源的 DuckDB 在载入数据后关闭外部访问。
   - 模板校验与渲染时，每条查询同样按权限校验。
   - 报告模板由创建人和管理员管理，渲染仍按调用人的数据权限校验。
-- **报告分享**：在报告库点击「分享」，按已启用的员工工号授予「可查看」或「可编辑」。接收人用海尔 IAM 登录后，可通过分享链接查看，或在报告库编辑报告名称和 HTML。创建人和管理员可以更改或撤销分享权限。
+- **报告分享**：在报告库点击「分享」，按已启用的员工工号授予「可查看」或「可编辑」。接收人用海尔 IAM 登录后，可通过分享链接查看，或在授权范围内修订报告。正式正文修订经预览验收后追加版本。创建人和管理员可以更改或撤销分享权限。
 
 ## 样式：设计令牌
 
-生效顺序为 **智能体决定 ≥ 业务场景规则 ≥ 通用规则 ≥ 内置样式**。MCP `get_style_rules` 按优先级合并视觉样式和展示要求。内置经营报告主题包含蓝绿渐变封面、两级目录、章节面板、紧凑指标卡、图表配色和表格排版。章节、图表类型和筛选条件由报告模板决定。个人场景样式只对本人生成的报告生效。令牌定义见 `app/smartreportgen/design.py`。
+生效顺序为 **当前用户明确要求 > 业务场景规则 > 通用规则 > 内置样式**。MCP `get_style_rules` 按优先级合并视觉样式和展示要求。内置经营报告主题包含蓝绿渐变封面、两级目录、章节面板、紧凑指标卡、图表配色和表格排版。章节、图表类型和筛选条件由报告模板决定。个人场景样式只对本人生成的报告生效。令牌定义见 `app/smartreportgen/design.py`。
 
-内置报告规则通过独立字段 `reporting_rules` 返回，并在管理台「报告样式」底部只读展示，不参与视觉样式覆盖。业务指标必须直取事实表或正式视图，缺失不补算；每个展示值记录行级证据，单位、比例尺度和期间必须明确。报告全部资源及数据内嵌为离线单文件，浏览和筛选不触发取数、生成或保存。这些是交给 Agent 的生成约束，不代表服务端能自动证明任意 SQL、脚本或结论已符合事实直取要求。用户明确变更业务口径时须在模板和报告留痕。
-
-规则细则见 `skills/smart-report/references/fact-contract.md`，MCP 可用 `get_skill_guide(reference="fact-contract")` 读取。绿能2026年9月仅作为按需场景参考，不设为全局默认；附件未含原始 HTML/CSS，历史核验声明不等于本项目已经复现其样式。已有结构化模板公式仅保留兼容，新报告采用事实直取的 Agent HTML 流程。
+内置规则通过 `reporting_rules` 返回，并在管理台只读展示。报告事实来自正式字段或场景负责人登记的官方指标。缺少预聚合数据时可采用受控分组计算，缺失事实保留缺值。服务端执行权限、字段、格式和离线行为门禁，业务解释由使用者据实核实。[事实取数契约](skills/smart-report/references/fact-contract.md)
 
 管理台「样式规则」面向业务人员：
 - **展示要求**：设置好坏判定、涨跌颜色、数字格式、文案等。章节安排、选图建议和筛选条件可写在业务场景的「分析思路」中。
@@ -149,6 +140,6 @@ scripts/mcp_call.py         MCP 调试客户端
 - **向量模型**：当前 `.env` 接入 AI 网关的 `Qwen3-Embedding-4B`（`AI_BASE_URL` / `AI_API_KEY`），通过 `dimensions` 截断为 1024 维以使用 HNSW 索引，查询侧加指令前缀 `EMBEDDING_QUERY_INSTRUCTION`。
   在 8 条口语化需求上，场景检索命中率由离线哈希向量的 4/8 提升到 8/8。未配置时回退为 `EMBEDDING_PROVIDER=hash`（离线特征哈希，没有语义理解能力）；改模型或维度后重启会自动重建向量。
   向量接口不可用时检索自动降级为纯关键词，并在结果 `warnings` 中说明。
-- **报告数据**：Agent 通过 MCP 取数，将聚合结果嵌入 HTML，筛选联动在浏览器端完成。刷新数据时重新查询并保存报告新版本。
+- **报告数据**：服务端从同一批快照投影展示所需字段并内嵌 HTML，浏览器负责选择事实及显示。刷新数据时重新查询并保存报告新版本。
 - **安全**：数据源请使用只读账号（系统的只读 SQL 校验是第二道防线）；对外暴露前设置 `SECRET_KEY` 和海尔 IAM 应用凭证，并通过 HTTPS 提供服务。
 - **已验证**：PostgreSQL、MySQL 8.4、Oracle 23ai、HTTP API 连接器；StarRocks 仅按 MySQL 协议路径验证。权限越权用例见验证记录（JOIN、子查询、同名 CTE、带引号的标识符、information_schema、query_to_xml、read_csv 均被拒绝）。

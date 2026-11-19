@@ -46,6 +46,19 @@ class WorkflowPerformanceTest(unittest.TestCase):
         self.enterContext(patch.object(mcp_server.services, "datasource_for_dataset", return_value=self.source))
         self.enterContext(patch.object(mcp_server.services, "get_connector", return_value=self.connector))
 
+    def test_scene_search_miss_returns_the_configured_management_entry(self):
+        # MCP 可以单独发布，场景配置链接必须使用管理台的域名和子路径。
+        empty = {"hits": [], "warnings": [], "query_tokens": ["新增场景"]}
+        with patch.object(settings, "public_base_url", "https://portal.example/reports-tools"), \
+                patch.object(settings, "mcp_public_url", "https://mcp.example/mcp"), \
+                patch.object(mcp_server.repo, "search_datasets", return_value=empty) as search:
+            result = mcp_server.search_business_scenarios("新增场景", None)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["hits"], [])
+        self.assertIn("有权限", result["tip"])
+        self.assertEqual(result["scenario_management_url"], "https://portal.example/reports-tools/#datasets")
+        search.assert_called_once_with("新增场景", 3, dataset_ids=[1])
+
     def test_light_probe_skips_full_scans_and_limits_sample(self):
         with patch.object(self.connector, "query", wraps=self.connector.query) as query:
             light = mcp_server.describe_table(1, "Facts", None)

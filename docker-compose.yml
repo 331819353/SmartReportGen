@@ -58,7 +58,7 @@ services:
     restart: unless-stopped
     environment: *app-env
     volumes:
-      - report-work:/srv/report-work:ro
+      - report-work:/srv/report-work
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       postgres: { condition: service_healthy }

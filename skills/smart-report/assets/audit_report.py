@@ -13,7 +13,7 @@ import sys
 SURFACES = ('prose', 'cards', 'tables', 'charts', 'formatters', 'empty')
 BEHAVIORS = ('facts', 'filters_reset', 'sign_threshold_boundaries', 'missing_zero_duplicate_scale',
              'offline', 'desktop_narrow')
-STATES = ('up', 'down', 'neutral', 'met', 'miss')
+STATES = ('up', 'down', 'neutral', 'met', 'miss', 'warning')
 EXPAND_MARKERS = ('data-srg-snapshot', 'data-srg-vendor', 'data-srg-asset', 'data-srg-style')
 # 仅固定版本的纯库脚本可跳过应用格式化扫描；改名、data 属性及未知摘要均不能豁免。
 VENDOR_HASHES = {'52958d5fee0a05e911c340b414836f8a23c383b24fd69fdc2a8a2bff2b362692'}
@@ -103,7 +103,7 @@ class Document(HTMLParser):
             self.visible.append(data)
 
 
-def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> list[str]:
+def audit_html(text: str, *, expanded: bool = False, fixture: bool = False, runtime_hash: str | None = None) -> list[str]:
     doc = Document(text)
     errors = list(doc.errors)
     contracts = [s for s in doc.scripts if s['attrs'].get('id') == 'srg-display-contract']
@@ -118,16 +118,17 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
         except (ValueError, TypeError):
             contract = {}
             errors.append('R-07 展示契约 JSON 无效')
-    if contract.get('version') != 1 or contract.get('rate_symbols') not in ('percent-only', 'semantic'):
+    if contract.get('version') not in (1, 2) or contract.get('rate_symbols') not in ('percent-only', 'semantic'):
         errors.append('R-07 契约版本或 rate_symbols 无效')
     if contract.get('fixture') and not fixture:
         errors.append('R-10 正式门禁禁止夹具标记；仅独立示例可显式使用 --fixture')
     sources = contract.get('rule_sources')
     if not isinstance(sources, list) or not sources or any(not isinstance(s, str) or not s.strip() for s in sources):
         errors.append('R-01 契约必须记录生效规则来源/ID')
+    states = STATES if contract.get('version') == 2 else STATES[:-1]
     colors = contract.get('colors')
-    if not isinstance(colors, dict) or any(not re.fullmatch(r'#[\da-fA-F]{6}', str(colors.get(s, ''))) for s in STATES):
-        errors.append('R-09 缺少完整的 up/down/neutral/met/miss 六位色值')
+    if not isinstance(colors, dict) or any(not re.fullmatch(r'#[\da-fA-F]{6}', str(colors.get(s, ''))) for s in states):
+        errors.append('R-09 缺少契约要求的六位状态色值')
     canonical = Path(__file__).with_name('report-formatters.js').read_text(encoding='utf-8').strip()
     helpers = [s for s in doc.scripts if s['attrs'].get('id') == 'srg-formatters']
 
@@ -186,10 +187,14 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
             # 原始 JSON 字段名、单位与规则原文不当作已展示的标签；绑定后的输出仍须浏览器复核。
             if attrs.get('data-srg-snapshot'):
                 snapshot_count += 1
+                if expanded and attrs['data-srg-snapshot'] != 'embedded':
+                    errors.append('R-06 展开文件仍有快照引用')
                 if expanded:
                     try:
                         payload = json.loads(code)
-                        if not isinstance(payload.get('columns'), list) or not isinstance(payload.get('rows'), list):
+                        blocks = payload.get('data', {}) if runtime_hash and attrs.get('id') == 'srg-data' else {'snapshot': payload}
+                        if not blocks or any(not isinstance(p.get('columns'), list) or not isinstance(p.get('rows'), list)
+                                             for p in blocks.values()):
                             raise ValueError('快照结构无效')
                     except (ValueError, AttributeError):
                         errors.append('R-06 展开文件仍有空引用或无效快照')
@@ -212,11 +217,16 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
             continue
         if helpers and doc.scripts.index(script) < doc.scripts.index(helpers[0]):
             errors.append('R-08 应用脚本必须位于格式化模块之后')
+        if runtime_hash and digest(code.strip()) == runtime_hash:
+            continue  # 仅服务端自身的编译运行时可以按固定摘要跳过通用应用脚本扫描。
         names = r'(?:fmtNum|fmtPct|fmtDelta|metricState|applyMetric|stateColor)'
         if FORMATTERS.search(code) or re.search(rf'\bfunction\s+{names}\b|\b(?:const|let|var)\s+{names}\s*=', code):
             errors.append('R-08 应用脚本存在第二套数字格式化/入口定义')
-        # 单位标题可保留；业务值拼接、模板字符串及已知转义写法仍阻断。
-        literals = JS_STRING.findall(code)
+        # 只放行布局属性的字面百分比。裸字符串、插值及数字文本拼接仍经过统一格式化检查。
+        pct = r"""['"][+-]?\d+(?:\.\d+)?%['"]"""
+        layout = rf"\b(?:left|right|top|bottom|width|height|radius|center|barWidth)\s*:\s*(?:\[\s*{pct}\s*,\s*{pct}\s*\]|{pct})(?=\s*[,}}])"
+        layout_free = re.sub(layout, "", code)
+        literals = JS_STRING.findall(layout_free)
         if any('%' in s and s[1:-1] != '单位：%' for s in literals) or re.search(
                 r'\\(?:x25|u0025|u\{0*25\})|fromCharCode\s*\(\s*37\s*\)', code, re.I):
             errors.append('R-08 应用脚本包含硬编码/转义 %；请调用统一入口')
@@ -226,7 +236,10 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
             errors.append('R-07 应用脚本包含禁用率差符号')
         if NETWORK.search(code):
             errors.append('R-06 应用脚本包含网络/动态加载能力')
-        if COLOR_LITERAL.search(code):
+        # 阴影等纯装饰属性不表达好坏，系列和文案的状态色仍须使用统一入口。
+        decoration = re.sub(r"""\b(?:shadowColor|borderColor|backgroundColor)\s*:\s*(['"])(?:#[\da-fA-F]{3,8}|rgba?\([^'"]+\))\1""", "", code)
+        decoration = re.sub(r"""\b(?:axisLine|splitLine|axisTick)\s*:\s*\{\s*lineStyle\s*:\s*\{\s*color\s*:\s*(['"])(?:#[\da-fA-F]{3,8}|rgba?\([^'"]+\))\1""", "", decoration)
+        if COLOR_LITERAL.search(decoration):
             errors.append('R-09 应用脚本硬编码颜色；请使用 stateColor 或已定义 CSS token')
     if snapshot_count == 0 and not (fixture and contract.get('fixture')):
         errors.append('R-06 正式报告缺少快照数据块；旧内联数据需迁移为带引用的快照块')
@@ -235,9 +248,9 @@ def audit_html(text: str, *, expanded: bool = False, fixture: bool = False) -> l
             errors.append('R-06 CSS 含非内嵌资源')
     # 状态类固定为变量引用；自定义主题只调整契约中的色值，不能另写章节颜色。
     css = ''.join(doc.styles)
-    if re.search(r'--srg-(?:up|down|neutral|met|miss)\s*:', css):
+    if re.search(r'--srg-(?:up|down|neutral|met|miss|warning)\s*:', css):
         errors.append('R-09 状态色值只能在展示契约定义，CSS 不得重复定义')
-    for state in STATES:
+    for state in states:
         pattern = rf'\.srg-{state}\s*\{{\s*color\s*:\s*var\(--srg-{state}\)\s*;?\s*\}}'
         if not re.search(pattern, css):
             errors.append(f'R-09 缺少统一状态类 .srg-{state}')

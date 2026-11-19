@@ -150,15 +150,15 @@ docker compose logs -f api # 首次启动可看到建表、迁移与向量化日
 
 修改 `.env` 后执行 `docker compose up -d` 使其生效（会重建对应容器）。
 
-快照查询把 JSON 写入 `/srv/report-work` 对应的私有 Compose 卷 `report-work`（同时保存临时样式文件 `.css`、预览文件 `.html` 及预览源元信息 `.meta.json`）。MCP 写入工作文件，管理 API 只读访问预览文件。工作文件按工号隔离，24 小时后失效，后续写入时清理。每个 JSON 快照上限为 32 MiB。独立部署时可用 `REPORT_WORK_DIR` 指定共享目录。报告保存时完整数据与内置资源已内联到该版本的 HTML 中。
+快照查询把 JSON 写入 `/srv/report-work` 对应的私有 Compose 卷 `report-work`（同时保存临时样式文件 `.css`、预览文件 `.html` 及预览源元信息 `.meta.json`）。MCP 和管理 API 都使用共享卷生成并读取验收预览。工作文件按工号隔离，24 小时后失效，后续写入时清理。每个 JSON 快照上限为 32 MiB。独立部署时可用 `REPORT_WORK_DIR` 指定共享目录。报告保存时将展示所需数据和内置资产内联到对应版本。
 
 #### 探查成本与耗时排查
 
 报告生成优先调用 `describe_tables(dataset_id, include_profile=true)`：每页最多 20 张授权表，服务内部对单页多表使用有界并发（最多 4 并发）一次返回各表字段、样本和轻量画像，默认每表最多读取 100 行，不执行 `COUNT` 或全范围 `MIN/MAX`。`describe_table` 默认也使用 `mode="light"`；需要总行数与数值/日期字段最值时显式传 `mode="full"`，恢复最多 2,000 行画像及全范围统计。两种模式都必须另行用直接事实核实业务覆盖、唯一性和结论；`row_count_status="not_requested"` 表示未查询，不是零行。
 
-`sample_rows` 控制响应展示行数，`profile_rows` 控制画像采样行数（0–2,000）；默认轻量模式下 `sample_rows=0` 且省略 `profile_rows` 时不执行样本查询。`run_query(snapshot=true, sample_rows=...)` 最多可返回 200 行样本（样本预览字节预算按需扩展至 64 KiB），≤200 行的正式事实查询可一次同时取得完整核数证据与 `snapshot_id`。数据库的 `LIMIT` 约束读取结果；HTTP API 数据源在 `cache_seconds` 有效期内复用预序列化的 NDJSON 文本以减少重复序列化开销，但首次拉取仍须读取源接口记录后再载入 DuckDB，100 行画像不等于源接口只传输 100 行。管理台的 HTTP 探查接口继续使用完整模式，保留既有调用行为。
+`sample_rows` 控制响应展示行数，`profile_rows` 控制画像采样行数（0–2,000）；默认轻量模式下 `sample_rows=0` 且省略 `profile_rows` 时不执行样本查询。`run_query(snapshot=true, sample_rows=...)` 最多可返回 200 行样本（样本预览字节预算按需扩展至 64 KiB），≤200 行的正式事实查询可一次同时取得完整核数证据与 `snapshot_id`。数据库的 `LIMIT` 约束读取结果；HTTP API 连接器在缓存有效期内复用已物化的内存 DuckDB 表。初次读取按数据源分页合同取数，样本上限仅约束返回给调用方的行数。管理台的 HTTP 探查接口继续使用完整模式，保留既有调用行为。
 
-此外，推荐 Agent 调用 `get_style_rules(..., include_css=false)` 获取 `style_id`，在源 HTML 中使用 `<style data-srg-style>`、`<script data-srg-vendor="echarts">` 与 `<script id="srg-formatters" data-srg-asset="report-formatters.js">` 占位标签交由服务端展开，并在通过审核门禁后于 `save_report` / `revise_report` 中直接传入预览返回的 `preview_id`，减少大文本往返传输。
+结构化报告使用 `preview_report_spec`，自由版式报告使用 `preview_free_report`。服务端 Chromium 与 Playwright 由镜像安装。独立部署可用 `SRG_CHROMIUM_PATH` 指定浏览器路径。验收过程需要可运行的无头浏览器，报告查看及筛选无需服务端浏览器。使用 `verification` 和 `timing` 分别查看验收结果与阶段耗时。
 
 字段缓存随数据源连接器隔离，数据源修改后自动更换连接器；每次工具调用仍先校验当前权限。数据库字段发生变化时用 `refresh_schema=true` 刷新探查结果，或将 `SCHEMA_CACHE_SECONDS` 设为 0；API 字段来自记录推断，不叠加字段缓存。
 
@@ -193,7 +193,7 @@ docker compose logs --since=1h --timestamps mcp | rg '"event": "tool_timing"'
 1. 在 IAM 为 SmartReportGen 申请应用（或经同意复用已有应用），登记回调地址：`{PUBLIC_BASE_URL}/auth/iam/callback`（如 `https://report.example.com/auth/iam/callback`）。
 2. 在 `.env` 填 `HAIER_IAM_CLIENT_ID`、`HAIER_IAM_CLIENT_SECRET`、`IAM_BOOTSTRAP_ADMINS`，然后 `docker compose up -d`。
 3. 首批管理员用 IAM 登录 → 「员工与授权」中为员工或角色授权。员工首次使用 IAM Bearer 接入或首次登录时会自动注册为普通用户（角色 `user`，无权限）；若希望全员都能看某些数据，对角色 `user` 授权即可。
-4. 员工在 Codex CLI 运行 `codex mcp login smartreportgen`，按浏览器提示完成海尔 IAM 登录。其他客户端的配置见[第 10 节：接入 Agent](#10-接入-agent)。
+4. 员工从海尔 IAM 取得 access token。按[第 10 节：接入 Agent](#10-接入-agent)配置 MCP 客户端发送 Bearer 请求头。
 
 IAM 接口约定（与海尔 IAM 实际行为一致）：
 - 登录跳转：`{HOST}/oauth/authorize`
@@ -207,8 +207,8 @@ IAM 接口约定（与海尔 IAM 实际行为一致）：
 
 | 功能 | 管理员 | 普通用户 |
 |---|---|---|
-| 数据源 | 新建、编辑、测试、浏览表、SQL 查询、删除 | 只读：只看到自己有权限的数据集所用的数据源（不显示连接信息） |
-| 数据集 | 新建、编辑、删除、重建索引 | 只读：只看到有权限的业务场景，表只显示有权限的 |
+| 数据源 | 新建、编辑、测试、浏览表、SQL 查询、删除 | 可引用开放给本人或角色的表，连接配置和密钥由管理员维护 |
+| 数据集 | 新建、编辑、删除、重建索引 | 可创建和管理本人的场景，可查看另行授权的场景和表 |
 | 报告模板 / 报告 | 查看全部人的（列表显示创建人、创建时间） | 只看到、只能修改 / 删除自己创建的（显示创建时间） |
 | 样式规则 | 配置通用规则；可查看所有人的业务场景样式 | 通用规则只读；为自己有权限的业务场景配置个人样式，只对自己生成的报告生效 |
 | 员工与授权 | 可见、可管理 | 不可见（接口拒绝） |
@@ -278,9 +278,9 @@ server {
 
 按以下顺序配置（`SEED_DEMO=true` 时已有演示数据可参考）：
 
-1. **数据源**：新建并“测试连接”。支持 MySQL、PostgreSQL、Oracle（thin 模式，无需 Instant Client）、StarRocks（MySQL 协议，默认端口 9030）、HTTP API（JSON 载入 DuckDB 查询）。
-2. **业务场景**：填写场景名称、业务描述、数据源和分析思路。从数据源选择所需的表或视图。展开每项的「数据过滤」，选择字段后搜索并勾选要保留的实际取值。同一字段满足任一值即可，不同字段须同时满足。场景查询和数据画像会自动使用该范围。用页面上的场景匹配功能验证检索效果。
-3. **样式规则**的生效顺序是“当前用户明确要求 > 业务场景规则 > 通用规则 > 内置展示默认值”。后三者合并为一份指定样式，包含视觉样式和展示要求。低层条目及智能体判断不能豁免高层要求；智能体只可裁量章节、选图、筛选维度及未指定的装饰样式，不能自行放宽数字格式、单位、口径、缺失处理和状态色。通用规则由管理员配置，个人场景样式按报告模板创建人选取。技能要求源文档审计、展开后六类展示面/边界复核及最终门禁通过后保存；MCP-only 客户端可通过 `get_skill_guide` 获取展示契约及审计资产。
+1. **数据源**：管理员在「数据源」配置并测试连接，通过「开放给员工构建业务场景」设置 `config.scenario_tables`，按表填写员工工号或角色及可选的固定行范围。已有数据源可在原配置补充开放范围。支持 PostgreSQL、MySQL、StarRocks、Oracle 和 HTTP API。[数据源开放配置](HTTP_API.md#数据源开放配置)
+2. **业务场景**：新建报告先复用适用的已有场景。找不到时，普通用户在「业务场景 → 新建业务场景」选择可引用的数据源和表，填写业务描述与分析思路。个人场景可加筛选，数据源的固定行范围同时生效。MCP 返回 `scenario_management_url` 作为该分支入口。[smart-report 主流程](../skills/smart-report/SKILL.md)
+3. **样式规则**的生效顺序是“当前用户明确要求 > 业务场景规则 > 通用规则 > 内置展示默认值”。后三者合并为一份指定样式，包含视觉样式和展示要求。低层条目及智能体判断不能豁免高层要求；智能体只可裁量章节、选图、筛选维度及未指定的装饰样式，不能自行放宽数字格式、单位、口径、缺失处理和状态色。通用规则由管理员配置，现行声明式预览按操作者加载个人场景样式，由服务端完成静态审计和 Chromium 验收。MCP 客户端可通过 `get_skill_guide` 查看展示契约，通过 `get_preview_file` 读取验收后的 HTML。
    - 通用规则对所有报告生效；业务场景规则写该场景的特殊要求。
    - 每条规则可设置「展示要求」和「视觉样式」，右侧实时预览。升级前保存的版式结构、图表选择、必备筛选条目可在样式详情的「已停用的分析要求」中查阅。
    - 用“查看最终效果”确认某场景叠加后的样式，每项都标明来源。
@@ -289,7 +289,7 @@ server {
    - 在“员工”列表编辑目标员工，将“系统身份”设为“管理员”并保存。账号启用时权限在下一次请求生效；员工回到或刷新已打开的管理台即可看到管理入口，无需重新登录。
    - 按角色或员工授权“业务场景 / 数据表”。
    - 在“权限查询”中核对某个员工的有效权限。
-   - Codex CLI 可发起 IAM 登录并自动获得 IAM access token。使用 Bearer 配置的客户端可直接传入宿主取得的 IAM 原票。
+   - MCP 客户端使用宿主从海尔 IAM 取得的 access token。
 
 ## 9. 运维
 
@@ -303,7 +303,9 @@ docker compose up -d
 
 表结构与数据迁移在 `api` 启动时自动、幂等执行（迁移标记记录在 `sys.setting`）。已保存的报告是 HTML 快照。需要变更时，读取所选版本，修改并验证单文件后保存新版本。
 
-从双端口部署升级时，删除 `.env` 中的 `MCP_BIND` 和 `MCP_HOST_PORT`。如果 `MCP_PUBLIC_URL` 指向旧端口 `18601`，清空该变量，客户端改用 `http://localhost:18600/mcp` 并重新登录。已有 HTTPS 反向代理也应将 `/mcp` 和 OAuth 资源发现转发到同一个网关入口。
+从双端口部署升级时，删除 `.env` 中的 `MCP_BIND` 和 `MCP_HOST_PORT`。如果 `MCP_PUBLIC_URL` 指向旧端口 `18601`，清空该变量，客户端改用 `http://localhost:18600/mcp`。已有 HTTPS 反向代理应将 `/mcp` 转发到同一个网关入口。
+
+从 MCP 浏览器登录或自定义令牌请求头迁移时，改用 `Authorization: Bearer <海尔 IAM access token>`。Codex 需把原 MCP 配置改成下文的 `bearer_token_env_var`。升级后执行 `docker compose restart gateway` 载入新的网关配置。
 
 从平台自签令牌迁移时，客户端改用海尔 IAM 原票，浏览器重新登录。报告链接由创建人、管理员或获分享的员工通过 IAM 访问。跨设备分享时，将 `PUBLIC_BASE_URL` 设为员工可访问的地址，并配置对应的 IAM 回调。历史令牌记录保留在原库中，升级后不能用于认证。
 
@@ -347,46 +349,43 @@ curl -s http://127.0.0.1:18600/healthz
 - 仓库内已有软链接：`.claude/skills/smart-report`、`.agents/skills/smart-report` 都指向它，在仓库目录中启动 agent 可直接发现。
 - 用户级安装用 `scripts/install-skill.sh`。
 
-Codex CLI 默认通过浏览器登录海尔 IAM，自动取得 IAM access token。支持 Bearer 配置的客户端也可以使用宿主已有的 IAM access token。MCP 按工号检查业务数据权限。
-
-使用下文 Bearer 配置的客户端，在启动 agent 的同一个 shell 中设置令牌。
+MCP 仅接受 `Authorization: Bearer <海尔 IAM access token>`，并按 IAM 核实的工号检查数据权限。从海尔 IAM 取得令牌后，在启动 agent 的同一个终端中输入原始令牌。
 
 ```bash
-export SMARTREPORT_TOKEN=<海尔 IAM 签发的 access token>
+printf '海尔 IAM access token: '
+IFS= read -r -s SMARTREPORT_TOKEN
+printf '\n'
+export SMARTREPORT_TOKEN
 ```
 
 ### 10.1 Claude Code
 
-- 在本仓库内使用：项目 `.mcp.json` 已配置（读取 `${SMARTREPORT_TOKEN}`），技能经 `.claude/skills/` 自动发现。直接运行 `claude`，首次会提示信任项目 MCP。
-- 在其他项目中使用：
+- 注册 MCP 服务，URL 使用实际部署地址。
   ```bash
   claude mcp add --transport http smartreportgen https://report.example.com/mcp --header "Authorization: Bearer $SMARTREPORT_TOKEN"
   ```
+- 在本仓库内，技能经 `.claude/skills/` 自动发现。在其他项目中可安装到用户目录。
   ```bash
   scripts/install-skill.sh claude      # 安装到 ~/.claude/skills
   ```
 
 ### 10.2 Codex
 
-- 在本仓库内信任项目后运行 `codex mcp login smartreportgen`。在浏览器完成海尔 IAM 登录后，Codex 会保存 IAM access token 并随 MCP 请求发送。令牌失效时重新运行登录命令。
-- 在其他项目中可全局配置：
+- 注册 MCP 服务，URL 使用实际部署地址。随后在已设置 `SMARTREPORT_TOKEN` 的终端中启动 Codex。
   ```bash
-  codex mcp add smartreportgen --url https://report.example.com/mcp --oauth-client-id smartreportgen-cli
-  codex mcp login smartreportgen
-  ```
-  ```bash
-  scripts/install-skill.sh codex       # 安装到 ~/.codex/skills 与 ~/.agents/skills
+  codex mcp add smartreportgen --url https://report.example.com/mcp --bearer-token-env-var SMARTREPORT_TOKEN
   ```
   等价的手写配置（`~/.codex/config.toml`）：
   ```toml
   [mcp_servers.smartreportgen]
   url = "https://report.example.com/mcp"
-  [mcp_servers.smartreportgen.oauth]
-  client_id = "smartreportgen-cli"
+  bearer_token_env_var = "SMARTREPORT_TOKEN"
   ```
-- 自动登录要求 已配置海尔 IAM、可访问的 `PUBLIC_BASE_URL` 和 `MCP_PUBLIC_URL`。海尔 IAM 使用已登记的 `/auth/iam/callback`。Codex 的本机回调由 SmartReportGen OAuth 入口处理。
-- 原有 `bearer_token_env_var` 或固定 `Authorization` 配置会优先使用其显式凭证。切换到浏览器登录时，从该 MCP 配置项中移除这些设置。
-- Codex 也会读取仓库根目录的 `AGENTS.md`，其中说明了技能位置与使用约束。
+- 令牌失效时，从海尔 IAM 取得新令牌，更新 `SMARTREPORT_TOKEN` 并重新启动 Codex。
+- 在本仓库内，Codex 自动发现 `.agents/skills/` 下的技能，也会读取根目录 `AGENTS.md`。在其他项目中可安装到用户目录。
+  ```bash
+  scripts/install-skill.sh codex
+  ```
 
 ### 10.3 其他 Agent
 
@@ -417,7 +416,7 @@ curl -s -X POST https://report.example.com/mcp \
 | 构建时 pip 报 SSL / 超时 | 网络不稳或无法访问 PyPI：重试，或按[第 7 节：内网 / 离线部署](#7-内网--离线部署)使用 `PIP_INDEX_URL` 镜像 |
 | `api` 一直 unhealthy | `docker compose logs api`：数据库未就绪、`.env` 配置错误、端口占用 |
 | 端口被占用 | 应用入口修改 `API_HOST_PORT`，并同步调整对外地址与 IAM 回调。数据库运维端口使用 `PG_HOST_PORT` |
-| agent 调 MCP 返回 401 | Codex CLI 可重新运行 `codex mcp login smartreportgen`，并确认 IAM 已配置。使用 Bearer 配置的客户端应检查启动时是否设置了有效令牌。响应体中有具体原因 |
+| agent 调 MCP 返回 401 | 确认客户端发送 `Authorization: Bearer <海尔 IAM access token>`。令牌失效时从 IAM 取得新令牌并更新客户端配置。响应体中有具体原因 |
 | 点击 IAM 登录后 IAM 报回调地址不匹配 | IAM 应用登记的回调必须与 `{PUBLIC_BASE_URL}/auth/iam/callback`（或 `IAM_REDIRECT_URI`）完全一致，包括协议、域名、端口 |
 | 登录失败并提示“浏览器未带回登录凭据” | 在同一浏览器用 IAM 回调地址对应的主机重新打开管理台并发起登录。管理台会先跳到回调主机再设置登录 Cookie，请确认该主机可访问且浏览器允许它设置 Cookie |
 | 登录页提示“IAM 单点登录未配置” | `HAIER_IAM_HOST / CLIENT_ID / CLIENT_SECRET` 未配齐 |

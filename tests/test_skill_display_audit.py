@@ -19,10 +19,11 @@ def document(*, body='毛利率 9.78%，同比差 -3.66%', code='', mode='percen
                 'colors': {'up': '#047857', 'down': '#B91C1C', 'neutral': '#475569',
                            'met': '#047857', 'miss': '#B91C1C'}}
     css = ''.join(f'.srg-{state} {{ color: var(--srg-{state}); }}' for state in audit.STATES)
+    marker = "embedded" if expanded else "base"
     data = json.dumps({'columns': ['direct_delta'], 'rows': [[-3.66]]}) if expanded else ''
     return (f'<!doctype html><html><head><style>{css} .layout{{width:100%}}</style></head><body>'
             f'<p>{body}</p><script type="application/json" id="srg-display-contract">{json.dumps(contract)}</script>'
-            f'<script type="application/json" id="srg-data" data-srg-snapshot="base">{data}</script>'
+            f'<script type="application/json" id="srg-data" data-srg-snapshot="{marker}">{data}</script>'
             f'<script id="srg-formatters">{(ASSETS / "report-formatters.js").read_text()}</script>'
             f'<script>const {{fmtPct,fmtNum,fmtDelta}} = SrgDisplay;{code}</script></body></html>')
 
@@ -32,6 +33,12 @@ class SkillDisplayAuditTest(unittest.TestCase):
         self.assertEqual(audit.audit_html(document()), [])
         self.assertEqual(audit.audit_html(document(expanded=True), expanded=True), [])
         self.assertTrue(audit.audit_html(document(), expanded=True))
+
+    def test_chart_layout_and_decoration_literals(self):
+        code = ("const chart = {radius: ['45%', '70%'], grid: {left: '4%'}, "
+                "axisLine: {lineStyle: {color: '#ddd'}}, shadowColor: 'rgba(0,0,0,0.06)'};")
+        self.assertEqual(audit.audit_html(document(code=code)), [])
+        self.assertTrue(audit.audit_html(document(code=code + "const value = '73%';")))
 
     def test_banned_display_and_tooltip_paths(self):
         for body in ('同比 -3.66pp', '同比 -3.66 PP', '差 3.66个百分点', '差 3.66pct',
@@ -57,7 +64,7 @@ class SkillDisplayAuditTest(unittest.TestCase):
         # 原始字段/单位不等于输出；规则原文也必须可以记录禁用词。
         source = source.replace('测试规则', '禁止 pp、百分点、pct')
         source = source.replace('data-srg-snapshot="base"></script>',
-                                'data-srg-snapshot="base">{"columns":["pp"],"rows":[["pct"]]}</script>')
+                                'data-srg-snapshot="embedded">{"columns":["pp"],"rows":[["pct"]]}</script>')
         self.assertEqual(audit.audit_html(source, expanded=True), [])
         self.assertEqual(audit.audit_html(document(code='const coordinate = index % 3;')), [])
 

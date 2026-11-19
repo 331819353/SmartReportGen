@@ -57,15 +57,19 @@ def check_ident(name: str) -> str:
 
 
 def norm_value(v: Any) -> Any:
+    if type(v) is int and abs(v) > 2**53 - 1:
+        return {"$decimal": str(v)}
     if v is None or isinstance(v, (bool, int, str)):
         return v
     if isinstance(v, float):
         return v if math.isfinite(v) else None  # JSON 无法表示 NaN 和无穷大。
     if isinstance(v, decimal.Decimal):
-        f = float(v)
-        if not math.isfinite(f):
+        # 使用显式类型保留原值，避免把看似数字的业务文本当成度量。
+        if not v.is_finite():
             return None
-        return int(f) if v == v.to_integral_value() and abs(f) < 2**53 else f
+        if v == v.to_integral_value() and abs(v) <= 2**53 - 1:
+            return int(v)
+        return {"$decimal": str(v)}
     if isinstance(v, dt.datetime):
         if v.hour == v.minute == v.second == 0 and v.microsecond == 0:
             return v.strftime("%Y-%m-%d")
@@ -123,7 +127,7 @@ def _kind(values: list[Any]) -> str:
         return "unknown"
     if all(isinstance(v, bool) for v in nn):
         return "boolean"
-    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in nn):
+    if all(type(v) in (int, float) or isinstance(v, dict) and "$decimal" in v for v in nn):
         return "number"
     if all(isinstance(v, str) and re.match(r"^\d{4}-\d{2}(-\d{2})?([ T]\d{2}:\d{2}(:\d{2})?)?$", v) for v in nn):
         return "datetime"
@@ -145,9 +149,14 @@ def profile(columns: list[str], rows: list[list[Any]]) -> list[dict]:
             "distinct": len(set(map(str, nn))),
         }
         if nn and kind in ("number", "datetime"):
-            p["min"], p["max"] = min(nn), max(nn)
-            if kind == "number":
-                p["avg"] = round(sum(nn) / len(nn), 4)
+            if kind == "number" and any(isinstance(v, dict) for v in nn):
+                values = [decimal.Decimal(v["$decimal"] if isinstance(v, dict) else str(v)) for v in nn]
+                p["min"], p["max"] = norm_value(min(values)), norm_value(max(values))
+                p["avg"] = norm_value(round(sum(values) / len(values), 4))
+            else:
+                p["min"], p["max"] = min(nn), max(nn)
+                if kind == "number":
+                    p["avg"] = round(sum(nn) / len(nn), 4)
         if nn and kind in ("text", "boolean") or (kind == "number" and p["distinct"] <= 12):
             p["top_values"] = [
                 {"value": v, "count": k} for v, k in Counter(map(str, nn)).most_common(10)

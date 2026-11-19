@@ -54,7 +54,7 @@ api --get "$BASE_URL/api/datasets" --data-urlencode 'q=客服'
 |---|---|
 | 已对接海尔 IAM 的服务或宿主 | 使用其登录流程签发给当前用户、可通过 IAM 账号核验的 access token。每次向 SmartReportGen 发送 `Authorization: Bearer <access token>` |
 | 需要自己实现登录的第三方服务 | 向 IAM 负责人申请或确认应用，登记第三方应用的回调地址。由服务端按下方授权码流程换取 access token |
-| Codex 等支持本机 OAuth 回调的 MCP 客户端 | 将 MCP 地址和 `smartreportgen-cli` 配置给客户端，让客户端发起浏览器授权并管理令牌。见 [MCP OAuth](#mcp-oauth) |
+| Codex 或其他 MCP 客户端 | 从海尔 IAM 取得用户 access token，用 `Authorization: Bearer <access token>` 调用。见 [MCP 客户端接入](#mcp-authentication) |
 | 在浏览器中操作管理台 | 从 `$BASE_URL/auth/iam/login?next=/` 发起登录，浏览器自动使用 `srg_iam_session` Cookie。管理台的登录回调不会向第三方应用返回 IAM access token |
 
 SmartReportGen 用海尔 IAM 的 `GET /api/oauth/account/info` 核实令牌对应的员工，再检查本地账号状态、系统身份和数据授权。REST 的 Bearer 值是 IAM access token，`client_secret`、授权码和管理台 Cookie 各有独立用途。服务端接入需要用户授权，没有 SmartReportGen API Key 或 `client_credentials` 换票入口。显式发送的 `Authorization` 优先于浏览器 Cookie。
@@ -76,53 +76,22 @@ HAIER_IAM_ACCESS_TOKEN=$(
 )
 ```
 
-IAM 返回 `resultCode=0` 时从 `data.access_token` 读取令牌，部分 IAM 环境字段为 `data.accessToken` 或 `data.token`。示例把令牌保存在变量中，换票失败时应停止调用并检查 IAM 返回的状态。避免把凭证写入日志。换票后用 `/api/me` 核对工号。令牌失效后由 IAM 登录流程更新凭证。SmartReportGen 的 `/auth/mcp/token` 只接收其 MCP 授权流程签发的一次性授权码。
+IAM 返回 `resultCode=0` 时从 `data.access_token` 读取令牌，部分 IAM 环境字段为 `data.accessToken` 或 `data.token`。示例把令牌保存在变量中，换票失败时应停止调用并检查 IAM 返回的状态。避免把凭证写入日志。换票后用 `/api/me` 核对工号。令牌失效后由 IAM 登录流程更新凭证。
 
 <a id="report-quickstart"></a>
 
-## 运行结构化模板并下载报告
+## 运行声明式模板并下载报告
 
-新报告请按 smart-report 流程由 Agent 直接编写单文件 HTML，验证筛选联动与结论着色，再用 MCP `save_report` 关联业务模板版本并保存。下面的 HTTP 示例演示如何运行服务端结构化模板。先完成 [首次调用](#quickstart)，再把 `DATASET_ID` 和 `TABLE_NAME` 替换为获授权的测试场景和表名。示例 SQL 适用于普通表名或 `schema.table`，带引号等特殊表名时请按数据源方言编写 SQL。此示例会保存一份模板和一份报告。
+先完成 [首次调用](#quickstart)，再选择已配置、包含查询计划的声明式模板。运行会按当前账号取数，完成编译和 Chromium 验收，成功时保存报告。
 
 ```bash
-(
-  set -eu
-  DATASET_ID=12
-  TABLE_NAME='tickets'
-
-  # 核对表名来自当前账号可见的场景清单，再构造只读查询。
-  dataset=$(api "$BASE_URL/api/datasets/$DATASET_ID")
-  printf '%s\n' "$dataset" | jq -e --arg t "$TABLE_NAME" \
-    'any(.tables[]; .table_name == $t) and ($t | test("^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$"))' >/dev/null
-  template=$(jq -n --argjson dataset_id "$DATASET_ID" --arg table "$TABLE_NAME" '
-    {
-      dataset_id: $dataset_id,
-      business_summary: "统计授权表的记录数",
-      markdown: "---\ntitle: 接入验证报告\nqueries:\n  q1:\n    sql: SELECT COUNT(*) AS row_count FROM \($table)\n---\n\n## 数据概况\n\n统计授权表的记录数。"
-    }')
-
-  # HTTP 200 仍可能校验失败。只有 ok 为 true 才保存和生成。
-  validation=$(api "$BASE_URL/api/templates/validate" \
-    -H 'Content-Type: application/json' --data-binary "$template")
-  printf '%s\n' "$validation" | jq '{ok, errors, warnings, queries}'
-  printf '%s\n' "$validation" | jq -e '.ok == true' >/dev/null
-
-  saved=$(api "$BASE_URL/api/templates" \
-    -H 'Content-Type: application/json' --data-binary "$template")
-  TEMPLATE_ID=$(printf '%s\n' "$saved" | jq -er '.id | numbers')
-
-  report=$(api -X POST "$BASE_URL/api/templates/$TEMPLATE_ID/render")
-  REPORT_ID=$(printf '%s\n' "$report" | jq -er '.id | numbers')
-  printf '%s\n' "$report" | jq '{id, name, url, warnings}'
-
-  api "$BASE_URL/reports/$REPORT_ID/download?standalone=true" --output "report-$REPORT_ID.html"
-  printf '已下载 report-%s.html\n' "$REPORT_ID"
-)
+TEMPLATE_ID=12
+report=$(api "$BASE_URL/api/templates/$TEMPLATE_ID/render" -H 'Content-Type: application/json' --data-binary '{"parameters":{"period":"2026-09"}}')
+REPORT_ID=$(printf '%s\n' "$report" | jq -er '.id | numbers')
+api "$BASE_URL/reports/$REPORT_ID/download" --output "report-$REPORT_ID.html"
 ```
 
-`POST /api/templates` 返回模板 `id`，用于 `/api/templates/{tpl_id}/render`。生成响应的 `id` 是另一项资源的报告 ID，用于报告详情和下载。返回的 `url` 可交给有查看权限的员工在浏览器登录后打开。应用也可以向下载接口发 Bearer 请求，按 HTML 文件处理响应。模板的完整语法可从部署实例的 `$BASE_URL/api-guide/template-spec` 获取。
-
-如果只想下载已有报告，调用 `api "$BASE_URL/api/reports"`，从结果中选一个报告 `id` 后直接调用下载接口。模板校验、预览和生成可能同步执行查询，为调用配置合适的响应超时。创建模板和生成报告都可能新增记录。调用超时且结果未知时，先查 `/api/templates` 或 `/api/reports` 确认是否已成功，再决定是否重试。
+使用模板实际声明的参数名，无参数时传 `{}`。模板可通过 `POST /api/templates` 提交 `{"dataset_id":12,"spec":{...}}` 创建。[完整 Spec 和官方指标示例](../skills/smart-report/references/declarative-report.md)
 
 <a id="troubleshooting"></a>
 
@@ -159,7 +128,7 @@ IAM 返回 `resultCode=0` 时从 `data.access_token` 读取令牌，部分 IAM �
 | `500` | 未处理的服务端异常 |
 | `503` | IAM 尚未配置或暂时无法核验凭证 |
 
-REST 业务错误通常为 `{"detail":"错误说明"}`，`422` 的 `detail` 是校验问题数组，例如 `{"detail":[{"type":"missing","loc":["query","q"],"msg":"Field required","input":null}]}`。浏览器登录、报告下载和 MCP OAuth 的特殊响应格式在各自接口下说明。
+REST 业务错误通常为 `{"detail":"错误说明"}`，`422` 的 `detail` 是校验问题数组，例如 `{"detail":[{"type":"missing","loc":["query","q"],"msg":"Field required","input":null}]}`。浏览器登录、报告下载和 MCP 传输的响应格式在各自接口下说明。
 
 <a id="api-reference"></a>
 
@@ -172,6 +141,7 @@ REST 业务错误通常为 `{"detail":"错误说明"}`，`422` 的 `detail` 是�
 | `GET /` | `200 text/html` | 管理台页面，带 `Cache-Control: no-cache`。页面加载后查询当前登录身份 |
 | `GET /healthz` | `200`，`{"ok":true}` | 检查 HTTP 服务及元数据库连通性。失败返回非 2xx |
 | `GET /api-guide` | `200 text/html` | 本文的在线版本 |
+| `GET /api-guide/report-spec` | `200 text/plain` | 声明式报告模板及官方指标配置 |
 | `GET /api-guide/template-spec` | `200 text/plain` | Markdown 报告模板规范全文 |
 | `GET /docs` | `200 text/html` | Swagger UI |
 | `GET /docs/oauth2-redirect` | `200 text/html` | FastAPI 自带的 Swagger OAuth 回调页 |
@@ -185,7 +155,7 @@ FastAPI 自带文档路由和静态资源还支持 `HEAD`，返回响应头，�
 
 | 方法与路径 | 权限 | 请求 | 响应 |
 |---|---|---|---|
-| `GET /api/auth/config` | 公开 | 无。可带 Cookie 或 Bearer 查询当前身份 | `{"mode":"iam","iam_configured":true,"mcp_oauth":true,"me":{"logged_in":false}}`。登录时 `me` 为下方身份对象 |
+| `GET /api/auth/config` | 公开 | 无。可带 Cookie 或 Bearer 查询当前身份 | `{"mode":"iam","iam_configured":true,"me":{"logged_in":false}}`。登录时 `me` 为下方身份对象 |
 | `GET /api/auth/check` | 公开 | 无。可带 Cookie 或 Bearer | `{"required":true,"ok":true}`。身份缺失、未登记或已停用时 `ok:false` |
 | `GET /auth/iam/login` | 公开 | 可选查询参数 `next`，默认 `/`，仅接受站内路径 | `302`，`Location` 为 IAM 授权地址，`Set-Cookie` 设置 10 分钟有效的 HttpOnly 登录状态 Cookie `srg_iam_login`。请求主机与配置的 IAM 回调主机不同时，先 `302` 到回调主机的登录入口。IAM 未配置返回 `503 text/html` |
 | `GET /auth/iam/callback` | IAM 浏览器回调 | 查询参数 `code`、`state` 及登录状态 Cookie。IAM 授权失败时可带 `error` | `302` 跳转至登录时指定的站内路径，设置 HttpOnly 会话 Cookie `srg_iam_session` 并清除登录状态 Cookie。失败时返回 HTML，`400` 为授权或状态无效，`403` 为未登记或已停用，`503` 为 IAM 暂不可用。MCP 回调分支见下文 |
@@ -251,9 +221,9 @@ FastAPI 自带文档路由和静态资源还支持 `HEAD`，返回响应头，�
 | `DELETE /api/datasources/{ds_id}` | 管理员 | 路径 `ds_id`，无请求体 | `{"ok":true}`。被业务场景引用时返回 `400` |
 | `POST /api/datasources/test` | 管理员 | JSON 传 `type`、`config`，可选 `name`、`secret`、`id`。传 `id` 且未提供非空 `secret` 时使用该数据源的已存密钥，本次测试仍使用请求中的连接配置 | 连接测试对象，见下方示例。借用密钥的 ID 不存在返回 `404` |
 | `POST /api/datasources/{ds_id}/test` | 管理员 | 路径 `ds_id`，无请求体 | 使用已保存的配置，返回连接测试对象。数据源不存在返回 `404` |
-| `GET /api/datasources/{ds_id}/tables` | 管理员 | 路径 `ds_id`，可选查询参数 `schema` | 数据库账号可见的表和视图。每项有 `schema`、`table`、`name`、`comment`、`kind`（`table`、`view` 或 `materialized_view`）。不存在返回 `404` |
-| `GET /api/datasources/{ds_id}/columns` | 管理员 | 路径 `ds_id`，必填查询参数 `table` | 字段元数据数组：`name`（小写）、`source_name`（原始名称）、`type`、`nullable`、`comment`。数据库数据源不读取业务行 |
-| `GET /api/datasources/{ds_id}/values` | 管理员 | 必填 `table` 和 `column`（使用字段的 `source_name`）；可选 `q`（字面包含搜索）、`limit`（默认 50，最多 100）、`offset`（默认 0，最大 10000） | 字段实际去重值 `{"values":[null,"华东","华南"],"next_offset":null}`。有下一页时 `next_offset` 为整数。候选值不受场景中已有过滤条件影响 |
+| `GET /api/datasources/{ds_id}/tables` | 管理员或获数据源选表授权 | 路径 `ds_id`，可选查询参数 `schema` | 数据库账号可见的表和视图。每项有 `schema`、`table`、`name`、`comment`、`kind`（`table`、`view` 或 `materialized_view`）。不存在返回 `404` |
+| `GET /api/datasources/{ds_id}/columns` | 管理员或获数据源选表授权 | 路径 `ds_id`，必填查询参数 `table` | 字段元数据数组：`name`（小写）、`source_name`（原始名称）、`type`、`nullable`、`comment`。数据库数据源不读取业务行 |
+| `GET /api/datasources/{ds_id}/values` | 管理员或获数据源选表授权 | 必填 `table` 和 `column`（使用字段的 `source_name`）；可选 `q`（字面包含搜索）、`limit`（默认 50，最多 100）、`offset`（默认 0，最大 10000） | 字段实际去重值 `{"values":[null,"华东","华南"],"next_offset":null}`。有下一页时 `next_offset` 为整数。候选值不受场景中已有过滤条件影响 |
 | `GET /api/datasources/{ds_id}/describe` | 管理员 | 路径 `ds_id`，必填查询参数 `table`，可选整数 `sample_rows`，默认 10 | 表结构、样本和列画像，见下方示例。数据源不存在返回 `404`，表查询失败可返回 `400` |
 | `POST /api/datasources/{ds_id}/query` | 管理员 | 路径 `ds_id`。JSON 传必填 `sql`，可选整数 `limit`，默认 200，有效返回上限限制在 1–5000 | 查询结果，见下方示例。无数据源返回 `404`，空 SQL、非只读语句或执行失败返回 `400` |
 
@@ -284,6 +254,25 @@ Oracle 的 `config.schema` 用作默认浏览范围及 SQL 会话的当前 Schem
 ```
 
 `endpoints` 以逻辑表名为键。单项可传 `path`、`method`、查询对象 `params`、JSON `body`、`description` 及覆盖全局的 `records_path`。
+
+### 数据源开放配置
+
+管理员在数据源的 `config.scenario_tables` 中配置普通用户可以引用的表或视图。按工号 `employees` 或角色 `roles` 匹配，至少填写其中一项。表名需与该数据源目录一致。可在已有数据源上补充配置，普通用户随后就能自行创建场景。
+
+```json
+{
+  "scenario_tables": [
+    {
+      "table_name": "tickets",
+      "description": "客服工单",
+      "roles": ["user"],
+      "row_filters": [{"column": "region", "values": ["华东"]}]
+    }
+  ]
+}
+```
+
+普通用户请求 `GET /api/datasources` 时，`can_build_scene:true` 标记可用于创建场景的数据源。表和字段目录基于当前授权返回，候选值按固定行范围查询。个人场景的附加筛选与固定行范围同时生效。删除表授权、撤销角色或停用数据源后，该账号不能再通过个人场景读取受影响的数据。既有共享场景继续按原场景授权工作。
 
 **数据源对象**
 
@@ -336,11 +325,11 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 | 方法与路径 | 权限 | 请求 | 响应 |
 |---|---|---|---|
-| `GET /api/datasets` | 登录 | 可选查询参数 `q`，按场景名、业务描述或标签做不区分大小写的包含搜索 | 场景摘要数组，按 ID 升序。普通用户仅见启用且有表权限的场景 |
-| `POST /api/datasets` | 管理员 | JSON 场景配置。必填 `business_scenario`、`business_description`、`datasource_id`，可选 `analysis_approach`、`tags`、`enabled`、`tables` | 场景详情。缺字段、空表名或重复表名返回 `400`，重名或引用冲突返回 `409` |
+| `GET /api/datasets` | 登录 | 可选查询参数 `q`，按场景名、业务描述或标签做不区分大小写的包含搜索 | 场景摘要数组，按 ID 升序。普通用户可见本人创建的场景及另行获授权的启用场景 |
+| `POST /api/datasets` | 登录 | JSON 场景配置。必填 `business_scenario`、`business_description`、`datasource_id`，可选 `analysis_approach`、`tags`、`enabled`、`tables`。普通用户至少选一张已开放的表 | 场景详情。缺字段、空表名或重复表名返回 `400`，重名或引用冲突返回 `409` |
 | `GET /api/datasets/{dataset_id}` | 登录 | 路径 `dataset_id` | 场景详情。普通用户仅见获授权的表。不存在或不可见返回 `404` |
-| `PUT /api/datasets/{dataset_id}` | 管理员 | 路径 `dataset_id`。JSON 传要修改的字段，传入 `tables` 时整体替换，可用 `[]` 清空 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
-| `DELETE /api/datasets/{dataset_id}` | 管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true}`，删除场景及其表清单和授权，已关联的模板解除场景关联 |
+| `PUT /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`。JSON 传要修改的字段，传入 `tables` 时整体替换，个人场景至少保留一张可引用的表 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
+| `DELETE /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true}`，删除场景及其表清单和授权，已关联的模板解除场景关联 |
 | `GET /api/datasets/search` | 登录 | 必填查询参数 `q` 为业务需求，可选整数 `top_k`，默认 5 | 混合检索结果，见下方。仅检索启用场景，普通用户限已授权场景 |
 | `POST /api/datasets/reindex` | 管理员 | 无 | 如 `{"datasets":3,"style_rules":2,"not_vectorized":0}`，前两项为重建索引的记录数，末项为操作后仍无向量的记录数 |
 | `GET /api/scenarios` | 登录 | 无 | 场景名称字符串数组，如 `["客服工单分析"]`。管理员见全部，普通用户限启用且已授权的场景 |
@@ -377,7 +366,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 }
 ```
 
-场景摘要以 `table_count` 替代 `analysis_approach` 和 `tables`。普通用户的摘要和详情均附 `read_only:true`，`table_count` 统计其可见的表。管理员详情不含 `table_count`。
+场景摘要以 `table_count` 替代 `analysis_approach` 和 `tables`。个人场景返回 `owner_emp_no`。普通用户查看本人场景时返回 `read_only:false`，表的 `source_row_filters` 表示只读的源范围。管理员详情不含 `table_count`。
 
 **混合检索结果**
 
@@ -385,26 +374,29 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 ## 报告模板
 
-业务模板保存面向业务人员的 Markdown 文档，供 agent 开发 HTML。结构化模板可由管理台和服务端直接运行。
+自由版式模块使用 MCP 的 `save_free_report_template`、`patch_free_report_template` 和 `preview_free_report`。HTTP 的模板运行可按已保存的自由模板取数验收，报告读取的 `include_source=true` 返回 `free_report` 定义，报告修订可提交同账号的验收 `preview_id`。[自由版式模板契约](../skills/smart-report/references/free-report.md)
+
+声明式模板保存场景、取数计划和报告定义。历史 Markdown 与旧结构化模板可查看、诊断及迁移。
 
 | 方法与路径 | 权限 | 请求 | 响应 |
 |---|---|---|---|
 | `GET /api/templates` | 登录 | 可选查询参数 `q`，按模板名、场景、业务说明、目标、需求搜索 | 模板摘要数组，按更新时间降序。普通用户仅见本人模板 |
-| `POST /api/templates` | 登录 | JSON 模板写入对象，必填 `markdown`，其他字段见下方 | 模板详情，初始 `version:1`。源码非法返回 `400`，无权使用指定场景返回 `403` |
+| `POST /api/templates` | 登录 | JSON 模板写入对象，提交 `spec` 或 `markdown`，其他字段见下方 | 模板详情，初始 `version:1`。源码非法返回 `400`，无权使用指定场景返回 `403` |
 | `POST /api/templates/validate` | 登录 | JSON 传 `markdown`，可选整数 `dataset_id`、布尔值 `execute`（默认 `true`） | 校验结果。结构、SQL 或字段校验失败仍返回 `200`，以 `ok:false` 及 `errors` 表示。对请求中指定的场景无权访问时返回 `403` |
 | `POST /api/templates/preview` | 登录 | JSON 传 `markdown`，可选整数 `dataset_id`。管理员可传 `owner`（工号）按其个人样式预览 | `200 text/html`，即时渲染的报告页面。源码、SQL 或渲染失败返回 `400`，无权使用指定场景返回 `403` |
 | `GET /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id` | 模板详情，额外附 `versions`。不存在返回 `404`，非本人且非管理员返回 `403` |
-| `PUT /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`。JSON 必须提交 `markdown`，可同时更新管理字段 | 更新后的模板详情，源码变化时新增版本。不存在返回 `404`，权限或校验失败同新增及详情 |
+| `PUT /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`。JSON 提交 `spec` 或 `markdown`，可同时更新管理字段 | 更新后的模板详情，源码变化时新增版本。不存在返回 `404`，权限或校验失败同新增及详情 |
 | `DELETE /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`，无请求体 | `{"ok":true}`，删除模板及历史版本，已生成的报告保留。不存在返回 `404`，越权返回 `403` |
 | `GET /api/templates/{tpl_id}/versions/{version}` | 本人 | 路径 `tpl_id`、`version` | `{"version":1,"markdown":"历史 Markdown 源码","created_at":"2026-01-01T00:00:00+00:00"}`。模板或版本不存在返回 `404`，越权返回 `403` |
-| `POST /api/templates/{tpl_id}/render` | 本人 | 路径 `tpl_id`。可省略请求体，或传 JSON `{"name":"客服工单日报"}`，缺省使用模板名 | 运行结构化模板并保存新报告，字段见报告库一节。业务模板或查询、渲染失败返回 `400`，越权返回 `403`，模板不存在返回 `404` |
+| `POST /api/templates/{tpl_id}/render` | 本人 | 路径 `tpl_id`。可省略请求体，或传 `name`、`template_version` 与模板声明的 `parameters` | 运行声明式模板并验收保存。旧格式、取数或验收失败返回 `400`，越权返回 `403`，模板不存在返回 `404` |
 
 **模板写入字段**
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `markdown` | 字符串，必填 | 完整 Markdown。业务模板保存原文，结构化模板写入时做静态语法校验 |
-| `template_type` | `business` 或 `structured`，可选 | `business` 为业务文档，`structured` 为可执行模板。新增省略时沿用 `structured` 默认值，创建后类型固定 |
+| `spec` | 对象 | 完整声明式模板，须指定 `dataset_id`，按 `business` 类型保存 |
+| `markdown` | 字符串 | 历史 Markdown；旧结构化模板写入时做语法校验 |
+| `template_type` | `business` 或 `structured`，可选 | `business` 为声明式模板或历史业务文档，`structured` 为旧结构化格式。新增省略时沿用 `structured` 默认值，创建后类型固定 |
 | `name` | 字符串，可选 | 模板名，省略或空字符串时取源码标题，更新时也是如此 |
 | `dataset_id` | 整数或 `null`，可选 | 关联场景。新增省略时无关联，更新省略时沿用原值，传 `null` 解除关联 |
 | `user_requirement` | 字符串，可选 | 用户需求 |
@@ -461,11 +453,11 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `GET /api/reports/{report_id}` | 本人或获分享 | 可选查询参数 `version`（正整数）、`include_html`、`include_source`（布尔值，均默认 `false`） | 报告详情与固定版本链接。按需增加 `html`（字符串）及 `markdown`（字符串或 `null`） |
 | `GET /api/reports/{report_id}/versions` | 本人或获分享 | 无额外参数 | 默认查看的版本详情（无链接字段）及 `versions` 数组，按版本号降序 |
 | `PUT /api/reports/{report_id}/selection` | 本人或获分享 | JSON 必填 `version`，正整数或 `null`。例如 `{"version":2}` | 保存当前账号的版本选择，返回所选版本详情。`{"version":null}` 恢复跟随最新。格式错误返回 `422` |
-| `PUT /api/reports/{report_id}` | 本人或获编辑权限 | JSON 必填 `name`，`html` 或 `markdown` 二选一。可选 `base_version`、`expected_version`、`revision`、`change_note` | 在同一报告追加版本，返回新版本详情。并发冲突返回 `409`，字段校验失败返回 `422`，内容或渲染失败返回 `400` |
+| `PUT /api/reports/{report_id}` | 本人或获编辑权限 | JSON 必填 `name`。修改正文传 `spec` 或同账号生成的验收 `preview_id`。可选 `base_version`、`expected_version`、`revision`、`change_note` | 在同一报告追加版本，返回新版本详情。并发冲突返回 `409`，字段校验失败返回 `422`，内容或渲染失败返回 `400` |
 | `DELETE /api/reports/{report_id}` | 本人 | 无额外参数 | `{"ok":true}`，删除报告及版本和分享记录 |
 | `GET /api/reports/{report_id}/shares` | 本人 | 无额外参数 | 分享对象数组，按工号升序 |
 | `GET /api/reports/{report_id}/share-recipients` | 本人 | 可选查询参数 `q`（姓名或工号，最多 100 个字符） | 最多 20 个已启用接收人，仅返回 `emp_no`、`name` |
-| `POST /api/reports/{report_id}/shares` | 本人 | JSON 必填 `emp_no`（1–256 个字符）、`access_level`（`view` 或 `edit`） | 分享对象，已存在时更新权限。未登记的工号可预先授权。工号无效、停用或为创建人时返回 `400`，字段校验失败返回 `422` |
+| `POST /api/reports/{report_id}/shares` | 本人 | JSON 必填 `emp_no`（1–256 个字符）、`access_level`（`view` 或 `edit`） | 分享对象，已存在时更新权限。接收人须登记、启用且有当前版本全部来源数据的权限。工号无效、停用或未登记时返回 `400`，缺数据权限返回 `403`，字段校验失败返回 `422` |
 | `DELETE /api/reports/{report_id}/shares/{emp_no}` | 本人 | 路径 `report_id`、`emp_no`，无请求体 | `{"ok":true}`，撤销接收员工的访问权限。该授权已不存在时也返回成功 |
 | `GET /reports/{report_id}` | 本人或获分享 | 可选正整数查询参数 `version` | `200 text/html`。`Accept` 包含 `text/html` 时返回带版本操作的浏览器页面，其他情况下返回报告正文 |
 | `GET /reports/{report_id}/content` | 本人或获分享 | 可选正整数查询参数 `version` | `200 text/html`，报告正文 |
@@ -513,23 +505,24 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 **编辑报告请求示例**（`PUT /api/reports/15`）
 
 ```json
-{"name":"客服工单日报","html":"<!doctype html><html><head><meta charset=\"utf-8\"><style>h1{color:#17396d}</style></head><body><h1>客服工单日报</h1><script>document.title = document.querySelector('h1').textContent;</script></body></html>","base_version":1,"expected_version":1,"change_note":"更新标题"}
+{"name":"客服工单日报","base_version":1,"expected_version":1,"change_note":"更新报表名称"}
 ```
 
 | 字段 | 类型及用途 |
 |---|---|
 | `name` | 必填，非空字符串。保存时去除首尾空白 |
-| `html`、`markdown` | 二选一，字符串。`html` 提交已验证的单文件，CSS、JavaScript 和数据均内联。`markdown` 供旧结构化报告重新执行查询，需有该版源码和当前数据权限 |
+| `spec` | 声明式正文。省略 `parameters` 时复用基准数据，提交 `parameters` 时重新取数 |
+| `preview_id` | 与报告和基准版本匹配、由当前账号生成的服务端验收预览 |
 | `base_version` | 可选正整数，从详情的 `revision` 读取。指定编辑使用的版本，允许从历史版本生成新版本。省略时使用个人选定版本或最新版本，旧链接默认用原快照 |
 | `expected_version` | 可选正整数，从详情的 `latest_version` 读取。传入后，如果报告在读取后产生了新版本，保存返回 `409` |
 | `revision` | 兼容旧客户端的可选正整数，同时作为 `base_version` 与 `expected_version`。传入时省略另外两个版本字段 |
 | `change_note` | 可选字符串，默认空，最多 500 字符 |
 
-例如当前已有 v1–v4，使用 `base_version:2`、`expected_version:4` 成功保存时产生 v5，响应中 `base_version` 为 2，`revision` 和 `latest_version` 为 5。保存后编辑者恢复跟随最新版本。手工修改 HTML 正文后，新版本不再提供原 Markdown。收到 `409` 时先读取最新内容和版本，再决定如何合并修改。
+例如当前已有 v1–v4，使用 `base_version:2`、`expected_version:4` 成功保存时产生 v5，响应中 `base_version` 为 2，`revision` 和 `latest_version` 为 5。保存后编辑者恢复跟随最新版本。声明式正文变更重新执行服务端验收，并留存新版本源码。收到 `409` 时先读取最新内容和版本，再决定如何合并修改。
 
 **分享请求与响应示例**（`POST /api/reports/15/shares`）
 
-请求为 `{"emp_no":"E10002","access_level":"view"}`，响应为 `{"emp_no":"E10002","name":"示例同事","enabled":true,"registered":true,"access_level":"view"}`。分享列表返回同结构的数组。`registered` 表示工号是否已在系统登记，`enabled` 表示账号当前是否启用。未登记工号的两个字段均为 `false`，接收人完成海尔 IAM 登录且账号启用后即可使用授权。
+请求为 `{"emp_no":"E10002","access_level":"view"}`，响应为 `{"emp_no":"E10002","name":"示例同事","enabled":true,"registered":true,"access_level":"view"}`。分享列表返回同结构的数组。`registered` 表示工号是否已在系统登记，`enabled` 表示账号当前是否启用。已登记接收人使用获授权的账号登录。访问历史版本仍会逐版本复核数据权限。
 
 分享权限覆盖同一份报告的全部版本，模板和业务数据权限独立授权。撤销后，接收人再次访问该报告会收到 `403`，先前下载的离线文件仍可打开。跨设备分享时，`PUBLIC_BASE_URL` 须指向接收人可访问的部署地址。
 
@@ -603,7 +596,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `general_rules`、`scenario_rules` | 生效的通用规则和当前用户个人场景规则数组。规则的 `items` 附 `category_label`。有检索命中时规则附 `relevance`，结构同业务场景检索命中去掉 `dataset` |
 | `warnings` | 字符串数组，例如相关度检索的向量降级提示 |
 
-`reporting_rules` 由代码内置，不写入样式规则表，不能通过规则 CRUD 删除或修改。MCP `get_style_rules` 同样返回该字段；`get_skill_guide(reference="fact-contract")` 可读事实取数细则，`reference="green-energy-september-facts"` 可读附件的绿能九月场景参考，`reference="display-contract"` 可读展示断言、统一入口与保存门禁。MCP-only 客户端可分别用 `asset="report-formatters.js"`、`asset="audit_report.py"` 读取完整代码并保存到同一目录；asset 不与 reference/include_example 混用。后者不代表本次已验证数据或复现样式。规则指导 Agent 直取事实、保留缺失并交付离线单文件，不是任意 SQL、JavaScript 或自然语言结论的自动合规校验器。技能要求 Agent 在保存前执行本地源文档/展开文件审计及浏览器复核；保存接口本身不验证该本地审计记录。
+内置事实和展示规则通过 `reporting_rules` 返回。声明式报告由服务端完成静态审计及 Chromium 验收。本地审计脚本可诊断历史草稿，不能签发保存凭证。场景负责人可通过 `semantic_metrics` 配置官方指标，见[声明式模板和取数计划](../skills/smart-report/references/declarative-report.md)。
 
 **`effective` 与 `preview` 请求示例**
 
@@ -668,89 +661,23 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 角色授权的 `employee_name` 为 `null`，整场景授权的 `table_name` 为 `"*"`。查询员工有效权限时会合并角色授权和直授，并按当前启用的场景及实际表清单计算。
 
-<a id="mcp-oauth"></a>
+<a id="mcp-authentication"></a>
 
-## Codex CLI 与 MCP OAuth
+## MCP 客户端接入
 
-在已安装 Codex CLI 的终端设置部署方提供的 `MCP_URL`。默认是 `BASE_URL` 加 `/mcp`，如部署方提供了不同地址，以其为准。
+按[首次调用](#quickstart)输入海尔 IAM access token 后，在同一个终端中配置 Codex。默认地址是 `BASE_URL` 加 `/mcp`，部署方提供独立地址时使用该地址。
 
 ```bash
 MCP_URL="$BASE_URL/mcp"
-codex mcp add smartreportgen --url "$MCP_URL" --oauth-client-id smartreportgen-cli
-codex mcp login smartreportgen
+export SMARTREPORT_TOKEN="${HAIER_IAM_ACCESS_TOKEN:?请先输入海尔 IAM access token}"
+codex mcp add smartreportgen --url "$MCP_URL" --bearer-token-env-var SMARTREPORT_TOKEN
 ```
 
-按浏览器提示完成海尔 IAM 登录后，在客户端调用 `whoami`，确认工号、`registered` 和 `access`。兼容客户端通过 OAuth 发现、浏览器授权及 S256 PKCE 获得 IAM 原票。令牌到期后重新登录。
-
-| 方法与路径 | 权限 | 请求 | 响应 |
-|---|---|---|---|
-| `GET /.well-known/oauth-protected-resource/mcp` | 公开 | 无 | MCP 资源元数据，字段见下方。也可使用 `GET /.well-known/oauth-protected-resource`，两者返回相同结构 |
-| `GET /.well-known/oauth-authorization-server` | 公开 | 无 | 授权服务器元数据，字段见下方 |
-| `GET /auth/mcp/authorize` | 公开 | 查询参数见下方 | `302` 跳转至 IAM，设置短时 HttpOnly 回调 Cookie。请求非法返回 `400` |
-| `POST /auth/mcp/token` | 授权码与 PKCE | `Content-Type: application/x-www-form-urlencoded`，表单字段见下方 | 如 `{"access_token":"<IAM access token>","token_type":"Bearer","scope":"mcp","expires_in":3600}`。非法或已使用的授权码返回 `400` |
-
-未配置 IAM 时，以上发现、授权和换票接口返回 `404`。OAuth JSON 错误格式为 `{"error":"invalid_request","error_description":"错误说明"}`，未启用时 `error` 为 `server_error`。
-
-**资源发现响应**
-
-```json
-{
-  "resource":"http://localhost:18600/mcp",
-  "authorization_servers":["http://localhost:18600"],
-  "bearer_methods_supported":["header"],
-  "scopes_supported":["mcp"]
-}
-```
-
-配置其他 MCP 公开路径时，资源发现路径按该 URL 的路径生成。
-
-**授权服务器发现响应**
-
-```json
-{
-  "issuer":"http://localhost:18600",
-  "authorization_endpoint":"http://localhost:18600/auth/mcp/authorize",
-  "token_endpoint":"http://localhost:18600/auth/mcp/token",
-  "response_types_supported":["code"],
-  "grant_types_supported":["authorization_code"],
-  "code_challenge_methods_supported":["S256"],
-  "token_endpoint_auth_methods_supported":["none"],
-  "scopes_supported":["mcp"],
-  "authorization_response_iss_parameter_supported":true
-}
-```
-
-**授权请求查询参数**
-
-| 参数 | 要求 |
-|---|---|
-| `client_id` | 必填，`smartreportgen-cli` |
-| `response_type` | 必填，`code` |
-| `redirect_uri` | 必填，`http://127.0.0.1:<port>/callback` 或 IPv6 本机回环 `[::1]`。端口及 `/callback/<实例 ID>` 的实例后缀可选 |
-| `state` | 必填，客户端生成的 1–512 字符状态值，用于验证回调 |
-| `code_challenge_method` | 必填，`S256` |
-| `code_challenge` | 必填，`code_verifier` 的 SHA-256 摘要，使用无填充的 Base64URL 编码（43 字符） |
-| `scope` | 可选，若填写则为 `mcp` |
-| `resource` | 可选，若填写须与 MCP 公开 URL 一致 |
-
-授权发起失败时，`error` 可为 `invalid_client`、`invalid_request`、`invalid_scope`、`invalid_target`。IAM 仍调用 `GET /auth/iam/callback`，带 `code`、以 `mcp.` 开头的 IAM `state` 和本次流程的回调 Cookie。成功时服务端返回 `302` 跳回客户端 `redirect_uri`，查询参数为一次性 `code`、原客户端 `state` 及 `iss`。授权码有效期为 2 分钟。IAM 授权失败或暂不可用时，重定向携带 `error`（`access_denied` 或 `temporarily_unavailable`）、`error_description`、`state` 和 `iss`。无法验证流程状态时直接返回 `400` OAuth JSON 错误。
-
-**换票请求表单字段**
-
-| 字段 | 要求 |
-|---|---|
-| `grant_type` | 必填，`authorization_code` |
-| `code` | 必填，客户端回调收到的 SmartReportGen 一次性授权码 |
-| `client_id` | 必填，`smartreportgen-cli` |
-| `redirect_uri` | 必填，与授权请求中的值一致 |
-| `code_verifier` | 必填，生成挑战值时使用的原串，43–128 个字母、数字或 `._~-` 字符 |
-| `resource` | 可选，若填写须与 MCP 公开 URL 一致 |
-
-换票成功返回原始 IAM `access_token`，`expires_in` 仅在已知剩余有效期时返回，单位为秒。换票错误的 `error` 可为 `invalid_request`、`invalid_client`、`unsupported_grant_type`、`invalid_target`、`invalid_grant`。OAuth 流程不签发 refresh token。
+在同一个终端启动 Codex 后调用 `whoami`，确认工号、`registered` 和 `access`。其他客户端可直接配置 Bearer 请求头。令牌到期后，从 IAM 取得新令牌并更新客户端使用的凭证。
 
 ## MCP HTTP 传输
 
-`/mcp` 使用 Streamable HTTP。每次请求均携带 `Authorization: Bearer <IAM access token>`，也兼容 `X-IAM-Access-Token` 或 `Access-Token`。服务当前使用无状态模式，不需要 `Mcp-Session-Id`。初始化后由客户端发送协商得到的 `MCP-Protocol-Version`。
+`/mcp` 使用 Streamable HTTP。每次请求均须携带 `Authorization: Bearer <海尔 IAM access token>`。服务当前使用无状态模式，不需要 `Mcp-Session-Id`。初始化后由客户端发送协商得到的 `MCP-Protocol-Version`。
 
 | 方法与路径 | 请求 | 响应 |
 |---|---|---|

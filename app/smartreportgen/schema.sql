@@ -162,21 +162,6 @@ CREATE TABLE IF NOT EXISTS permission.iam_session (
 );
 CREATE INDEX IF NOT EXISTS iam_session_expiry ON permission.iam_session(expires_at);
 
--- OAuth 状态和授权码保存摘要，IAM 票只在短期换票窗口内加密保存。
-CREATE TABLE IF NOT EXISTS permission.mcp_oauth_flow (
-    state_hash    text PRIMARY KEY,
-    browser_hash  text,
-    code_hash     text UNIQUE,
-    redirect_uri  text NOT NULL,
-    client_state  text NOT NULL,
-    challenge     text NOT NULL,
-    emp_no        text,
-    iam_token     text,
-    iam_expires_at timestamptz,
-    expires_at    timestamptz NOT NULL
-);
-CREATE INDEX IF NOT EXISTS mcp_oauth_flow_expiry ON permission.mcp_oauth_flow(expires_at);
-
 -- 兼容已有库，旧记录可以在管理台补充说明。
 ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_approach text NOT NULL DEFAULT '';
 ALTER TABLE dataset.dataset_table ADD COLUMN IF NOT EXISTS row_filters jsonb NOT NULL DEFAULT '[]'::jsonb;
@@ -277,3 +262,10 @@ BEGIN
     DELETE FROM report.report r USING legacy_report_versions m WHERE r.id=m.id AND m.id<>m.report_id;
     INSERT INTO sys.setting(key, value) VALUES ('report_version_migration_v1','done');
 END $$;
+
+-- 官方指标仅由数据集管理员配置，报告计划按名称引用。
+ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS semantic_metrics jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- 个人场景记录所有者，查询按数据源当前授权计算。未登记所有者的历史共享场景继续使用原有场景授权。
+ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS owner_emp_no text;
+CREATE INDEX IF NOT EXISTS dataset_owner_idx ON dataset.dataset(owner_emp_no) WHERE owner_emp_no IS NOT NULL;

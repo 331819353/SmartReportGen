@@ -4,9 +4,10 @@ from unittest.mock import patch
 
 from smartreportgen.connectors.api import APIConnector
 from smartreportgen.connectors.base import ConnectorError
-from smartreportgen.permission import PermissionDenied
+from smartreportgen.auth import Principal
+from smartreportgen.permission import PermissionDenied, access_for
 from smartreportgen.scenario_filters import query_in_scenario, table_filters
-from smartreportgen.services import describe_table
+from smartreportgen.services import describe_table, source_scene_values
 
 
 class ScenarioFiltersTest(unittest.TestCase):
@@ -76,6 +77,32 @@ class ScenarioFiltersTest(unittest.TestCase):
                      {"column": "Status", "values": [{"raw_sql": "1=1"}]}]:
             with self.subTest(rule=rule), self.assertRaises(ConnectorError):
                 table_filters([rule], "Sales", columns)
+
+    def test_personal_scene_filters_intersect_the_fixed_source_range(self):
+        self.dataset["tables"][0]["source_row_filters"] = [{"column": "region", "values": ["华东"]}]
+        result = self.run_sql("SELECT id FROM Sales")
+        self.assertEqual(result, [[1]])
+
+    def test_personal_scene_filter_picker_reads_only_authorized_rows(self):
+        policy = {"table_name": "Sales", "source_row_filters": [{"column": "region", "values": ["华东", "华南"]}]}
+        with patch("smartreportgen.services.get_connector", return_value=self.connector):
+            first = source_scene_values(self.source, policy, "region", "", 1, 0)
+            self.assertEqual(first, {"values": ["华东"], "has_more": True})
+            second = source_scene_values(self.source, policy, "region", "", 1, 1)
+            self.assertEqual(second, {"values": ["华南"], "has_more": False})
+            self.assertEqual(source_scene_values(self.source, policy, "region", "华北", 10, 0)["values"], [])
+
+    def test_personal_scene_access_respects_current_source_policy(self):
+        principal = Principal("owner", roles=["analyst"])
+        config = {"scenario_tables": [{"table_name": "Sales", "roles": ["analyst"]},
+                                      {"table_name": "Lookup", "employees": ["other"]}]}
+        rows = [{"dataset_id": 11, "owner_emp_no": None, "datasource_id": 8, "table_name": "Lookup", "config": None},
+                {"dataset_id": 12, "owner_emp_no": "owner", "datasource_id": 8, "table_name": "Sales", "config": config},
+                {"dataset_id": 12, "owner_emp_no": "owner", "datasource_id": 8, "table_name": "Lookup", "config": config}]
+        with patch("smartreportgen.permission.db.fetchall", return_value=rows):
+            self.assertEqual(access_for(principal).tables, {11: {"lookup"}, 12: {"sales"}})
+            principal.roles.clear()
+            self.assertEqual(access_for(principal).tables, {11: {"lookup"}})
 
     def test_value_options_use_source_values_and_keep_null(self):
         first = self.connector.distinct_values("Sales", "region", "", 2, 0)
