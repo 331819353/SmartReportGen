@@ -1,4 +1,5 @@
 """用两张内存表验证多表取数、完整 JSON 快照和版本数据复用。"""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -77,8 +78,14 @@ class ReportSnapshotsTest(unittest.TestCase):
         if not Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file():
             self.skipTest("需要部署镜像中的 Chromium")
         self.addCleanup(report_browser.close_pool)
-        orders = mcp_server.run_query(1, "SELECT * FROM Orders ORDER BY id", None, snapshot=True, sample_rows=2)
-        targets = mcp_server.run_query(1, "SELECT * FROM Targets", None, snapshot=True, sample_rows=0)
+        # 两个独立模块并发取数，快照发布后仍能在同一离线文档中完整读取各自的数据。
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            orders_job = pool.submit(mcp_server.run_query, 1, "SELECT * FROM Orders ORDER BY id", None,
+                                     snapshot=True, sample_rows=2)
+            targets_job = pool.submit(mcp_server.run_query, 1, "SELECT * FROM Targets", None,
+                                      snapshot=True, sample_rows=0)
+            orders, targets = orders_job.result(), targets_job.result()
+        self.assertNotEqual(orders["snapshot_id"], targets["snapshot_id"])
         self.assertEqual(orders["row_count"], 11)
         self.assertEqual(len(orders["sample_rows"]), 2)
         self.assertEqual(targets["sample_rows"], [])

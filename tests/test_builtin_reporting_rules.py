@@ -55,7 +55,7 @@ class BuiltinReportingRulesTest(unittest.TestCase):
         with patch.object(mcp_server, "SKILL_DIR", skill_dir), \
                 patch.object(mcp_server, "SKILL_FILE", skill_dir / "SKILL.md"):
             body = mcp_server.get_skill_guide()
-            for reference in ("fact-contract", "display-contract", "html-assembly"):
+            for reference in ("fact-contract", "display-contract", "html-assembly", "parallel-subagents"):
                 with self.subTest(reference=reference):
                     contents = (skill_dir / "references" / f"{reference}.md").read_text(encoding="utf-8")
                     self.assertEqual(mcp_server.get_skill_guide(reference=reference), body + "\n\n---\n\n" + contents)

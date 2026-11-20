@@ -85,7 +85,16 @@ def _verify(principal, *, draft=None, html=None, dataset_id=None, report_id=None
                     template_id, template_version = base.get("template_id"), base.get("template_version")
         with measure("report.scope"):
             scopes, dataset_id = _scopes(source, principal, dataset_id, base, inherit=draft is None and base is not None)
+        legacy = draft.legacy_full_html if draft and not draft.shell_html else ""
         with measure("html.embed_and_check"):
+            if draft:
+                # 先保留快照标签与页面元素冲突的章节归因。历史整页扩展只允许沿用已有的重名。
+                duplicates = report_draft.duplicate_dom_ids(source)
+                if duplicates and legacy:
+                    inherited = {item["id"]: item["count"] for item in report_draft.duplicate_dom_ids(legacy)}
+                    duplicates = [item for item in duplicates if item["count"] > inherited.get(item["id"], 1)]
+                if duplicates:
+                    raise report_browser.duplicate_id_error(duplicates, "html.embed_and_check")
             page = report_data.embed(source, principal.emp_no, base["html"] if base else "")
             if base and not base["meta"].get("single_file"):
                 page = report_document.inline_legacy_echarts(page)
@@ -94,7 +103,7 @@ def _verify(principal, *, draft=None, html=None, dataset_id=None, report_id=None
             page = report_document.enforce_offline_policy(page)
         with measure("chromium.verify"):
             expected = [section.section_id for section in draft.sections] if draft else None
-            evidence = report_browser.verify_html(page, expected_sections=expected)
+            evidence = report_browser.verify_html(page, expected_sections=expected, allow_shared_duplicate_ids=bool(legacy))
         with measure("preview.save"):
             evidence.update(source_sha256=_hash(source), html_sha256=_hash(page))
             proof = {"source": "assembled_html", "scopes": scopes, "verification": evidence,

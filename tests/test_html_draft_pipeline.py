@@ -270,6 +270,22 @@ def test_unauthorized_or_modified_preview_cannot_publish(facts):
         report_pipeline.load_preview(OWNER, ref, certified=True)
 
 
+@pytest.mark.usefixtures("chromium")
+def test_same_runtime_resource_failure_is_attributed_to_both_sections(facts):
+    # 两个章节各自从脚本生成同一外部地址，诊断需保留两个独立的修复入口。
+    def section(section_id):
+        return {"section_id": section_id, "html": "<p>测试资源依赖</p>",
+                "js": f"""const img = document.createElement('img');
+                img.src = 'https://assets.invalid/shared.png';
+                SRG.section('{section_id}').append(img);"""}
+
+    draft = mcp.create_html_draft("重复外部依赖", None, dataset_id=91, use_echarts=False,
+                                  sections=[section("first"), section("second")])
+    result = mcp.verify_html_draft(None, draft_id=draft["draft_id"])
+    assert result["error_type"] == "verify_failed", result
+    assert set(result["diagnostics"]["section_ids"]) == {"first", "second"}, result
+
+
 @pytest.fixture
 def postgres(monkeypatch):
     url = os.environ.get("SRG_TEST_DATABASE_URL")
@@ -365,10 +381,21 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     edit = mcp.create_html_draft("修订", None, report_id=rid, base_version=1)
     assert edit["snapshots"] == {"facts": "base"}
     assert [x["section_id"] for x in edit["sections"]] == ["overview", "trend", "details"]
-    mcp.upsert_html_section(edit["draft_id"], None, "overview", '<h1>修订概览</h1><output id="amount">—</output>')
-    preview = mcp.verify_html_draft(None, draft_id=edit["draft_id"])
-    assert preview["ok"], preview
-    revised = mcp.revise_report(rid, "修订", None, base_version=1, draft_id=edit["draft_id"], expected_version=1)
+    competing_edit = mcp.create_html_draft("修订", None, report_id=rid, base_version=1)
+    edits = [edit, competing_edit]
+    for draft in edits:
+        mcp.upsert_html_section(draft["draft_id"], None, "overview", '<h1>修订概览</h1><output id="amount">—</output>')
+    # 独立草稿可同时验收，入库时由报告版本锁阻止同一 expected_version 被提交两次。
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        previews = list(pool.map(lambda draft: mcp.verify_html_draft(None, draft_id=draft["draft_id"]), edits))
+        assert all(preview["ok"] for preview in previews), previews
+        revisions = list(pool.map(lambda draft: mcp.revise_report(
+            rid, "修订", None, base_version=1, draft_id=draft["draft_id"], expected_version=1,
+        ), edits))
+    assert sum(item["ok"] for item in revisions) == 1, revisions
+    winner = next(i for i, item in enumerate(revisions) if item["ok"])
+    edit, preview, revised = edits[winner], previews[winner], revisions[winner]
+    assert revisions[1 - winner]["error_type"] == "conflict", revisions
     assert revised["ok"] and revised["version"] == 2, revised
     assert "chromium.verify" not in revised["timing"]["stages"]
 

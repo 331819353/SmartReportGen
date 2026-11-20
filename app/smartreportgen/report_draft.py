@@ -6,9 +6,10 @@ import json
 import logging
 import re
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from hashlib import sha256
 from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
 from time import perf_counter, time
 from typing import Literal
@@ -21,6 +22,7 @@ from .telemetry import measure
 
 log = logging.getLogger(__name__)
 MARKER = "<!--SRG_SECTIONS-->"
+SHARED_SECTION = "__shared__"
 DEFAULT_SHELL = f'<div class="srg-page"><main id="srg-main">{MARKER}</main></div>'
 BASE_CSS = """*{box-sizing:border-box}
 body{margin:0;background:var(--color-bg,#f5f7fa);color:var(--color-text,#182636);font-family:system-ui,sans-serif}
@@ -57,13 +59,19 @@ SRG_BRIDGE_JS = """(() => {
     chart.setOption(option);
     return chart;
   }
+  function section(sectionId) {
+    // 章节脚本可以在自己的容器内用 data 属性定位节点，避免创建全页 id。
+    const root = document.getElementById('srg-sec-' + sectionId);
+    if (!root) throw new Error('找不到章节容器：' + sectionId);
+    return root;
+  }
   addEventListener('resize', () => {
     for (const chart of charts) {
       if (chart.isDisposed()) charts.delete(chart);
       else chart.resize();
     }
   });
-  window.SRG = {raw, rows, num, charts, initChart};
+  window.SRG = {raw, rows, num, charts, initChart, section};
   window.__srgErrors = [];
 })();"""
 
@@ -114,20 +122,38 @@ class HtmlDraft:
         data = asdict(self)
         return report_data._json({"smartreportgen_html_draft": {key: data[key] for key in SOURCE_FIELDS}})
 
-    def status_dict(self, *, include_code: bool = False, section_id: str | None = None) -> dict:
-        data = asdict(self)
-        for key in ("owner", "head_css", "shell_html", "shared_js", "legacy_full_html"):
-            data.pop(key)
-        if section_id is not None and not any(section.section_id == section_id for section in self.sections):
-            raise repo.NotFound("草稿中没有该章节")
+    def status_dict(self, *, include_code: bool = False, section_id: str | None = None,
+                    section_ids: list[str] | None = None) -> dict:
+        if section_id is not None and section_ids is not None:
+            raise repo.Invalid("请使用 section_id 或 section_ids 之一指定章节")
+        if section_ids is not None and not isinstance(section_ids, (list, tuple)):
+            raise repo.Invalid("section_ids 须为章节标识列表")
+        if section_id is not None:
+            requested: list[str] | None = [section_id]
+        elif section_ids is not None:
+            requested = section_ids
+        else:
+            requested = None
+        if requested is not None:
+            existing = {section.section_id for section in self.sections}
+            for sid in requested:
+                if not isinstance(sid, str):
+                    raise repo.Invalid("章节标识必须为字符串")
+                if sid != SHARED_SECTION and sid not in existing:
+                    raise repo.NotFound(f"草稿中没有该章节：{sid}")
+        shared_fields = ("head_css", "shell_html", "shared_js", "legacy_full_html")
+        # 局部读稿只构造需要的章节结果，避免为每次并发读取复制其他章节的源码结构。
+        data = {item.name: getattr(self, item.name) for item in fields(self)
+                if item.name not in ("owner", "sections", *shared_fields)}
+        target_ids = set(requested) if requested is not None else None
         data["sections"] = [
             {"section_id": section.section_id, "title": section.title, "updated_at": section.updated_at,
              **{f"{key}_chars": len(getattr(section, key)) for key in ("html", "css", "js")},
              **({key: getattr(section, key) for key in ("html", "css", "js")} if include_code else {})}
-            for section in self.sections if section_id is None or section.section_id == section_id
+            for section in self.sections if target_ids is None or section.section_id in target_ids
         ]
-        if include_code and section_id is None:
-            data.update({key: getattr(self, key) for key in ("head_css", "shell_html", "shared_js", "legacy_full_html")})
+        if include_code and (target_ids is None or SHARED_SECTION in target_ids):
+            data.update({key: getattr(self, key) for key in shared_fields})
         return data
 
 
@@ -162,6 +188,7 @@ def lock_draft(owner: str, draft_id: str):
             fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
+
 def record(draft: HtmlDraft, action: str, started: float, section_id: str | None = None) -> None:
     draft.events = [*draft.events[-29:], {"ts": time(), "action": action, "section_id": section_id,
                      "revision": draft.revision, "elapsed_ms": round((perf_counter() - started) * 1000, 3),
@@ -169,8 +196,11 @@ def record(draft: HtmlDraft, action: str, started: float, section_id: str | None
     report_data._write_ref(draft.owner, UUID(draft.draft_id), "draft.json", report_data._json(asdict(draft)))
 
 
-def get_draft_status(draft_id: str, owner: str, *, include_code: bool = False, section_id: str | None = None) -> dict:
-    return load_draft(owner, draft_id).status_dict(include_code=include_code, section_id=section_id)
+def get_draft_status(draft_id: str, owner: str, *, include_code: bool = False, section_id: str | None = None,
+                     section_ids: list[str] | None = None) -> dict:
+    return load_draft(owner, draft_id).status_dict(
+        include_code=include_code, section_id=section_id, section_ids=section_ids,
+    )
 
 
 def list_drafts(owner: str, is_admin: bool = False) -> list[dict]:
@@ -226,7 +256,8 @@ def edit_base(principal, report_id: int, base_version: int | None, *, with_html:
 def create_draft(title: str, principal, *, dataset_id: int | None = None, snapshots: dict[str, str] | None = None,
                  head_css: str = "", shell_html: str = "", shared_js: str = "", style_id: str | None = None,
                  use_echarts: bool = True, template_id: int | None = None, template_version: int | None = None,
-                 report_id: int | None = None, base_version: int | None = None) -> dict:
+                 report_id: int | None = None, base_version: int | None = None,
+                 sections: list[dict] | None = None) -> dict:
     started = perf_counter()
     if base_version is not None and report_id is None:
         raise repo.Invalid("指定基准版本时须提供报告 ID")
@@ -270,11 +301,18 @@ def create_draft(title: str, principal, *, dataset_id: int | None = None, snapsh
     _check_shell(draft.shell_html)
     # 历史 HTML 的数据块 ID 可能早于当前命名约定。保留原 ID，仅对新绑定应用命名检查。
     _bind_snapshots(draft, snapshots or {})
+    if sections is not None and not isinstance(sections, (list, tuple)):
+        raise repo.Invalid("sections 须为章节对象列表")
+    # 复用更新规则。修订时按列表顺序应用到已恢复章节，所有槽位准备好后才发布草稿。
+    for patch in sections or ():
+        _patch_section(draft, patch)
     record(draft, "create", started)
     return draft.status_dict()
 
 
 def _patch_section(draft: HtmlDraft, patch: dict) -> None:
+    if not isinstance(patch, dict):
+        raise repo.Invalid("章节列表元素必须为对象")
     section_id = patch.get("section_id")
     if not isinstance(section_id, str) or not IDENTIFIER.fullmatch(section_id):
         raise repo.Invalid("章节标识必须以字母或下划线开头，只能包含字母、数字、下划线和连字符")
@@ -283,6 +321,9 @@ def _patch_section(draft: HtmlDraft, patch: dict) -> None:
     if "delete" in patch and type(patch["delete"]) is not bool:
         raise repo.Invalid("delete 须为布尔值")
     existing_index = next((i for i, section in enumerate(draft.sections) if section.section_id == section_id), None)
+    # 保留历史同名章节的编辑能力，避免新增章节与共享源码的诊断标识混淆。
+    if section_id == SHARED_SECTION and existing_index is None:
+        raise repo.Invalid(f"章节标识 {SHARED_SECTION} 保留给页面骨架与共享脚本")
     if patch.get("delete"):
         if existing_index is None:
             raise repo.NotFound(f"草稿中没有章节：{section_id}")
@@ -367,7 +408,7 @@ def assemble_source_html(draft: HtmlDraft) -> str:
         for block_id, ref in draft.snapshots.items() if block_id not in legacy_ids
     )
     vendor = '<script data-srg-vendor="echarts"></script>' if draft.use_echarts and not has_vendor else ""
-    shared = _script(draft.shared_js, "__shared__") if draft.shared_js else ""
+    shared = _script(draft.shared_js, SHARED_SECTION) if draft.shared_js else ""
     scripts = "\n".join(_script(sec.js, sec.section_id) for sec in draft.sections if sec.js)
     runtime = f"{bindings}\n{vendor}\n<script>{SRG_BRIDGE_JS}</script>\n{shared}\n{scripts}"
     style = f'<style id="srg-theme" data-srg-style="{escape(draft.style_id, quote=True)}"></style>' if draft.style_id else ""
@@ -383,3 +424,54 @@ def assemble_source_html(draft: HtmlDraft) -> str:
         f'<meta name="viewport" content="width=device-width, initial-scale=1">'
         f'<title>{escape(draft.title)}</title>{styles}</head><body>{shell}\n{runtime}</body></html>'
     )
+
+
+class _DuplicateIdInspector(HTMLParser):
+    """统计主文档中重复的元素 id，并归因到所在章节或共享骨架。"""
+
+    CDATA_CONTENT_ELEMENTS = (*HTMLParser.CDATA_CONTENT_ELEMENTS, "title", "textarea", "xmp", "iframe",
+                              "noembed", "noframes", "noscript")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.template_depth = 0
+        self.sections: list[str | None] = []
+        self.counts: dict[str, int] = {}
+        self.owners: dict[str, list[str]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if not self.template_depth:
+            if tag == "section":
+                self.sections.append(next((value for key, value in attrs if key == "data-srg-section"), None))
+            # 浏览器保留首个同名属性。template 节点自身在主文档中，内部节点则不参与。
+            element_id = next((value for key, value in attrs if key == "id"), None)
+            if element_id:
+                owner = next((item for item in reversed(self.sections) if item), None) or SHARED_SECTION
+                self.counts[element_id] = self.counts.get(element_id, 0) + 1
+                section_list = self.owners.setdefault(element_id, [])
+                if owner not in section_list:
+                    section_list.append(owner)
+        if tag == "template":
+            self.template_depth += 1
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # HTML 的非空元素不会因尾部斜杠关闭。章节和 template 的作用域仍等待结束标签。
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "template" and self.template_depth:
+            self.template_depth -= 1
+        elif tag == "section" and not self.template_depth and self.sections:
+            self.sections.pop()
+
+
+def duplicate_dom_ids(html: str) -> list[dict]:
+    """返回主文档内重复出现的元素 id 及涉及的章节列表。"""
+    inspector = _DuplicateIdInspector()
+    inspector.feed(html)
+    inspector.close()
+    return [
+        {"id": element_id, "count": count, "section_ids": inspector.owners[element_id]}
+        for element_id, count in inspector.counts.items()
+        if count > 1
+    ]

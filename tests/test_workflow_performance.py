@@ -221,8 +221,9 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
         for tool_name, expected_keys in (
             ("save_report", {"name", "draft_id", "html", "preview_id", "dataset_id", "template_id", "template_version"}),
             ("save_report_template", {"name", "dataset_id", "markdown", "template_id", "expected_version"}),
-            ("create_html_draft", {"title", "snapshots", "style_id", "report_id", "base_version"}),
+            ("create_html_draft", {"title", "snapshots", "style_id", "report_id", "base_version", "sections"}),
             ("upsert_html_section", {"draft_id", "section_id", "sections", "shared_js"}),
+            ("get_html_draft", {"draft_id", "include_code", "section_id", "section_ids"}),
             ("revise_report", {"report_id", "name", "base_version", "html", "preview_id"}),
             ("get_style_rules", {"business_scenario", "query", "include_css"}),
             ("prepare_report_context", {"dataset_id", "query", "sample_rows", "profile_rows"}),

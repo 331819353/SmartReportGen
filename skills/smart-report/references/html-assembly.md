@@ -6,7 +6,7 @@
 
 `SRG.raw("summary")` 返回 `{columns, rows}`，`SRG.rows("summary")` 返回按列名访问的行对象。Decimal 与超出 JavaScript 安全整数范围的数据以 `{"$decimal":"原始文本"}` 保留精度。显示精确值时保留原始文本。绘图用 `SRG.num(v)` 解包为 Number，空值返回 NaN。画图时用 `null` 表示缺值。
 
-可将 `prepare_report_context` 返回的 `style.builtin_style.style_id` 用于草稿，主题会内联。ECharts 默认内联。需要格式化辅助时，可在骨架加入 `<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>`，以 `SrgDisplay` 使用。
+可将 `prepare_report_context` 返回的 `style.builtin_style.style_id` 用于草稿，主题会内联。ECharts 默认内联。需要格式化辅助时，可在骨架加入 `<script id="srg-formatters" data-srg-asset="report-formatters.js"></script>`，以 `SrgDisplay` 使用。`create_html_draft` 可通过 `sections` 预置有序章节槽位（如 `[{"section_id":"overview","title":"经营概览"}]`），供分轮或子智能体按 `section_id` 并发填充。脚本中可用 `SRG.section(sectionId)` 获取 `#srg-sec-<sectionId>` 容器节点，避免与其他章节元素 `id` 冲突。
 
 ## 第一轮初始化页面与筛选
 
@@ -96,6 +96,6 @@ SRG.filters.subscribe(region => {
 
 ## 局部修订与验收
 
-章节 DOM 先组装，随后执行共享脚本和各章节脚本。章节脚本各自有作用域，可复用局部变量名。局部 CSS 可用 `#srg-sec-<section_id>` 限定范围。批量参数 `sections` 支持只更新指定字段、用显式空字符串清除字段、用从零开始的 `index` 移动章节。删除传 `delete=true`。全局更新可与章节同轮提交。
+章节 DOM 先组装，随后执行共享脚本和各章节脚本。章节脚本各自有作用域，可复用局部变量名。局部 CSS 用 `#srg-sec-<section_id>` 限定范围。各章节及页面骨架的元素 `id` 须全页唯一。源 HTML 或浏览器冒烟操作产生的重复 `id` 会返回 `diagnostics.duplicate_ids` 与 `diagnostics.section_ids`。历史整页扩展可保留基准原有的重复 ID。批量参数 `sections` 支持只更新指定字段、用显式空字符串清除字段、用从零开始的 `index` 移动章节。删除传 `delete=true`。全局更新可与章节同轮提交。多章节并行拼装流程见[子智能体并行编排](parallel-subagents.md)。
 
-用 `get_html_draft(draft_id, include_code=true, section_id="trend_chart")` 读取待修复片段。共享脚本错误的章节标识为 `__shared__`。修改后的草稿需重新验收。管理 API 的 `GET /api/report-drafts` 提供草稿状态及最近操作。
+用 `get_html_draft(draft_id, include_code=true, section_id="trend_chart")` 读取待修复片段，也支持 `section_ids=["overview", "trend_chart"]` 批量读取。保留标识 `__shared__` 对应全局骨架、样式和共享脚本。修改后的草稿需重新验收。管理 API 的 `GET /api/report-drafts` 提供草稿状态及最近操作。

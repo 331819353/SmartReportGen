@@ -120,12 +120,16 @@ _RUNTIME_PROBE = """<script>(() => {
     const url = event.blockedURI;
     if (!url || ['inline', 'eval', 'wasm-eval'].includes(url)) return;
     const node = event.target instanceof Element ? event.target : null;
-    const resource = [...document.querySelectorAll('[src],[href],[poster]')].find(element =>
+    // 浏览器可能合并相同 URL 的资源加载，单次事件也要检查页面中所有对应节点。
+    const resources = [...document.querySelectorAll('[src],[href],[poster]')].filter(element =>
       [element.src, element.href, element.poster].includes(url));
-    const section = (node || resource)?.closest('[data-srg-section]') ||
-      resource?.closest('[data-srg-section]');
-    results.requests.push({url, section_id: section?.dataset.srgSection ?? null,
-      location: event.sourceFile || event.violatedDirective});
+    if (node) resources.push(node);
+    const sections = new Set(resources.map(element => element.closest('[data-srg-section]')?.dataset.srgSection)
+      .filter(Boolean));
+    if (!sections.size) sections.add(null);
+    for (const section_id of sections) {
+      results.requests.push({url, section_id, location: event.sourceFile || event.violatedDirective});
+    }
   });
   addEventListener('error', event => {
     if (event.message) results.errors.push({message: event.message, line: event.lineno, location: event.filename});
@@ -184,12 +188,21 @@ def _failure(message: str, **diagnostics) -> ReportVerifyError:
     return ReportVerifyError(message, "chromium.verify", diagnostics)
 
 
+def duplicate_id_error(duplicates: list[dict], stage: str) -> ReportVerifyError:
+    # 保留所有涉及的章节供分派修复，限制单次返回的详细冲突数量。
+    ids = list(dict.fromkeys(section_id for item in duplicates for section_id in item["section_ids"]))
+    names = "、".join(item["id"] for item in duplicates[:5])
+    return ReportVerifyError(f"页面存在重复的元素 id：{names}。各章节请使用独立的 id 前缀", stage,
+                             {"duplicate_ids": duplicates[:20], "section_ids": ids, "section_id": ids[0]})
+
+
 def _section(text: str) -> str | None:
     match = _SECTION_SOURCE.search(text)
     return match[1] if match else None
 
 
-def _verify_on_thread(page_html: str, expected_sections: list[str] | None, executable_path: str) -> dict:
+def _verify_on_thread(page_html: str, expected_sections: list[str] | None, executable_path: str,
+                      allow_shared_duplicate_ids: bool) -> dict:
     from playwright.sync_api import Error as BrowserError
     from playwright.sync_api import TimeoutError as BrowserTimeout
 
@@ -227,10 +240,25 @@ def _verify_on_thread(page_html: str, expected_sections: list[str] | None, execu
         errors.append({"kind": "pageerror", "message": str(error), "section_id": _section(stack), "stack": stack})
 
     def check_runtime(static=(), control=None):
-        data = page.evaluate("""() => ({
-          probe: window.__srgProbe || {errors: [], requests: []},
-          wrapped: Array.isArray(window.__srgErrors) ? window.__srgErrors : []
-        })""")
+        data = page.evaluate("""checkIds => {
+          const ids = new Map();
+          // 脚本和筛选操作会改变 DOM。以当前主文档为准，template 内容自然不参与。
+          if (checkIds) {
+            for (const node of document.querySelectorAll('[id]')) {
+              if (!node.id) continue;
+              if (!ids.has(node.id)) ids.set(node.id, {id: node.id, count: 0, sectionIds: new Set()});
+              const entry = ids.get(node.id);
+              entry.count++;
+              entry.sectionIds.add(node.closest('[data-srg-section]')?.dataset.srgSection || '__shared__');
+            }
+          }
+          return {
+            probe: window.__srgProbe || {errors: [], requests: []},
+            wrapped: Array.isArray(window.__srgErrors) ? window.__srgErrors : [],
+            duplicates: [...ids.values()].filter(entry => entry.count > 1)
+              .map(({id, count, sectionIds}) => ({id, count, section_ids: [...sectionIds]}))
+          };
+        }""", expected_sections is not None)
         detail = [{"kind": "section", "section_id": item.get("section"), "message": item.get("message"),
                    "stack": item.get("stack")} for item in data["wrapped"] if isinstance(item, dict)]
         for item in data["probe"]["errors"]:
@@ -240,13 +268,17 @@ def _verify_on_thread(page_html: str, expected_sections: list[str] | None, execu
                 section_id = next((ident for start, end, ident in section_lines if start <= line <= end), None)
             detail.append({**item, "kind": "script", "section_id": section_id})
         grouped_requests = list(static)
-        known = {item["url"] for item in grouped_requests}
+        known = {(item["url"], item["section_id"]) for item in grouped_requests}
         for item in data["probe"]["requests"]:
-            if item["url"] not in known:
-                grouped_requests.append({**item, "section_id": item["section_id"] or _section(item["location"])})
-                known.add(item["url"])
+            section_id = item["section_id"] or _section(item["location"])
+            # 多个章节可能请求同一 URL，按 URL 和章节去重才能完整保留归因。
+            key = (item["url"], section_id)
+            if key not in known:
+                grouped_requests.append({**item, "section_id": section_id})
+                known.add(key)
+        known_urls = {url for url, _ in known}
         for url in dict.fromkeys(requests):
-            if url not in known:
+            if url not in known_urls:
                 grouped_requests.append({"url": url, "section_id": None})
         if grouped_requests or errors or detail:
             # 模块包装器的诊断比 Playwright 的全局 console 事件更精确，优先返回。
@@ -260,6 +292,15 @@ def _verify_on_thread(page_html: str, expected_sections: list[str] | None, execu
             diagnostics["section_ids"] = ids
             diagnostics["section_id"] = ids[0] if ids else None
             raise _failure("报告尝试加载外部资源" if grouped_requests else "报告脚本运行或资源加载出错", **diagnostics)
+        duplicates = data["duplicates"]
+        if allow_shared_duplicate_ids:
+            # 历史整页保留共享骨架已有的重名，新增章节与旧页面相撞仍需修复。
+            duplicates = [item for item in duplicates if item["section_ids"] != ["__shared__"]]
+        if duplicates:
+            error = duplicate_id_error(duplicates, "chromium.verify")
+            if control:
+                error.diagnostics["control"] = control
+            raise error
 
     try:
         context.route("**/*", block)
@@ -306,6 +347,7 @@ def _verify_on_thread(page_html: str, expected_sections: list[str] | None, execu
                 except BrowserError as exc:
                     check_runtime(control=info)
                     raise _failure("交互控件未能完成操作", control=info, section_id=info["section_id"],
+                                   section_ids=[info["section_id"]] if info["section_id"] else [],
                                    message_detail=str(exc)) from exc
                 tested += 1
                 check_runtime(control=info)
@@ -332,7 +374,8 @@ def _verify_on_thread(page_html: str, expected_sections: list[str] | None, execu
         context.close()
 
 
-def verify_html(page_html: str, expected_sections: list[str] | None = None) -> dict:
+def verify_html(page_html: str, expected_sections: list[str] | None = None, *,
+                allow_shared_duplicate_ids: bool = False) -> dict:
     global _executor
     with measure("chromium.acquire_slot"):
         if not _slots.acquire(timeout=30):
@@ -343,7 +386,8 @@ def verify_html(page_html: str, expected_sections: list[str] | None = None) -> d
             if _executor is None:
                 _executor = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="srg-chromium")
             context = copy_context()
-            future = _executor.submit(context.run, _verify_on_thread, page_html, expected_sections, executable_path)
+            future = _executor.submit(context.run, _verify_on_thread, page_html, expected_sections, executable_path,
+                                      allow_shared_duplicate_ids)
         return future.result()
     finally:
         _slots.release()

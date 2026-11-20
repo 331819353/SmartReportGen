@@ -145,6 +145,7 @@ docker compose logs -f api # 首次启动可看到建表、迁移与向量化日
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `QUERY_MAX_ROWS` | 50000 | 报告单个查询的最大行数。快照模式超出时返回截断标记，调整查询后再创建快照 |
+| `SRG_BROWSER_WORKERS` | 4 | 每个 API 或 MCP 进程的 Chromium 校验并发数，限制在 1–8 |
 | `QUERY_TIMEOUT_SECONDS` | 60 | 数据源查询超时 |
 | `SCHEMA_CACHE_SECONDS` | 300 | 数据库字段元数据缓存秒数，0 禁用；不缓存业务查询或权限 |
 | `SEED_DEMO` | true | 首次启动是否写入演示数据源、数据集、员工与授权 |

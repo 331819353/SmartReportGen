@@ -51,10 +51,10 @@ def _skill_body() -> str:
     return text
 
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP。用 get_skill_guide 获取从报告分流到验收保存的主流程。
-先区分新建与修订。修订用报告链接或 list_reports 定位，多个匹配候选先请用户确认，再按 get_report 返回的 revision 锁定基准。
+先区分新建与修订。修订用报告链接或 list_reports 定位，多个匹配候选先请用户确认。get_report 返回的 revision 用于 base_version，latest_version 用于 expected_version。
 新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景时，可用 list_scene_datasources 查看开放数据源与固定范围并配合 save_business_scenario 协助建场景，或给出 scenario_management_url 引导用户配置。
 已知场景后调用 prepare_report_context 获取分析思路、表画像、Markdown 指南摘要和生效样式。
-读取匹配的指南，用 run_query(snapshot=True) 取得授权快照，创建 HTML 草稿并分轮填写章节。
+读取匹配的指南，用 run_query(snapshot=True) 取得授权快照，创建 HTML 草稿并分轮填写章节。复杂报告可在 create_html_draft 绑定数据块、配置筛选和预置有序章节槽位后并行拼装，按 diagnostics.section_ids 分派修复（详见 get_skill_guide(reference="parallel-subagents")）。
 默认用 save_report 或 revise_report 提交 draft_id，服务端按需运行离线 Chromium。先审阅时可调用 verify_html_draft。
 采用海尔 IAM，场景及事实来源受当前员工授权约束。"""
 
@@ -386,8 +386,8 @@ def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
             "next_offset": tables_page["next_offset"],
             "style": style,
             "templates": [_template_brief(row) for row in templates[:50]],
-            "html_assembly_hint": "用 create_html_draft 绑定数据块与 snapshot_id，分轮编写章节。"
-                                  "浏览器端通过 window.SRG.rows(blockId) 访问授权快照。",
+            "html_assembly_hint": "用 create_html_draft 绑定数据块与 snapshot_id（可传 sections 预置有序章节槽位），"
+                                  "再分轮或并行编写章节。浏览器端通过 window.SRG.rows(blockId) 访问授权快照。",
         })
     except _EXPECTED as e:
         return _err(e)
@@ -465,16 +465,16 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
 
 @_tool()
 def get_skill_guide(include_example: bool = False,
-                    reference: Literal["fact-contract", "display-contract", "html-assembly"] | None = None,
+                    reference: Literal["fact-contract", "display-contract", "html-assembly", "parallel-subagents"] | None = None,
                     asset: Literal["report-formatters.js"] | None = None) -> str:
-    """返回 smart-report 技能原文，可附加取数、展示或 HTML 拼装说明。"""
+    """返回 smart-report 技能原文，可附加取数、展示、HTML 拼装或子智能体并行编排说明。"""
     if asset is not None:
         if asset != "report-formatters.js" or reference is not None or include_example:
             raise ValueError("资产仅支持 report-formatters.js，须单独读取")
         return (SKILL_DIR / "assets" / asset).read_text(encoding="utf-8")
     text = _skill_body()
     if reference is not None:
-        if reference not in {"fact-contract", "display-contract", "html-assembly"}:
+        if reference not in {"fact-contract", "display-contract", "html-assembly", "parallel-subagents"}:
             raise ValueError("不支持的技能参考文档")
         text += "\n\n---\n\n" + (SKILL_DIR / "references" / f"{reference}.md").read_text(encoding="utf-8")
     if include_example:
@@ -635,13 +635,15 @@ def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int
 def create_html_draft(title: str, ctx: Context, dataset_id: int | None = None, snapshots: dict[str, str] | None = None,
                       head_css: str = "", shell_html: str = "", shared_js: str = "", style_id: str | None = None,
                       use_echarts: bool = True, template_id: int | None = None, template_version: int | None = None,
-                      report_id: int | None = None, base_version: int | None = None) -> dict:
-    """创建多轮拼装的 HTML 草稿。提供报告和基准版本时，可复用已保存的源码与快照。"""
+                      report_id: int | None = None, base_version: int | None = None,
+                      sections: list[dict[str, Any]] | None = None) -> dict:
+    """创建多轮或并行拼装的 HTML 草稿。可传 sections 预置有序章节槽位，提供报告和基准版本时复用已保存的源码与快照。"""
     with measure("draft.create"):
         result = report_draft.create_draft(
             title, _access(ctx).principal, dataset_id=dataset_id, snapshots=snapshots, head_css=head_css,
             shell_html=shell_html, shared_js=shared_js, style_id=style_id, use_echarts=use_echarts,
             template_id=template_id, template_version=template_version, report_id=report_id, base_version=base_version,
+            sections=sections,
         )
     return _ok({"ok": True, **result})
 
@@ -671,11 +673,13 @@ def upsert_html_section(draft_id: str, ctx: Context, section_id: str | None = No
 
 
 @_tool()
-def get_html_draft(draft_id: str, ctx: Context, include_code: bool = False, section_id: str | None = None) -> dict:
-    """查询草稿进度、最近校验和失败诊断。必要时读取指定章节或全页的草稿源码。"""
+def get_html_draft(draft_id: str, ctx: Context, include_code: bool = False, section_id: str | None = None,
+                   section_ids: list[str] | None = None) -> dict:
+    """查询草稿进度、最近校验和失败诊断。必要时读取指定章节（支持 section_ids 批量或 '__shared__' 全局源码）或全页草稿源码。"""
     with measure("draft.read"):
         result = report_draft.get_draft_status(draft_id, _access(ctx).principal.emp_no,
-                                               include_code=include_code, section_id=section_id)
+                                               include_code=include_code, section_id=section_id,
+                                               section_ids=section_ids)
     return _ok({"ok": True, **result})
 
 

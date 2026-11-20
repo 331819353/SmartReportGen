@@ -10,7 +10,7 @@
 
 以 [smart-report 主流程](skills/smart-report/SKILL.md) 为准。收到需求后先区分新建与修订。修订从报告库定位基准，多个匹配候选先请用户确认。新建优先复用已有授权场景。只有找不到适用场景时，才通过 `search_business_scenarios` 返回的管理台入口引导普通用户选择管理员已配置并授权的数据源，自行配置分析思路和所需表，然后继续新建报告。
 
-已知场景后用 `prepare_report_context` 读取分析思路、表画像、生效样式与 Markdown 模板指南摘要。用 `get_report_template` 读指南，用 `run_query(snapshot=true)` 取得正式事实快照。调用 `create_html_draft` 初始化，分轮用 `upsert_html_section` 拼装原生 HTML/CSS/JS。默认把 `draft_id` 交给 `save_report` 或 `revise_report`，服务端通过离线 Chromium 校验后保存。需先审阅时用 `verify_html_draft`，确认后提交 `preview_id`。修订用实际读取的 `revision` 作为 `base_version`，纯展示复用基准快照，换账期时重新取数并更换绑定。
+已知场景后用 `prepare_report_context` 读取分析思路、表画像、生效样式与 Markdown 模板指南摘要。用 `get_report_template` 读指南，用 `run_query(snapshot=true)` 取得正式事实快照。调用 `create_html_draft` 初始化数据块和筛选逻辑，可传 `sections` 预置有序章节槽位。分轮或派发子智能体并行调用 `upsert_html_section` 拼装原生 HTML/CSS/JS，按 `diagnostics.section_ids` 修复可独立处理的章节问题。默认把 `draft_id` 交给 `save_report` 或 `revise_report`，服务端通过离线 Chromium 校验后保存。需先审阅时用 `verify_html_draft`，确认后提交 `preview_id`。修订用实际读取的 `revision` 作为 `base_version`，用同时返回的 `latest_version` 作为 `expected_version` 检查并发修改。纯展示复用基准快照，换账期时重新取数并更换绑定。
 
 各 agent 的 MCP 接入方式见[部署文档第 10 节：接入 Agent](docs/DEPLOYMENT.md#10-接入-agent)。管理台 HTTP 接入见[HTTP 接入说明](docs/HTTP_API.md)。
 
