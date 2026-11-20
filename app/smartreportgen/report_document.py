@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 from functools import cache
+from hashlib import sha256
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -23,7 +24,7 @@ LEGACY_ECHARTS = re.compile(r'<script src="(?:[^"<>]*/)?static/vendor/echarts\.m
 def skill_dir() -> Path:
     """定位唯一技能目录：镜像内优先 docs/skill，本地开发/测试回退仓库 skills/smart-report。"""
     packaged = Path(__file__).with_name("docs") / "skill"
-    return packaged if packaged.is_dir() else Path(__file__).resolve().parents[2] / "skills" / "smart-report"
+    return packaged if (packaged / "SKILL.md").is_file() else Path(__file__).resolve().parents[2] / "skills" / "smart-report"
 
 
 @cache
@@ -147,7 +148,7 @@ html, body, [data-srg-merge-shell], [data-srg-merge-main] {
 _MERGE_SCRIPT = """
 const documents = JSON.parse(document.getElementById('documents').textContent);
 const sharedEchartsEl = document.getElementById('shared-echarts');
-const sharedEcharts = sharedEchartsEl ? JSON.parse(sharedEchartsEl.textContent) : '';
+const sharedEcharts = sharedEchartsEl ? JSON.parse(sharedEchartsEl.textContent) : {};
 const contentStyle = document.getElementById('content-style').textContent;
 const frames = new Map();
 const reportFooter = '.rf-footer, .report-footer, .page-footer';
@@ -163,10 +164,11 @@ const hidden = 'data-srg-merge-hidden';
 function prepareReport(source) {
   // 先在不执行脚本的文档中处理布局，图表初始化时即得到正文宽度。
   const doc = new DOMParser().parseFromString(source, 'text/html');
-  if (sharedEcharts) {
-    for (const el of doc.querySelectorAll('script[data-srg-vendor="echarts"]')) {
+  for (const el of doc.querySelectorAll('script[data-srg-vendor^="merge:"]')) {
+    const key = el.getAttribute('data-srg-vendor').slice(6);
+    if (Object.hasOwn(sharedEcharts, key)) {
       el.setAttribute('data-srg-vendor', 'embedded');
-      el.textContent = sharedEcharts;
+      el.textContent = sharedEcharts[key];
     }
   }
   const body = doc.body;
@@ -285,26 +287,33 @@ for (const report of documents) {
 
 def merge_report_documents(name: str, reports: list[dict]) -> str:
     """按选定顺序纵向拼接各份报告的标题和正文，各报告在沙箱中独立运行。"""
+    from .report_data import VENDOR_MARKER, _DataBlocks
+
     echarts_code = echarts_js()
-    embedded_tag = f'<script data-srg-vendor="embedded">{echarts_code}</script>'
     legacy_tag = f'<script>{echarts_code}</script>'
-    placeholder = '<script data-srg-vendor="echarts"></script>'
-    shared_used = False
+    shared_echarts: dict[str, str] = {}
     items = []
+
+    def fold_echarts(block):
+        if block.kind == "vendor" and block.fields[VENDOR_MARKER] == "embedded" and block.data:
+            # 各报告的 ECharts 版本可能不同。只合并字节一致的脚本，并在各自沙箱内恢复。
+            digest = sha256(block.data.encode()).hexdigest()
+            shared_echarts[digest] = block.data
+            return f"merge:{digest}", ""
+        return None
+
     for r in reports:
         body = r["html"]
-        if embedded_tag in body:
-            body = body.replace(embedded_tag, placeholder)
-            shared_used = True
         if legacy_tag in body:
-            body = body.replace(legacy_tag, placeholder)
-            shared_used = True
+            body = body.replace(legacy_tag, f'<script {VENDOR_MARKER}="embedded">{echarts_code}</script>')
+        if VENDOR_MARKER in body.lower():
+            body = _DataBlocks(body).replace(fold_echarts)
         items.append({"name": r["name"], "html": body})
     # 转义小于号，防止正文里的 </script> 提前终止 JSON 并在外层页面执行。
     documents = json.dumps(items, ensure_ascii=False).replace("<", "\\u003c")
     shared_block = (
-        f'<script id="shared-echarts" type="application/json">{json.dumps(echarts_code).replace("<", "\\u003c")}</script>'
-        if shared_used else ""
+        f'<script id="shared-echarts" type="application/json">{json.dumps(shared_echarts).replace("<", "\\u003c")}</script>'
+        if shared_echarts else ""
     )
     return f"""<!doctype html>
 <html lang="zh-CN">

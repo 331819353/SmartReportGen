@@ -19,6 +19,15 @@ STOPWORDS = set(
 )
 _TOKEN_OK = re.compile(r"^[\w一-鿿]+$")
 _CJK = re.compile(r"[一-鿿]")
+# 只扩展可互换的业务检索词，避免把同比、环比或销售额等不同口径混为同义词。
+_SCENARIO_TERMS = (
+    ("营收", "营业收入"), ("市占率", "市场占有率", "市场份额"),
+    ("同比", "去年同期"), ("环比", "上期对比"),
+    ("客户留存", "用户留存"), ("服务水平协议", "sla"),
+    ("准时交付率", "按时交付率"), ("库存周转", "存货周转"),
+)
+_SCENARIO_PATTERNS = [(re.compile(r"(?<![a-z0-9])(?:" + "|".join(terms) + r")(?![a-z0-9])"), terms)
+                      for terms in _SCENARIO_TERMS]
 
 
 def add_words(words) -> None:
@@ -54,3 +63,14 @@ def tokenize(text: str) -> list[str]:
 def char_ngrams(text: str, n: int = 2) -> list[str]:
     cjk = "".join(_CJK.findall(text or ""))
     return [cjk[i : i + n] for i in range(max(0, len(cjk) - n + 1))]
+
+
+def scenario_tokens(text: str) -> list[str]:
+    """离线场景检索补充常用同义词及其分词，直接匹配已建索引的历史文本。"""
+    normalized = text.lower()
+    tokens = tokenize(text)
+    for pattern, terms in _SCENARIO_PATTERNS:
+        if pattern.search(normalized):
+            for term in terms:
+                tokens.extend((term, *tokenize(term)))
+    return list(dict.fromkeys(tokens))

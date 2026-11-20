@@ -9,12 +9,13 @@ from uuid import uuid4
 
 import sqlglot
 from sqlglot import exp
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer, model_validator
 from typing import Annotated, Any, Literal
 
 from . import report_data
 from .connectors import ConnectorError, get_connector
 from .connectors.base import norm_value
+from .connectors.sql import DEFAULT_PORTS
 from .permission import DIALECT, PermissionDenied
 from .scenario_filters import _table_name, effective_filters, query_in_scenario
 
@@ -47,7 +48,8 @@ class Condition(StrictModel):
 
     @model_validator(mode="after")
     def validate_ops(self):
-        if not (self.model_fields_set & {"in_", "in", "not_in", "ne", "gt", "gte", "lt", "lte"}):
+        if "ne" not in self.model_fields_set and all(getattr(self, op) is None for op in (
+                "in_", "not_in", "gt", "gte", "lt", "lte")):
             raise ValueError("条件过滤至少需要指定一个比较算子")
         for values in (self.in_, self.not_in):
             if values is not None:
@@ -56,6 +58,12 @@ class Condition(StrictModel):
         for op in ("ne", "gt", "gte", "lt", "lte"):
             _check_scalar(getattr(self, op))
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_ops(self, handler):
+        # ne 显式为 null 表示 IS NOT NULL；序列化时省略其余未使用的算子。
+        return {op: value for op, value in handler(self).items()
+                if value is not None or (op == "ne" and "ne" in self.model_fields_set)}
 
 
 class ParamBinding(StrictModel):
@@ -72,9 +80,14 @@ class ParamBinding(StrictModel):
 
     @model_validator(mode="after")
     def validate_bindings(self):
-        if not (self.model_fields_set & {"eq", "ne", "in_", "in", "not_in", "gt", "gte", "lt", "lte"}):
+        if all(getattr(self, op) is None for op in ("eq", "ne", "in_", "not_in", "gt", "gte", "lt", "lte")):
             raise ValueError("参数条件至少需要绑定一个比较算子")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_bindings(self, handler):
+        # 模板和快照必须对同一组实际生效的参数绑定计算相同哈希。
+        return {op: value for op, value in handler(self).items() if value is not None}
 
 
 WhereValue = Scalar | list[Scalar] | Condition
@@ -100,6 +113,8 @@ class SemanticMetric(StrictModel):
     filter_dimensions: list[FieldName] | None = Field(default=None, max_length=32)
     when: dict[FieldName, WhereValue] = Field(default_factory=dict, max_length=4)
     denominator_when: dict[FieldName, WhereValue] = Field(default_factory=dict, max_length=4)
+    when_parameters: dict[FieldName, Key | ParamBinding] = Field(default_factory=dict, max_length=4)
+    denominator_parameters: dict[FieldName, Key | ParamBinding] = Field(default_factory=dict, max_length=4)
     scale: Literal["number", "decimal", "percent"] = "number"
     description: str = Field(default="", max_length=1000)
 
@@ -119,12 +134,14 @@ def validate_metrics(raw: dict, tables: list[dict]) -> dict:
     for key, metric in metrics.items():
         if metric.table not in names or (metric.op in binary) != bool(metric.denominator):
             raise ValueError(f"官方指标 {key} 的表或参与计算字段配置无效")
+        if not metric.denominator and (metric.denominator_when or metric.denominator_parameters):
+            raise ValueError(f"官方指标 {key} 没有分母，不能配置分母条件")
         if metric.op in {"ratio_of_sums", "growth_of_sums"} and metric.scale != "decimal":
             raise ValueError(f"官方指标 {key} 的公式返回小数比例，scale 应为 decimal")
     out = {}
     for key, item in metrics.items():
         dumped = item.model_dump(by_alias=True)
-        for opt in ("filter_dimensions", "when", "denominator_when"):
+        for opt in ("filter_dimensions", "when", "denominator_when", "when_parameters", "denominator_parameters"):
             if not dumped.get(opt) and opt not in item.model_fields_set:
                 dumped.pop(opt, None)
         out[key] = dumped
@@ -160,16 +177,18 @@ class QueryPlan(StrictModel):
         return self
 
 
-def source_target_hash(source: dict, tables: list[str]) -> str:
+def source_target_hash(source: dict, tables: list[str], *, version: int = 2) -> str:
     """只对决定物理数据源位置与接口契约的字段计算指纹；改密码、备注或无关表授权不影响历史报告。"""
     ds_type = source.get("type")
     cfg = source.get("config") or {}
     if ds_type == "api":
         eps = cfg.get("endpoints") or {}
+        contract_fields = ("path", "method", "params", "body", "records_path", "pagination",
+                           "revision_path", "complete", "immutable")
+        if version >= 2:
+            contract_fields += ("column_types",)
         selected_eps = {
-            t: {k: eps[t].get(k) for k in (
-                "path", "method", "params", "body", "records_path", "pagination",
-                "revision_path", "complete", "immutable")}
+            t: {k: eps[t].get(k) for k in contract_fields}
             for t in sorted(tables) if t in eps and isinstance(eps.get(t), dict)
         }
         target = {
@@ -191,6 +210,15 @@ def source_target_hash(source: dict, tables: list[str]) -> str:
             "sid": cfg.get("sid") or "",
             "search_path": cfg.get("search_path") or "",
         }
+        if version >= 2:
+            target["host"] = target["host"] or "localhost"
+            target["port"] = int(target["port"] or DEFAULT_PORTS.get(ds_type, 0))
+            # 登录用户在部分连接配置中同时决定默认数据库或 Schema。
+            if ds_type == "oracle" and not target["schema"]:
+                target["schema"] = (cfg.get("username") or "").upper()
+            if ds_type == "postgresql" and (not target["database"] or not target["search_path"]
+                                           or '"$user"' in target["search_path"]):
+                target["default_namespace_user"] = cfg.get("username") or ""
     return sha256(json.dumps(target, sort_keys=True, default=str, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -202,6 +230,7 @@ def scope_for(dataset_id: int, dataset: dict, source: dict, tables: list[str]) -
     return {"dataset_id": dataset_id, "source_id": source.get("id", dataset.get("datasource_id")),
             "source_revision": str(source.get("updated_at", "")),
             "source_target": source_target_hash(source, tables),
+            "source_target_version": 2,
             "tables": sorted(tables),
             "scope_sha256": sha256(policy.encode()).hexdigest()}
 
@@ -269,6 +298,30 @@ def _param_names(binding: Key | ParamBinding) -> set[str]:
             if getattr(binding, op) is not None}
 
 
+_PARAMETERS = TypeAdapter(dict[FieldName, Key | ParamBinding])
+
+
+def _parameter_predicates(column, binding, values: dict, bind) -> list[exp.Expr]:
+    bindings = {"eq": binding} if isinstance(binding, str) else binding.model_dump()
+    predicates, comparison = [], {}
+    for op, name in bindings.items():
+        if name not in values:
+            raise ConnectorError(f"缺少参数 {name}")
+        value = values[name]
+        if op in ("in_", "not_in"):
+            if not isinstance(value, list):
+                raise ConnectorError(f"参数 {name} 须为 1 至 200 个元素的数组")
+        elif isinstance(value, list) or (op in ("gt", "gte", "lt", "lte") and value is None):
+            raise ConnectorError(f"参数 {name} 须为标量值，范围比较不可为空")
+        if op == "eq":
+            predicates.extend(_predicates_for(column, value, bind))
+        else:
+            comparison[op] = value
+    if comparison:
+        predicates.extend(_predicates_for(column, Condition(**comparison), bind))
+    return predicates
+
+
 def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict, allowed):
     ds_tables = {t["table_name"] for t in ds["tables"]}
     if plan.table not in ds_tables or (allowed is not None and plan.table.lower() not in allowed):
@@ -282,6 +335,7 @@ def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict,
         return exp.column(name, table=table_alias, quoted=True)
 
     join_specs = []
+    join_checks = []
     join_fields: list[str] = []
     for idx, join in enumerate(plan.joins):
         if join.table not in ds_tables or (allowed is not None and join.table.lower() not in allowed):
@@ -296,16 +350,23 @@ def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict,
         for jf in join.fields:
             col(jf, j_alias, j_cols, join.table)
             join_fields.append(jf)
-        join_specs.append((join, j_alias, j_cols, on_exprs))
+        guard = f"srg::join:{idx}"
+        if any(c.lower() == guard for c in j_cols):
+            raise ConnectorError("维表字段与关联校验别名冲突")
+        join_checks.append((guard, join.table))
+        join_specs.append((join, j_alias, j_cols, on_exprs, guard))
 
     if not (plan.fields or plan.metrics) or (plan.metrics and plan.fields) or (plan.fields and plan.dimensions):
         raise ConnectorError("每组计划选择 fields 直取，或选择 metrics 与 dimensions 受控聚合")
     names = (plan.dimensions + join_fields + plan.metrics) if plan.metrics else (plan.fields + join_fields)
-    if len(set(n.lower() for n in names)) != len(names):
+    normalized_names = {n.lower() for n in names}
+    if len(normalized_names) != len(names) or any(g in normalized_names for g, _ in join_checks):
         raise ConnectorError("输出字段名重复")
     projections = [col(name) for name in (plan.dimensions if plan.metrics else plan.fields)]
-    for join, j_alias, j_cols, _ in join_specs:
+    for join, j_alias, j_cols, _, guard in join_specs:
         projections.extend(col(jf, j_alias, j_cols, join.table) for jf in join.fields)
+        checked = exp.column(guard, table=j_alias, quoted=True)
+        projections.append(exp.alias_(exp.Max(this=checked) if plan.metrics else checked, guard, quoted=True))
 
     marker = f"rq_{uuid4().hex}_"
     params: dict[str, Any] = {}
@@ -315,12 +376,13 @@ def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict,
         params[idx_key] = value
         return exp.Var(this=marker + idx_key)
 
-    def metric_target(field_name: str, when_raw: dict) -> exp.Expr:
+    def metric_target(field_name: str, when_raw: dict, parameters_raw: dict) -> exp.Expr:
         target = col(field_name)
-        if not when_raw:
-            return target
+        # 本期和基期参数分别限制聚合输入；外层 WHERE 依旧先约束整个事实集。
         parsed = TypeAdapter(dict[FieldName, WhereValue]).validate_python(when_raw)
         preds = [p for fname, fcond in parsed.items() for p in _predicates_for(col(fname), fcond, bind)]
+        for fname, binding in _PARAMETERS.validate_python(parameters_raw).items():
+            preds.extend(_parameter_predicates(col(fname), binding, values, bind))
         if not preds:
             return target
         cond_expr = preds[0]
@@ -330,18 +392,20 @@ def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict,
 
     aggregates = {"sum": exp.Sum, "min": exp.Min, "max": exp.Max}
     scales, derived = {}, {}
+    joined_group_keys = {field for join in plan.joins if join.fields for field in join.on}
     for key in plan.metrics:
         item = (ds.get("semantic_metrics") or {}).get(key)
         if not item or item["table"] != plan.table:
             raise ConnectorError(f"官方指标 {key} 未登记当前表、分组或筛选维度")
         allowed_group = set(item["dimensions"])
         allowed_filter = (allowed_group | set(item["filter_dimensions"])) if item.get("filter_dimensions") is not None else columns
-        if not set(plan.dimensions) <= allowed_group or not (set(plan.where) | set(plan.parameters)) <= allowed_filter:
+        if (not (set(plan.dimensions) | joined_group_keys) <= allowed_group
+                or not (set(plan.where) | set(plan.parameters)) <= allowed_filter):
             raise ConnectorError(f"官方指标 {key} 未登记当前表、分组或筛选维度")
         op = item["op"]
         when_raw = item.get("when") or {}
         den_when_raw = item.get("denominator_when") or {}
-        num_expr = metric_target(item["field"], when_raw)
+        num_expr = metric_target(item["field"], when_raw, item.get("when_parameters") or {})
         if op in aggregates:
             formula = aggregates[op](this=num_expr)
         elif op == "count_distinct":
@@ -351,12 +415,13 @@ def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict,
             # 再用服务端 Decimal 生成官方派生字段，始终先应用场景权限和分组。
             lhs = exp.Sum(this=num_expr)
             if op == "avg":
-                rhs = exp.Count(this=metric_target(item["field"], when_raw))
+                rhs = exp.Count(this=num_expr.copy())
             else:
-                rhs = exp.Sum(this=metric_target(item["denominator"], den_when_raw))
+                rhs = exp.Sum(this=metric_target(item["denominator"], den_when_raw,
+                                                item.get("denominator_parameters") or {}))
             numerator = f"srg::{len(derived)}:num"
             denominator = f"srg::{len(derived)}:den"
-            if any(name in columns for name in (numerator, denominator)):
+            if any(name in columns or name in names for name in (numerator, denominator)):
                 raise ConnectorError("源字段与官方指标内部别名冲突")
             projections.extend((exp.alias_(lhs, numerator, quoted=True), exp.alias_(rhs, denominator, quoted=True)))
             derived[key] = (op, numerator, denominator)
@@ -372,58 +437,50 @@ def _query_sql(plan: QueryPlan, ds: dict, source: dict, connector, values: dict,
     for name, binding in plan.parameters.items():
         if name in plan.where and (isinstance(binding, str) or not isinstance(plan.where[name], Condition)):
             raise ConnectorError(f"缺少参数或字段 {name} 被重复筛选")
-        col_expr = col(name)
-        if isinstance(binding, str):
-            if binding not in values:
-                raise ConnectorError(f"缺少参数 {binding}")
-            val = values[binding]
-            if isinstance(val, list):
-                raise ConnectorError(f"参数 {binding} 须为标量值")
-            where_exprs.extend(_predicates_for(col_expr, val, bind))
-        else:
-            cond_kwargs: dict[str, Any] = {}
-            for op in ("eq", "ne", "in_", "not_in", "gt", "gte", "lt", "lte"):
-                var = getattr(binding, op)
-                if var is None:
-                    continue
-                if var not in values:
-                    raise ConnectorError(f"缺少参数 {var}")
-                val = values[var]
-                if op in ("in_", "not_in"):
-                    if not isinstance(val, list) or not 1 <= len(val) <= 200:
-                        raise ConnectorError(f"参数 {var} 须为 1 至 200 个元素的数组")
-                else:
-                    if isinstance(val, list):
-                        raise ConnectorError(f"参数 {var} 须为标量值")
-                    if op in ("gt", "gte", "lt", "lte") and val is None:
-                        raise ConnectorError(f"范围比较参数 {var} 不能为空值")
-                if op == "eq":
-                    where_exprs.extend(_predicates_for(col_expr, val, bind))
-                else:
-                    cond_kwargs[op] = val
-            if cond_kwargs:
-                where_exprs.extend(_predicates_for(col_expr, Condition(**cond_kwargs), bind))
+        where_exprs.extend(_parameter_predicates(col(name), binding, values, bind))
 
     dialect = DIALECT[source["type"]]
     main_tbl = _table_name(plan.table, dialect)
     if main_alias:
         main_tbl.set("alias", exp.TableAlias(this=exp.to_identifier(main_alias, quoted=True)))
     tree = exp.select(*projections).from_(main_tbl)
-    for join, j_alias, _, on_exprs in join_specs:
+    for join, j_alias, _, on_exprs, guard in join_specs:
         j_tbl = _table_name(join.table, dialect)
-        j_tbl.set("alias", exp.TableAlias(this=exp.to_identifier(j_alias, quoted=True)))
+        # 在同一读取语句、同一授权行范围内计数。只有实际匹配到重复键时才拒绝结果。
+        keys = list(dict.fromkeys(join.on.values()))
+        fields = list(dict.fromkeys([*keys, *join.fields]))
+        multiplicity = exp.Window(this=exp.Count(this=exp.Star()),
+                                  partition_by=[exp.column(k, quoted=True) for k in keys])
+        j_view = exp.select(*(exp.column(k, quoted=True) for k in fields),
+                            exp.alias_(multiplicity, guard, quoted=True)).from_(j_tbl).subquery(
+                                exp.to_identifier(j_alias, quoted=True))
         on_cond = on_exprs[0]
         for extra in on_exprs[1:]:
             on_cond = exp.and_(on_cond, extra)
-        tree = tree.join(j_tbl, on=on_cond, join_type=join.type.upper())
+        tree = tree.join(j_view, on=on_cond, join_type=join.type.upper())
     for w_expr in where_exprs:
         tree = tree.where(w_expr)
     if plan.metrics and (plan.dimensions or join_fields):
         group_exprs = [col(name) for name in plan.dimensions]
-        for join, j_alias, j_cols, _ in join_specs:
+        for join, j_alias, j_cols, _, _ in join_specs:
             group_exprs.extend(col(jf, j_alias, j_cols, join.table) for jf in join.fields)
         tree = tree.group_by(*group_exprs)
-    return tree.sql(dialect=dialect), (marker, params), scales, derived
+    return tree.sql(dialect=dialect), (marker, params), scales, derived, join_checks
+
+
+def _check_join_keys(result: dict, checks: list[tuple[str, str]]) -> None:
+    if not checks:
+        return
+    indexes = {result["columns"].index(field): table for field, table in checks}
+    for row in result["rows"]:
+        for index, table in indexes.items():
+            value = row[index]
+            if value is not None and Decimal(value["$decimal"] if isinstance(value, dict) else str(value)) > 1:
+                raise ConnectorError(f"维表 {table} 在授权范围内的匹配键不唯一，关联会重复计算事实")
+    # 关联校验列只在服务端使用，不能进入快照或报告。
+    keep = [i for i in range(len(result["columns"])) if i not in indexes]
+    result["columns"] = [result["columns"][i] for i in keep]
+    result["rows"] = [[row[i] for i in keep] for row in result["rows"]]
 
 
 def _derive(result: dict, derived: dict) -> None:
@@ -497,6 +554,12 @@ def capture(dataset_id: int, dataset: dict, source: dict, allowed, owner: str,
             raise ConnectorError("取数参数的文本长度或字符无效")
     connector = get_connector(source)
     declared = {var for plan in plans.values() for binding in plan.parameters.values() for var in _param_names(binding)}
+    official_metrics = dataset.get("semantic_metrics") or {}
+    for name in {name for plan in plans.values() for name in plan.metrics}:
+        metric = official_metrics.get(name) or {}
+        for field in ("when_parameters", "denominator_parameters"):
+            for binding in _PARAMETERS.validate_python(metric.get(field) or {}).values():
+                declared.update(_param_names(binding))
     if set(values) != declared:
         raise ConnectorError("实际参数名须与取数计划声明一致")
     if len(plans) > 1 and source["type"] == "starrocks":
@@ -517,10 +580,11 @@ def capture(dataset_id: int, dataset: dict, source: dict, allowed, owner: str,
         context = nullcontext("single_statement")
     with context as consistency:
         for key, plan in plans.items():
-            sql, binds, scales, derived = _query_sql(plan, dataset, source, connector, values, allowed)
+            sql, binds, scales, derived, join_checks = _query_sql(plan, dataset, source, connector, values, allowed)
             result = query_in_scenario(source, dataset, sql, limit, connector, allowed, query_binds=binds)
             if result["truncated"]:
                 raise ConnectorError(f"取数计划 {key} 超过 {limit} 行，请缩小期间、字段或采用官方聚合指标")
+            _check_join_keys(result, join_checks)
             _derive(result, derived)
             _sort_result(result, plan.order_by)
             origin = scope_for(dataset_id, dataset, source, result["tables_used"])

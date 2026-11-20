@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from smartreportgen import mcp_server
+from smartreportgen import mcp_server, repo, search
 from smartreportgen.auth import Principal
 from smartreportgen.config import settings
 from smartreportgen.connectors import get_connector
@@ -58,6 +58,27 @@ class WorkflowPerformanceTest(unittest.TestCase):
         self.assertIn("有权限", result["tip"])
         self.assertEqual(result["scenario_management_url"], "https://portal.example/reports-tools/#datasets")
         search.assert_called_once_with("新增场景", 3, dataset_ids=[1])
+
+    def test_scenario_search_uses_synonyms_and_bundles_unambiguous_context(self):
+        # 业务分析思路和指标别名都应进入离线检索，零相似度哈希结果不会冒充命中。
+        ds = {"id": 1, "business_scenario": "经营看板", "business_description": "", "tags": [], "tables": [],
+              "analysis_approach": "按月查看营业收入", "semantic_metrics": {
+                  "delivery_rate": {"table": "Facts", "description": "准时交付率"}}}
+        index = repo._dataset_index(ds, [])
+        self.assertIn("营收", index["kw_b"])
+        self.assertIn("按时交付率", index["kw_c"])
+        with patch.object(settings, "embedding_provider", "hash"), patch.object(search, "embed_query"), \
+                patch.object(search, "_keyword", return_value=[]) as keyword, \
+                patch.object(search, "_vector", return_value=[{"id": 1, "score": 0}]):
+            self.assertEqual(search.hybrid("dataset", "营收")['hits'], [])
+            self.assertIn("营业收入", keyword.call_args.args[1])
+        result = {"hits": [{"dataset": ds, "relevance": 0.9}], "query_tokens": ["营收"], "warnings": []}
+        with patch.object(repo, "search_datasets", return_value=result) as find, \
+                patch.object(mcp_server, "prepare_report_context", return_value={"ok": True}) as prepare:
+            response = mcp_server.search_business_scenarios("营收", None, top_k=1, include_context="structured")
+        self.assertTrue(response["context"]["ok"])
+        find.assert_called_once_with("营收", 2, dataset_ids=[1])
+        prepare.assert_called_once_with(1, None, "营收", mode="structured")
 
     def test_light_probe_skips_full_scans_and_limits_sample(self):
         with patch.object(self.connector, "query", wraps=self.connector.query) as query:

@@ -25,7 +25,7 @@ from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from . import auth, db, design, embedding, iam, permission, repo, report_data, report_pipeline, report_spec, seed, services
+from . import auth, db, design, embedding, iam, permission, repo, report_browser, report_data, report_pipeline, report_spec, seed, services
 from .config import settings
 from .connectors import ConnectorError, get_connector
 from .renderer import RenderError, render, standalone, validate
@@ -43,6 +43,7 @@ if not (DOCS / "HTTP_API.md").is_file():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     need = db.init_db()
+    repo.migrate_report_versions()
     repo.load_custom_words()
     seed.seed_if_needed()
     seed.migrate()
@@ -54,7 +55,10 @@ async def lifespan(_app: FastAPI):
             log.info("补齐未向量化记录：%s", stale)
     if not iam.configured():
         log.warning("海尔 IAM 未配置齐全（缺 %s），受保护的接口不可用", "、".join(iam.missing_vars()))
-    yield
+    try:
+        yield
+    finally:
+        report_browser.close_pool()
 
 
 app = FastAPI(

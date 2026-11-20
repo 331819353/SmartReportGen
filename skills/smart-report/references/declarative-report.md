@@ -38,10 +38,10 @@
 - 查询计划 `QueryPlan` 支持：
   - `where` 值支持标量（`=` / `IS NULL`）、数组（`IN`，`[...]` 中包含 `null` 时等价 `IN (...) OR IS NULL`）或条件对象 `{"in": [...], "not_in": [...], "ne": ..., "gt": ..., "gte": ..., "lt": ..., "lte": ...}`；
   - `parameters` 支持标量参数键（`"month": "period"`）或条件绑定对象（如 `{"gte": "start_month", "lte": "end_month"}`、`{"in": "months"}`）；
-  - 受控维表关联 `joins: [{"table": "dim_org", "on": {"org_code": "code"}, "fields": ["org_name"], "type": "left"}]`，所有关联表同样先校验授权并自动注入行级条件；
+  - 受控维表关联 `joins: [{"table": "dim_org", "on": {"org_code": "code"}, "fields": ["org_name"], "type": "left"}]`。两侧先应用表授权和行级条件，维表匹配键重复时拒绝取数。使用维表字段分组时，事实侧关联键须在所用官方指标允许的 `dimensions` 中。
   - `order_by: [{"field":"指标或字段","direction":"desc"}]` 对全量结果排序。表格及图表声明 `columns`，至多显示 `limit` 行/点。图表首列是文本类别，其余列是度量，类别重复或超过容量时会提示缩小范围。原值和定点数用于文本及状态，绘图坐标使用 JS Number。
 - `format.kind` 支持 `number`、`rate`、`delta`、`rate_delta`、`text`。比率须明确 `scale=decimal|percent`。数字换算可设 `divisor` 与 `unit`（单位支持 `m²`、`CO₂` 等常见上/下标符号），精度为 0 至 6 位。 `signal=trend|attainment` 控制好坏，`direction=lower` 表示下降或低于阈值为好。预警阈值处于达标线的未达标一侧。正文可用 `{{metric.state}}` 随筛选显示状态。
-- 更新结构化模板 `save_report_spec` 时可传入 `expected_version` 做并发版本检查；预览返回 `warnings` 会提示默认首屏空卡片、重复类别或全部筛选下均空图的问题。
+- 更新结构化模板 `save_report_spec` 时可传入 `expected_version` 做并发版本检查。预览 `warnings` 提示默认空卡片、重复类别或部分组件始终缺数；所有受测状态均无有效数据时拒绝验收。
 - 旧结构化 Markdown 和历史自编 HTML 是历史格式。迁移历史模板时可新建声明式定义，并用原报告 ID 和版本追加新的可共享报告。
 
 ## 修改样式和图形
@@ -81,5 +81,7 @@
 ## 官方指标与数据连接
 
 有数据集写权限的场景负责人通过 `POST /api/datasets`、`PUT /api/datasets/{id}` 或 MCP `save_business_scenario` 登记 `semantic_metrics`（管理台支持可视化编辑与 JSON 源码切换）。键是指标名，每项固定 `table`、`field`、`op`、允许的分组 `dimensions`、`scale` 和含义。公式类型包括 `sum`、`avg`、`min`、`max`、`count_distinct`、`ratio_of_sums`、`difference_of_sums`、`growth_of_sums`。后三者额外指定 `denominator`。可选设 `when` 与 `denominator_when`（如分别匹配实际行与目标行 / 本期行与同期行）实现跨行指标聚合；`where` / `parameters` 过滤字段默认放行该表全部合法字段（与分组 `dimensions` 解耦，或通过 `filter_dimensions` 显式限定白名单）。增长率是两个聚合同粒度值的差与基准之比。比率或增长率零分母返回空值。官方公式按照数据源类型执行聚合和服务端十进制运算；任意表达式仍不可进入报告计划。
+
+跨账期复用时，可在官方公式登记 `when_parameters: {"month": "current_period"}` 与 `denominator_parameters: {"month": "baseline_period"}`。两组绑定语法与查询计划 `parameters` 相同。取数时提供对应参数，例如 `{"current_period":"2026-09","baseline_period":"2025-09"}`。外层查询只筛选两个期间共同适用的范围，或保留两个期间，避免提前过滤掉分母事实。
 
 HTTP API 来源的单页端点须声明 `complete: true` 或提供可信总数。游标分页在 `pagination` 中设 `cursor_param`、`next_cursor_path`，可选设 `total_path` 与 `max_pages`。每页返回游标字段，末页为 null 或空串。也可用 `page_param` 或 `offset_param` 与 `total_path` 配置页码或偏移分页，并按接口传 `page_size_param`、`page_size` 和 `start_page`。多页固定快照用 `revision_path`，或者明确声明数据内容不可变 `immutable: true`。同一版本号须由上游保证对应同一批数据，多接口报告要求共同版本号。字段可用 `column_types` 显式声明，例如 `{"amount":"DECIMAL(28, 12)"}`。

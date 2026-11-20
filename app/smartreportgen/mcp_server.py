@@ -32,7 +32,7 @@ from starlette.responses import JSONResponse
 
 from psycopg.errors import UniqueViolation
 
-from . import auth, db, design, repo, report_data, report_free, report_pipeline, report_queries, report_spec, services
+from . import auth, db, design, repo, report_browser, report_data, report_free, report_pipeline, report_queries, report_spec, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
@@ -182,12 +182,16 @@ def whoami(ctx: Context) -> dict:
 
 # ============================== 1. 场景检索 ==============================
 @_tool()
-def search_business_scenarios(query: str, ctx: Context, top_k: int = 3) -> dict:
+def search_business_scenarios(query: str, ctx: Context, top_k: int = 3,
+                              include_context: Literal["structured", "free"] | None = None) -> dict:
     """根据用户需求，在【当前员工有权限】的业务场景中做混合检索（向量 + 关键词，RRF 融合），
-    返回最匹配的业务场景、分析思路及已授权表，并给出管理台业务场景入口。query 宜使用用户的原始需求。"""
+    返回最匹配的业务场景、分析思路及已授权表，并给出管理台业务场景入口。query 宜使用用户的原始需求。
+    include_context 可在首个结果相关且与下一名有足够差距时一并返回其模板设计上下文。"""
     try:
         acc = _access(ctx)
-        res = repo.search_datasets(query, max(1, min(top_k, 10)), dataset_ids=acc.dataset_ids())
+        requested = max(1, min(top_k, 10))
+        # 即使只返回一名也要用第二名判断歧义，避免自动加载误匹配的表画像。
+        res = repo.search_datasets(query, max(2, requested) if include_context else requested, dataset_ids=acc.dataset_ids())
     except _EXPECTED as e:
         return _err(e)
     hits = []
@@ -208,8 +212,11 @@ def search_business_scenarios(query: str, ctx: Context, top_k: int = 3) -> dict:
     elif len(hits) >= 2 and hits[1]["scores"]["relevance"] >= 0.8 * hits[0]["scores"]["relevance"]:
         tip = "前两名相关度接近，请结合业务描述判断，必要时向用户确认业务场景。"
     # 管理台和 MCP 可以使用不同的公网地址，配置场景应跳到管理台的实际部署子路径。
-    return _ok({"ok": True, "query_tokens": res["query_tokens"], "hits": hits, "warnings": res["warnings"], "tip": tip,
-                "scenario_management_url": f"{settings.public_base_url}/#datasets"})
+    result = {"ok": True, "query_tokens": res["query_tokens"], "hits": hits[:requested], "warnings": res["warnings"], "tip": tip,
+              "scenario_management_url": f"{settings.public_base_url}/#datasets"}
+    if include_context and hits and not tip:
+        result["context"] = prepare_report_context(hits[0]["dataset_id"], ctx, query, mode=include_context)
+    return _ok(result)
 
 
 @_tool()
@@ -1052,8 +1059,12 @@ def build_app():
 
 def main() -> None:
     db.init_db()
+    repo.migrate_report_versions()
     repo.load_custom_words()
-    uvicorn.run(build_app(), host="0.0.0.0", port=settings.mcp_port, log_level="info")
+    try:
+        uvicorn.run(build_app(), host="0.0.0.0", port=settings.mcp_port, log_level="info")
+    finally:
+        report_browser.close_pool()
 
 
 if __name__ == "__main__":

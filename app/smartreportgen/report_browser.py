@@ -1,7 +1,6 @@
 """服务端 Chromium 验收。证据由固定运行时与查询快照生成。"""
 from __future__ import annotations
 
-import atexit
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from itertools import product
@@ -15,13 +14,23 @@ from .report_spec import ReportDefinition, ReportSpec, _project
 
 _WORKERS = max(1, min(8, int(getenv("SRG_BROWSER_WORKERS", "4"))))
 _slots = BoundedSemaphore(_WORKERS)
-_executor = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="srg-chromium")
+_executor: ThreadPoolExecutor | None = None
 _thread_state = threading.local()
 _pool_lock = threading.Lock()
 _worker_threads: set[int] = set()
 _MAX_BROWSER_USES = 200
 
-_SNAPSHOT_JS = """({cards, free}) => {
+_SNAPSHOT_JS = """async ({cards, free, changes, resized}) => {
+  // 使用页面自己的 change 事件更新筛选，变更和整页取证走一次浏览器调用。
+  for (const [id, value] of changes) {
+    const select = document.getElementById('filter-' + id);
+    if (select.value !== value) {
+      select.value = value;
+      select.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+  }
+  // 等待窄屏布局和 ECharts 的 resize 事件完成，避免读取上一个视口的画布尺寸。
+  if (resized) await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   const contractEl = document.getElementById('srg-display-contract');
   const rawColors = contractEl ? JSON.parse(contractEl.textContent).colors : {};
   const palette = Object.fromEntries(Object.entries(rawColors).map(([key, color]) =>
@@ -73,8 +82,10 @@ _SNAPSHOT_JS = """({cards, free}) => {
             });
           }
         } else {
-          info.series = option.series.map(s =>
-            s.data.map(d => [d.displayed, d.itemStyle?.color?.toLowerCase() ?? null]));
+          info.categories = [...(option.xAxis || []), ...(option.yAxis || [])]
+            .find(axis => axis.type === 'category')?.data ?? null;
+          info.series = option.series.map(s => [s.name,
+            s.data.map(d => [d.name, d.value, d.displayed, d.itemStyle?.color?.toLowerCase() ?? null])]);
         }
       }
     }
@@ -95,9 +106,18 @@ _SNAPSHOT_JS = """({cards, free}) => {
     if (freeRoot) {
       const walker = document.createTreeWalker(freeRoot, NodeFilter.SHOW_TEXT);
       const visible = [];
+      let block;
       for (let item = walker.nextNode(); item; item = walker.nextNode()) {
-        if (!item.parentElement.closest('srg-val,.srg-card-output,#srg-controls')) visible.push(item.data);
-        else visible.push('|');
+        const parent = item.parentElement;
+        if (parent.closest('srg-val,.srg-card-output,#srg-controls')) {
+          visible.push('|');
+        } else {
+          // 按块分隔合法的序号，同行的内联元素仍连在一起检查裸数字。
+          const current = parent.closest('p,li,h1,h2,h3,h4,h5,h6,div,section,article,header,footer,td,th,blockquote');
+          if (block !== current) visible.push('\\n');
+          visible.push(item.data);
+          block = current;
+        }
       }
       freeText = visible.join('');
     }
@@ -161,10 +181,15 @@ def _get_browser(executable_path: str):
     return browser
 
 
-@atexit.register
-def _close_pool() -> None:
+def close_pool() -> None:
+    global _executor
+    # 必须在服务退出前把清理任务派回 Playwright 所属线程。普通 atexit 执行时线程池已关闭。
     with _pool_lock:
+        executor, _executor = _executor, None
         count = len(_worker_threads)
+        _worker_threads.clear()
+    if executor is None:
+        return
     if count:
         barrier = threading.Barrier(count)
 
@@ -175,13 +200,13 @@ def _close_pool() -> None:
                 pass
             _reset_thread_browser()
 
-        futures = [_executor.submit(_cleanup) for _ in range(count)]
+        futures = [executor.submit(_cleanup) for _ in range(count)]
         for future in futures:
             try:
                 future.result(timeout=3)
             except Exception:
                 pass
-    _executor.shutdown(wait=False)
+    executor.shutdown()
 
 
 def _decimal(value):
@@ -228,6 +253,30 @@ def _equal(left, right):
     return type(left) is type(right) and left == right or type(left) in (int, float) and type(right) in (int, float) and left == right
 
 
+def _category(value):
+    if value is None:
+        return "—"
+    if isinstance(value, dict):
+        return value["$decimal"]
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        # JS 在这个区间使用普通小数，科学计数法的指数没有前导零。
+        if not value or 1e-6 <= abs(value) < 1e21:
+            return format(Decimal(str(value)).normalize(), "f") if value else "0"
+        coefficient, exponent = str(value).split("e")
+        return f"{coefficient}e{int(exponent):+d}"
+    return str(value)
+
+
+def _chart_coordinate(value, fmt):
+    raw = _decimal(value)
+    if raw is None:
+        return None
+    coordinate = float(raw) * (100 if fmt.scale == "decimal" else 1) / fmt.divisor
+    return coordinate if isfinite(coordinate) else None
+
+
 def _matches(row, by, selected):
     return all(selected[key] is None or _equal(row[field], selected[key]) for key, field in by.items())
 
@@ -263,7 +312,7 @@ def _waterfall_expected(card, facts, rate_symbols, colors):
         return None
     middle = [row for row in facts if row[role_field] == config.change] if config.role_field else [
         row for row in facts if row[role_field] not in (config.opening, config.closing)]
-    if len(middle) + 2 != len(facts) or len({str(row[category.field]) for row in facts}) != len(facts):
+    if len(middle) + 2 != len(facts) or len({_category(row[category.field]) for row in facts}) != len(facts):
         return None
     values = [(row, _decimal(row[amount.field])) for row in middle]
     opening, closing = _decimal(first[0][amount.field]), _decimal(last[0][amount.field])
@@ -279,7 +328,7 @@ def _waterfall_expected(card, facts, rate_symbols, colors):
         fmt = amount.format.model_copy(update={"kind": kind, "signed": role == "step"})
         multiplier = 100 if fmt.scale == "decimal" else 1
         displayed, _ = _expect(row[amount.field], fmt, rate_symbols)
-        return [str(row[category.field]), role if role == "total" else direction, displayed,
+        return [_category(row[category.field]), role if role == "total" else direction, displayed,
                 (colors[direction] if lookup else config.total_color).lower(),
                 "bottom" if lookup and direction == "up" else "top",
                 float(start) * multiplier / unit, float(end) * multiplier / unit]
@@ -311,7 +360,8 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
     card_rendered = {output_id: False for output_id, _ in outputs}
     metric_non_missing = {key: False for key in spec.metrics}
     empty_on_default: list[str] = []
-    duplicate_on_default: list[str] = []
+    invalid_cards: set[str] = set()
+    ambiguous_metrics: set[str] = set()
 
     try:
         browser = _get_browser(executable_path)
@@ -333,9 +383,10 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
                 if actual != expected:
                     raise ValueError(f"浏览器对账失败：{label}")
 
-            def check():
+            def check(changes=(), *, resized=False):
                 nonlocal checked
-                snap = page.evaluate(_SNAPSHOT_JS, {"cards": card_meta, "free": free})
+                snap = page.evaluate(_SNAPSHOT_JS, {"cards": card_meta, "free": free,
+                                                    "changes": list(changes), "resized": resized})
                 actual = snap["metrics"]
                 palette = snap["palette"]
                 colors = snap["colors"]
@@ -345,6 +396,8 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
                     binding = next((s for s in metric.sources if set(s.by) == axes), None)
                     facts = [row[binding.field] for row in rows[binding.query]
                              if _matches(row, binding.by, selected) and all(_equal(row[k], v) for k, v in binding.where.items())] if binding else []
+                    if len(facts) > 1:
+                        ambiguous_metrics.add(key)
                     expected[key] = _expect(facts[0] if len(facts) == 1 else None, metric.format, spec.rate_symbols)
                 same({result[0] for result in actual}, set(expected), "指标节点")
                 state_labels = {"up": "向好", "down": "承压", "neutral": "无变化", "met": "达标",
@@ -367,10 +420,10 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
                         expected_path = _waterfall_expected(card, facts, spec.rate_symbols, colors)
                         if expected_path is None:
                             same(actual_card["emptyCount"], 1, card.title)
+                            if facts:
+                                invalid_cards.add(card.title)
                             if checked == 0:
                                 empty_on_default.append(card.title)
-                                if facts:
-                                    duplicate_on_default.append(card.title)
                         else:
                             same(actual_card["canvasCount"] > 0, True, card.title)
                             same(actual_card.get("waterfall"), expected_path, card.title)
@@ -387,23 +440,34 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
                             _expect(row[c.field], c.format, spec.rate_symbols) for c in card.columns]]
                             for row in facts[:card.limit]]
                         same(actual_card.get("rows"), expect, card.title)
-                        card_rendered[output_id] = True
+                        if any(cell[0] != "—" for row in expect for cell in row):
+                            card_rendered[output_id] = True
+                        elif checked == 0:
+                            empty_on_default.append(card.title)
                     elif card.type != "table" and facts and len(facts) <= card.limit and len({
-                            str(row[card.columns[0].field]) for row in facts}) == len(facts):
+                            _category(row[card.columns[0].field]) for row in facts}) == len(facts) and any(
+                            _chart_coordinate(row[col.field], col.format) is not None
+                            for row in facts for col in card.columns[1:]):
                         same(actual_card["canvasCount"] > 0, True, card.title)
+                        categories = [_category(row[card.columns[0].field]) for row in facts]
+                        if card.type not in ("pie", "donut"):
+                            same(actual_card.get("categories"), categories, f"{card.title}的类别轴")
                         expected_series = []
                         for col in card.columns[1:]:
                             point_states = [_expect(row[col.field], col.format, spec.rate_symbols) for row in facts]
-                            expected_series.append([[shown, colors[state].lower() if state != "neutral" else None]
-                                                    for shown, state in point_states])
+                            expected_series.append([col.label, [
+                                [label, _chart_coordinate(row[col.field], col.format), shown,
+                                 colors[state].lower() if state != "neutral" else None]
+                                for row, label, (shown, state) in zip(facts, categories, point_states)
+                            ]])
                         same(actual_card.get("series"), expected_series, card.title)
                         card_rendered[output_id] = True
                     else:
                         same(actual_card["emptyCount"], 1, card.title)
+                        if facts:
+                            invalid_cards.add(card.title)
                         if checked == 0:
                             empty_on_default.append(card.title)
-                            if facts and card.type != "table":
-                                duplicate_on_default.append(card.title)
                 if free:
                     from .report_free import _author_text
 
@@ -420,30 +484,33 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
 
             check()
             # 小组合逐项测试，大组合测试各维度首尾及复合筛选。
-            controls = [page.locator(f"#filter-{f.id}") for f in spec.filters]
             options = page.evaluate("""ids => ids.map(id => {
                 const sel = document.getElementById('filter-' + id);
                 return sel ? [...sel.options].map(o => o.value) : [];
             })""", [f.id for f in spec.filters]) if spec.filters else []
+            same(all(options), True, "筛选控件")
 
             def apply(values):
-                for f, locator, option in zip(spec.filters, controls, values):
-                    locator.select_option(option)
-                    selected[f.id] = json.loads(option)
-                check()
+                changes = [(f.id, value) for f, value in zip(spec.filters, values)
+                           if not _equal(selected[f.id], json.loads(value))]
+                if changes:
+                    selected.update({key: json.loads(option) for key, option in changes})
+                    check(changes)
 
             if options and prod(map(len, options)) <= 12:
                 for values in product(*options):
                     apply(values)
             elif options:
-                for index, (f, locator) in enumerate(zip(spec.filters, controls)):
+                default_options = [next(option for option in opts if _equal(json.loads(option), defaults[f.id]))
+                                   for f, opts in zip(spec.filters, options)]
+                for index, opts in enumerate(options):
                     for option in dict.fromkeys((options[index][0], options[index][-1])):
-                        locator.select_option(option)
-                        selected[f.id] = json.loads(option)
-                        check()
-                apply([values[0] for values in options])
+                        values = default_options.copy()
+                        values[index] = option
+                        apply(values)
+                apply([opts[-1] for opts in options])
             page.set_viewport_size({"width": 390, "height": 844})
-            check()
+            check(resized=True)
             if spec.filters:
                 page.locator("#srg-reset").click()
                 selected = dict(defaults)
@@ -460,17 +527,20 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
     always_empty_cards = list(dict.fromkeys(card.title for output_id, card in outputs if not card_rendered[output_id]))
     always_missing_metrics = [key for key, seen in metric_non_missing.items() if not seen]
     empty_default_unique = list(dict.fromkeys(empty_on_default))
-    dup_default_unique = list(dict.fromkeys(duplicate_on_default))
     warnings: list[str] = []
     if always_empty_cards:
         warnings.append(f"卡片在全部已验收筛选状态下均为空或未绘图：{'、'.join(always_empty_cards)}")
     if always_missing_metrics:
         warnings.append(f"指标在全部已验收筛选状态下均显示缺数：{'、'.join(always_missing_metrics)}")
-    if dup_default_unique:
-        warnings.append(f"默认筛选下卡片存在类别重复、超限或桥接不平（建议为卡片配置 sources 或 where）：{'、'.join(dup_default_unique)}")
+    if invalid_cards:
+        warnings.append(f"受测筛选中有卡片类别重复、超限、无可绘制数值或桥接不平：{'、'.join(sorted(invalid_cards))}")
+    if ambiguous_metrics:
+        warnings.append(f"受测筛选中有指标匹配到多条事实：{'、'.join(sorted(ambiguous_metrics))}")
     remaining_default = [name for name in empty_default_unique if name not in set(always_empty_cards) | set(always_missing_metrics)]
     if remaining_default:
         warnings.append(f"默认初始筛选下存在空卡片或缺失指标：{'、'.join(remaining_default)}")
+    if not any(card_rendered.values()) and not any(metric_non_missing.values()):
+        raise ValueError("浏览器对账失败：所有已验收筛选状态下均没有有效卡片或指标")
     return {"status": "passed", "engine": "chromium", "states_checked": checked,
             "viewport_widths": [1280, 390], "external_requests": 0, "browser_errors": 0,
             "empty_on_default": empty_default_unique, "always_empty_cards": always_empty_cards,
@@ -478,12 +548,17 @@ def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, execut
 
 
 def verify(page_html: str, spec: ReportDefinition, snapshots: dict, dataset_id: int) -> dict:
+    global _executor
     data, _ = _project(spec, snapshots, dataset_id)
     rows = {key: [dict(zip(v["columns"], row)) for row in v["rows"]] for key, v in data.items()}
     if not _slots.acquire(timeout=30):
         raise ValueError("浏览器验收繁忙，请稍后重试")
     try:
         executable_path = getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")
-        return _executor.submit(_verify_on_thread, page_html, spec, rows, executable_path).result()
+        with _pool_lock:
+            if _executor is None:
+                _executor = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="srg-chromium")
+            future = _executor.submit(_verify_on_thread, page_html, spec, rows, executable_path)
+        return future.result()
     finally:
         _slots.release()

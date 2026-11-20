@@ -15,7 +15,7 @@ from pydantic import Field, model_validator
 
 from . import design, report_data, report_document
 from .permission import PermissionDenied, access_for
-from .report_queries import FieldName, Key, QueryPlan, Scalar, StrictModel, scope_for
+from .report_queries import FieldName, Key, QueryPlan, Scalar, StrictModel, scope_for, source_target_hash
 
 ASSET = Path(__file__).with_name("static") / "report" / "compiled.js"
 TOKEN = re.compile(r"\{\{([a-z][a-z0-9_]{0,47})(\.state)?\}\}")
@@ -32,23 +32,18 @@ _COMMON_CODES = re.compile(
 _LABEL_CALENDAR = re.compile(
     r"(?<![\d.])20\d{2}年(?:\d{1,2}月(?:\d{1,2}日)?)?"
     r"|(?<![\d.])20\d{2}[-/.](?:0?[1-9]|1[0-2])(?:[-/.](?:0?[1-9]|[12]\d|3[01]))?(?![\d%％])"
-    r"|(?<!\d)20\d{2}(?:0[1-9]|1[0-2])(?![\d%％])"
+    r"|(?<![\d.])20\d{2}(?:0[1-9]|1[0-2])(?![\d.%％元万亿吨件台套单笔家人个成倍])"
     r"|(?<![A-Za-z0-9])(?:20\d{2}\s*)?(?:Q[1-4]|H[12])(?![A-Za-z0-9%％])"
     r"|第[一二三四五六七八九十\d]{1,2}(?:季度|章|节|部分|阶段|梯队|步|周)"
     r"|(?<![\d.个])(?:1[0-2]|[1-9])月(?:份|\d{1,2}日)?(?![\d%％])"
+    r"|(?<![\d.])(?:1[0-2]|[1-9])\s*[-–—~至]\s*(?:1[0-2]|[1-9])月(?:份)?(?![\d%％])"
 )
 _LABEL_INDEX = re.compile(r"^\s*(?:[（(]?\d{1,2}[)）]|[①-⑳]|\d{1,2}[.、])(?=\s*[^\d.%％\s])")
-_PROSE_CALENDAR = re.compile(
-    r"(?<![\d.])20\d{2}年(?:\d{1,2}月(?:\d{1,2}日)?)?"
-    r"|(?<![A-Za-z0-9])(?:20\d{2}\s*)?(?:Q[1-4]|H[12])(?![A-Za-z0-9%％])"
-    r"|(?<![\d.个])(?:1[0-2]|[1-9])月(?:份|\d{1,2}日)?(?![\d%％])"
-)
 _PROSE_LIST = re.compile(r"(?:^|[\n；;。！？：:|])\s*(?:[（(]\d{1,2}[)）]|[①-⑳]|\d{1,2}[.、])(?=\s*(?:[^\d.%％\s]|$))")
-_PROSE_ORDINAL = re.compile(r"第[一二三四五六七八九十\d]{1,2}(?:季度|章|节|部分|阶段|梯队|步|周)")
 _PROSE_IDIOM = re.compile(
     r"再上一个台阶|更上一层楼|一家独大|成千上万|百倍信心|十倍努力|九成把握|三位一体|合二为一|一分为二|独当一面|举一反三|三令五申|五湖四海|千家万户|万无一失|百尺竿头"
     r"|个性化|个人|个别|个体"
-    r"|[一二两三四五六七八九十]+个(?:维度|方面|阶段|问题|核心|关键|抓手|方向|层次|层级|特征|特点|原则|结论|章节|模块|部分|环节|步骤|口径|视角|假设|原因|因素|建议|动作|策略|目标|指标|场景)"
+    r"|[一二两三四五六七八九十]+个(?:维度|方面|阶段|问题|核心|关键|抓手|方向|层次|层级|特征|特点|原则|结论|章节|模块|部分|环节|步骤|口径|视角|假设|原因|因素|建议|动作|策略|目标|指标|场景|链群)"
 )
 DECIMAL = Annotated[str, Field(pattern=r"^[+-]?\d+(?:\.\d+)?$", max_length=100)]
 Text = Annotated[str, Field(min_length=1, max_length=300)]
@@ -66,17 +61,10 @@ def check_unbound_numbers(text: str, where: str, *, mode: Literal["prose", "labe
         if CHINESE_VALUE.search(compact) or any(char.isdecimal() for char in compact):
             raise ValueError(f"{where} 含未绑定数字，请使用数据槽位")
         return
-    if mode == "label":
-        cleaned = _LABEL_CALENDAR.sub(" ", cleaned)
-        cleaned = _COMMON_CODES.sub(" ", cleaned)
-        cleaned = _LABEL_INDEX.sub(" ", cleaned)
-        cleaned = _PROSE_IDIOM.sub(" ", cleaned)
-    else:
-        cleaned = _PROSE_IDIOM.sub(" ", cleaned)
-        cleaned = _PROSE_CALENDAR.sub(" ", cleaned)
-        cleaned = _COMMON_CODES.sub(" ", cleaned)
-        cleaned = _PROSE_ORDINAL.sub(" ", cleaned)
-        cleaned = _PROSE_LIST.sub(" ", cleaned)
+    cleaned = _PROSE_IDIOM.sub(" ", cleaned)
+    cleaned = _LABEL_CALENDAR.sub(" ", cleaned)
+    cleaned = _COMMON_CODES.sub(" ", cleaned)
+    cleaned = (_LABEL_INDEX if mode == "label" else _PROSE_LIST).sub(" ", cleaned)
     compact = re.sub(r"\s+", "", cleaned)
     if CHINESE_VALUE.search(compact) or any(char.isnumeric() and not char.isalpha() for char in compact):
         raise ValueError(f"{where} 含未绑定数字，请使用数据槽位")
@@ -348,7 +336,7 @@ class ReportSpec(ReportDefinition):
 def encode_template(spec: ReportDefinition, dataset_id: int) -> str:
     # 版本固定完整模板和场景，两种模板均沿用已有的模板版本存储。
     key = "smartreportgen_spec" if isinstance(spec, ReportSpec) else "smartreportgen_free_html"
-    return json.dumps({key: spec.model_dump(mode="json"), "dataset_id": dataset_id},
+    return json.dumps({key: spec.model_dump(mode="json", by_alias=True), "dataset_id": dataset_id},
                       ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -395,12 +383,19 @@ def validate_scopes(scopes: list[dict], principal) -> None:
                 sources[ds_source] = repo.get_datasource(ds_source)
             source = sources[ds_source]
             current = scope_for(ds_id, dataset, source, recorded["tables"])
+            # 没有历史指纹时只能核实同一数据源修订，不能用今天的地址替历史快照作证。
+            if "source_target" in recorded:
+                version = recorded.get("source_target_version", 1)
+                same_target = version in (1, 2) and recorded["source_target"] == (
+                    current["source_target"] if version == 2 else source_target_hash(source, recorded["tables"], version=1))
+            else:
+                same_target = bool(current["source_revision"]) and current["source_revision"] == recorded.get("source_revision")
             if (not source["enabled"]
                     or current["dataset_id"] != recorded.get("dataset_id")
                     or current["source_id"] != recorded.get("source_id")
                     or current["tables"] != recorded.get("tables")
                     or current["scope_sha256"] != recorded.get("scope_sha256")
-                    or ("source_target" in recorded and current["source_target"] != recorded["source_target"])):
+                    or not same_target):
                 raise PermissionDenied("报告数据源或行范围已变化，请重新取数")
         except repo.NotFound as exc:
             raise PermissionDenied("报告来源已删除，无法核实该版本的数据权限") from exc

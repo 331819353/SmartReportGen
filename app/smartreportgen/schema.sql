@@ -199,6 +199,12 @@ CREATE TABLE IF NOT EXISTS report.report_version (
     CHECK (base_version < version)
 );
 
+-- 内置脚本按内容哈希共享。升级镜像后，旧报告继续展开保存时使用的精确版本。
+CREATE TABLE IF NOT EXISTS report.static_asset (
+    sha256 text PRIMARY KEY CHECK (sha256 ~ '^[a-f0-9]{64}$'),
+    body   text NOT NULL
+);
+
 -- 选择随员工账号保存，历史选择不影响其他员工；没有记录表示跟随最新版。
 CREATE TABLE IF NOT EXISTS report.report_selection (
     report_id bigint NOT NULL,

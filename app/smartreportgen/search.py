@@ -4,8 +4,9 @@ from __future__ import annotations
 import logging
 
 from . import db
+from .config import settings
 from .embedding import EmbeddingError, embed_query, to_pgvector
-from .textproc import tokenize
+from .textproc import scenario_tokens, tokenize
 
 log = logging.getLogger(__name__)
 RRF_K = 60
@@ -46,12 +47,15 @@ def _vector(table: str, vec: list[float], where: str, params: dict, limit: int) 
 def hybrid(kind: str, query: str, top_k: int = 5, where: str = "", params: dict | None = None) -> dict:
     table = _TABLES[kind]
     params = params or {}
-    tokens = tokenize(query)
+    tokens = scenario_tokens(query) if kind == "dataset" else tokenize(query)
     cand = max(top_k * 4, 20)
     warnings: list[str] = []
     kw = _keyword(table, tokens, where, params, cand)
     try:
+        # 哈希没有语义距离。完全不相似的记录不能掩盖场景未命中的结果。
         vec_rows = _vector(table, embed_query(query), where, params, cand)
+        if kind == "dataset" and settings.embedding_provider == "hash":
+            vec_rows = [row for row in vec_rows if row["score"] is not None and row["score"] > 0]
     except EmbeddingError as e:
         log.warning("向量检索失败，降级为关键词检索: %s", e)
         warnings.append(f"向量检索不可用，已降级为纯关键词检索：{e}")

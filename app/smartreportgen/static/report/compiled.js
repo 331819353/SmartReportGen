@@ -230,10 +230,9 @@
     const visual = (value, fmt) => {
       if (!numeric(value)) return null;
       // 展示单位用于图形坐标，状态与标签继续读取未经舍入的原值。
-      const asNumber = Number(exact(value));
-      return Number.isFinite(asNumber) ? asNumber * (fmt.scale === 'decimal' ? 100 : 1) / fmt.divisor : null;
+      const point = Number(exact(value)) * (fmt.scale === 'decimal' ? 100 : 1) / fmt.divisor;
+      return Number.isFinite(point) ? point : null;
     };
-    const instance = chartHost(container, card);
     const series = fields.map(col => {
       const type = col.series ?? (radial ? 'pie' : card.type === 'area' ? 'line' : card.type);
       const style = {name: col.label, type,
@@ -267,6 +266,14 @@
       });
       return style;
     });
+    if (!series.some(item => item.data.some(point => point.value !== null))) {
+      // 有分类但所有度量缺失时，空画布会让用户误以为图表已经核对过数据。
+      const note = element('p', '当前筛选无可绘制数值');
+      note.dataset.empty = 'true';
+      container.append(note);
+      return;
+    }
+    const instance = chartHost(container, card);
     const legendPosition = look.legend ?? 'auto';
     const legendVisible = legendPosition === 'auto' ? fields.length > 1 : legendPosition !== 'hidden';
     const legend = {show: legendVisible, type: 'scroll', textStyle: labelStyle,

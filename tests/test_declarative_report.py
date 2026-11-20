@@ -180,7 +180,8 @@ class DeclarativeReportTest(unittest.TestCase):
         _, invalid, _ = report_spec.compile_report(spec, {"facts": payload}, 91, {})
         self.assertIsNone(report_browser._waterfall_expected(card, [dict(zip(payload["columns"], row))
                           for row in payload["rows"]], "semantic", spec.colors))
-        self.assertEqual(report_browser.verify(invalid, spec, {"facts": payload}, 91)["status"], "passed")
+        with self.assertRaisesRegex(ValueError, "没有有效卡片或指标"):
+            report_browser.verify(invalid, spec, {"facts": payload}, 91)
 
     def test_preexisting_template_and_preview_compare_with_new_presentation_defaults(self):
         spec, payload = fixture()
@@ -343,6 +344,16 @@ class DeclarativeReportTest(unittest.TestCase):
         self.assertIn("未聚合明细图", diag["always_empty_cards"])
         self.assertTrue(diag["warnings"])
 
+        # 有类别但度量列全空时仍须显示缺数，整份报告无有效数据时不能发布。
+        missing = {**snapshots["by_region"], "rows": [["华东", "2026-08", None]]}
+        valid_other = {"overall": snapshots["overall"], "by_region": missing}
+        _, page, _ = report_spec.compile_report(broken, valid_other, 91, {})
+        self.assertIn("未聚合明细图", report_browser.verify(page, broken, valid_other, 91)["always_empty_cards"])
+        empty = {**valid_other, "overall": {**snapshots["overall"], "rows": []}}
+        _, page, _ = report_spec.compile_report(broken, empty, 91, {})
+        with self.assertRaisesRegex(ValueError, "没有有效卡片或指标"):
+            report_browser.verify(page, broken, empty, 91)
+
     @unittest.skipUnless(Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file(), "需安装 Chromium")
     def test_text_metric_and_refined_bare_number_rules(self):
         spec = report_spec.ReportSpec.model_validate({
@@ -354,7 +365,7 @@ class DeclarativeReportTest(unittest.TestCase):
             },
             "sections": [{
                 "title": "经营概览",
-                "narrative": "2026年9月围绕三个维度：1. 账期 {{period}} 完成率为 {{attainment}}。",
+                "narrative": "2026-09围绕三个维度：1. 账期 {{period}} 的两个链群完成率为 {{attainment}}。",
                 "cards": [{"title": "完成率", "type": "kpi", "metric": "attainment"}],
             }],
         })
@@ -371,10 +382,10 @@ class DeclarativeReportTest(unittest.TestCase):
                 report_spec.ReportSpec.model_validate(raw)
 
     def test_enhanced_query_plan_joins_and_conditional_semantic_metrics(self):
-        cfg = {"endpoints": {
-            "facts": {"path": "/facts", "complete": True, "revision_path": "ver",
+        cfg = {"cache_seconds": 0, "endpoints": {
+            "facts": {"path": "/facts", "complete": True, "revision_path": "ver", "records_path": "items",
                       "column_types": {"amount": "DECIMAL(18, 4)"}},
-            "dim_org": {"path": "/orgs", "complete": True, "revision_path": "ver"},
+            "dim_org": {"path": "/orgs", "complete": True, "revision_path": "ver", "records_path": "items"},
         }}
         source = {**SOURCE, "config": cfg}
         dataset = {
@@ -389,12 +400,17 @@ class DeclarativeReportTest(unittest.TestCase):
                 "attainment": {"table": "facts", "op": "ratio_of_sums", "field": "amount", "denominator": "amount",
                                "when": {"kind": "actual"}, "denominator_when": {"kind": "target"},
                                "dimensions": ["org_code"], "scale": "decimal"},
+                "growth": {"table": "facts", "op": "growth_of_sums", "field": "amount", "denominator": "amount",
+                           "when": {"kind": "actual"}, "denominator_when": {"kind": "actual"},
+                           "when_parameters": {"month": "current_period"},
+                           "denominator_parameters": {"month": "baseline_period"},
+                           "dimensions": [], "scale": "decimal"},
             },
         }
         items_map = {
             "/facts": {"ver": 1, "items": [
                 {"month": "2026-06", "org_code": "A1", "kind": "actual", "amount": "999", "flag": "Y"},
-                {"month": "2026-08", "org_code": "A1", "kind": "actual", "amount": "60", "flag": "Y"},
+                {"month": "2026-08", "org_code": "A1", "kind": "actual", "amount": "80", "flag": "Y"},
                 {"month": "2026-09", "org_code": "A1", "kind": "actual", "amount": "40", "flag": "Y"},
                 {"month": "2026-09", "org_code": "A1", "kind": "target", "amount": "80", "flag": "Y"},
                 {"month": "2026-09", "org_code": "A1", "kind": "actual", "amount": "500", "flag": None},
@@ -429,9 +445,23 @@ class DeclarativeReportTest(unittest.TestCase):
             res = report_queries.capture(91, dataset, source, {"facts", "dim_org"}, PRINCIPAL.emp_no,
                                          plans, {"orgs": ["A1", "B2"]}, 100, sample_rows=10)
             self.assertEqual(res["summary"]["sample_rows"], [
-                ["A1", "华东大区", {"$decimal": "1.25"}],
+                ["A1", "华东大区", {"$decimal": "1.5"}],
                 ["B2", "华北大区", {"$decimal": "0.5"}],
             ])
+            encoded = plans["summary"].model_dump_json(by_alias=True)
+            restored = report_queries.QueryPlan.model_validate_json(encoded)
+            self.assertEqual(report_queries.plan_hash(restored), report_queries.plan_hash(plans["summary"]))
+            self.assertNotIn('"ne"', json.loads(encoded)["where"]["month"])
+            self.assertIsNone(json.loads(encoded)["where"]["flag"]["ne"])
+            # 期间按行存放时，两个期间由登记的公式参数分别绑定，可复用同一个计划换账期。
+            growth = report_queries.QueryPlan(table="facts", metrics=["growth"], where={"org_code": "A1", "flag": "Y"})
+            result = report_queries.capture(91, dataset, source, {"facts"}, PRINCIPAL.emp_no, {"growth": growth},
+                                            {"current_period": "2026-09", "baseline_period": "2026-08"}, 100)
+            self.assertEqual(result["growth"]["sample_rows"], [[{"$decimal": "-0.5"}]])
+            items_map["/orgs"]["items"].append({"code": "A1", "org_name": "同键维表行"})
+            with self.assertRaisesRegex(ConnectorError, "匹配键不唯一"):
+                report_queries.capture(91, dataset, source, {"facts", "dim_org"}, PRINCIPAL.emp_no,
+                                       plans, {"orgs": ["A1", "B2"]}, 100)
             with self.assertRaises(PermissionDenied):
                 report_queries.capture(91, dataset, source, {"facts"}, PRINCIPAL.emp_no,
                                        plans, {"orgs": ["A1"]}, 100)
@@ -463,6 +493,9 @@ class DeclarativeReportTest(unittest.TestCase):
                 patch.object(repo, "get_dataset", return_value=DATASET), \
                 patch.object(repo, "get_datasource", return_value=rotated_source):
             report_spec.validate_scopes([recorded], PRINCIPAL)
+            legacy = {key: val for key, val in recorded.items() if key not in ("source_target", "source_target_version")}
+            with self.assertRaises(PermissionDenied):
+                report_spec.validate_scopes([legacy], PRINCIPAL)
         changed_host = {**rotated_source, "config": {**rotated_source["config"], "host": "other.internal"}}
         with patch.object(report_spec, "access_for", return_value=access), \
                 patch.object(repo, "get_dataset", return_value=DATASET), \
@@ -479,9 +512,14 @@ class DeclarativeReportTest(unittest.TestCase):
     def test_deflate_inflate_roundtrip_and_merge_deduplicates_echarts(self):
         spec, payload = fixture()
         _, expanded, _ = report_spec.compile_report(spec, {"facts": payload}, 91, {})
-        deflated = report_data.deflate_static(expanded)
+        deflated, assets = report_data.deflate_static(expanded)
         self.assertLess(len(deflated), len(expanded) - 500_000)
-        restored = report_data.inflate_static(deflated)
+        # 镜像升级后也须读到入库时的脚本，且缺失或损坏的资产不能静默替换。
+        with patch.object(report_document, "echarts_js", return_value="changed"), \
+                patch.object(report_document, "formatters_js", return_value="changed"):
+            restored = report_data.inflate_static(deflated, lambda _: assets)
+        with self.assertRaisesRegex(report_data.ReportDataError, "脚本缺失"):
+            report_data.inflate_static(deflated, lambda _: {})
         self.assertEqual(sha256(restored.encode()).hexdigest(), sha256(expanded.encode()).hexdigest())
         self.assertEqual(restored, expanded)
         merged = report_document.merge_report_documents("月报合集", [

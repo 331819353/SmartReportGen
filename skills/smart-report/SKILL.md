@@ -17,7 +17,7 @@ description: 智能报告生成（SmartReportGen）。按业务场景新建、�
 
 ### 新建报告
 
-1. 用原始需求调用 `search_business_scenarios`。按业务对象、分析口径和数据范围判断是否匹配已有授权场景。已有适用场景就直接引用并进入第 2 步。用户已经明确指定场景时核对其授权并复用。
+1. 场景未知时，用原始需求调用 `search_business_scenarios(query, include_context="structured"|"free")`。按业务对象、分析口径和数据范围判断是否匹配已有授权场景。高相关且无歧义的首个结果会附第 2 步所需 `context`。确定使用该场景后直接复用。用户已明确指定 `dataset_id` 时直接用第 2 步的 `prepare_report_context` 核对授权并读取上下文。
 2. **只有找不到适用场景时才进入「构建业务场景」分支。** 可换场景名称或业务术语再检索一次。若已知场景存在但当前员工缺少访问权，引导申请授权。否则可先调用 `list_scene_datasources` 查看当前账号已获开放的数据源、表和固定行范围，征得用户确认后通过 `save_business_scenario` 直接协助构建业务场景与官方指标；或给出工具返回的 `scenario_management_url` 引导用户打开「业务场景 → 新建业务场景」（支持可视化配置官方指标）。
 3. 场景确定后，数据源固定的行范围持续生效，随即从第 2 步开始设计。缺少可引用数据源时，联系管理员配置数据源或开放所需表。
 
@@ -27,7 +27,7 @@ description: 智能报告生成（SmartReportGen）。按业务场景新建、�
 
 ## 2. 根据分析思路、表元数据和样式设计模板
 
-1. **一步加载上下文。** 已知 `dataset_id` 后优先调用 `prepare_report_context(dataset_id, mode="structured"|"free")` 一次获取业务场景（`analysis_approach`、授权表、固定行范围、`semantic_metrics`）、前 10 张授权表的轻量画像、生效样式（含 `style_id`）及模板契约；表数量超过 10 张时再用 `describe_tables(include_profile=true, offset=...)` 翻页查看。单表需要全表统计时才调用 `describe_table(mode="full")`。
+1. **一步加载上下文。** 复用检索返回的 `context`，或调用 `prepare_report_context(dataset_id, mode="structured"|"free")` 一次获取业务场景（`analysis_approach`、授权表、固定行范围、`semantic_metrics`）、前 10 张授权表的轻量画像、生效样式（含 `style_id`）及模板契约。表数量超过 10 张且需要查看更多候选时，再用 `describe_tables(include_profile=true, offset=...)` 翻页查看。单表需要全表统计时才调用 `describe_table(mode="full")`。
 2. **确认事实和联动。** 上游已有正式汇总值时，优先按期间、组织等维度筛选、直取所需字段，例如总体值、目标、同比和完成率。缺少预聚合口径时，使用场景负责人登记且允许当前分组的官方公式（支持 `when`/`denominator_when` 跨行条件聚合，过滤字段独立于分组 `dimensions`）。`QueryPlan` 支持区间（`gte`/`lte`）、`in`/`not_in`、`ne` 及受控维表 `joins`。探查阶段可用 `run_query` 核实字段、值域、唯一性及实际引用的 `tables_used`；**正式报告所需的单组或多组快照统一用 `query_report_data(..., sample_rows=200)` 一次按同批次获取**（≤200 行且未触发上限时直接复用其 `sample_rows` 与 `snapshot_id` 传入 `bindings`）。当前筛选缺少同口径唯一事实时，相关结论、数字和状态一起显示缺数。结构化正文用 `{{metric}}`（支持 `format.kind="text"` 绑定账期、名称等事实），自由版式正文用 `<srg-val>` 绑定数字。多粒度筛选下需要切换总计与明细的图表/表格，可为卡片配置 `sources` 或 `where`。
 3. **落实生效样式。** 使用 `prepare_report_context` 返回的 `style` 或单独调用 `get_style_rules(..., include_css=false)` 获取样式与规则，按当前用户明确要求、场景规则、通用规则、内置默认的优先级应用。用 `format` 声明精度、单位、比例尺度和判定阈值。按需求配置主题、卡片、图例、状态色等展示选项。
 4. **保存设计结果。** 按需求选模板。标准卡片和图表用 `save_report_spec`（更新协作模板可传 `expected_version`）。需要自定义版式、按模块拼装或更细的 ECharts 视觉时，用 `save_free_report_template`，保存页面骨架、分模块 HTML/CSS 和受管数据槽位。两类模板都保存取数计划、字段绑定、筛选联动和展示规则。使用返回的 `template_id` 与版本进入第 3 步。用 `business_summary` 记录用途和重要口径，有未覆盖的分析项或权限限制时在交付中说明。
@@ -42,7 +42,7 @@ description: 智能报告生成（SmartReportGen）。按业务场景新建、�
 
 ## 4. 正式发布前验收
 
-结构化模板调用 `preview_report_spec`，自由版式调用 `preview_free_report`。新建时可填模板 ID 和版本，修订时填 `report_id` 和修订分支锁定的 `base_version`。服务端检查字段与数据范围，审计源和展开后的 HTML，并用 Chromium 核对正文、卡片、表格、图表、筛选与重置、状态颜色、桌面和窄屏、离线运行。请重点核查预览返回的 `warnings` 及 `verification.empty_on_default` / `always_empty_cards` / `always_missing_metrics`，确认没有因筛选映射遗漏或类别重复导致的空图。业务归因和有歧义的口径仍需根据证据核实。验收发现问题时回到相应环节修正，重新预览。通过 `get_preview_file(preview_id, offset, chars)` 可以在已登录的 MCP 通道分页读取正式预览。
+结构化模板调用 `preview_report_spec`，自由版式调用 `preview_free_report`。新建时可填模板 ID 和版本，修订时填 `report_id` 和修订分支锁定的 `base_version`。服务端检查字段与数据范围，审计源和展开后的 HTML，并用 Chromium 核对正文、卡片、表格、图表、筛选与重置、状态颜色、桌面和窄屏、离线运行。全部受测状态均无有效卡片或指标时，预览会阻断发布。请核查返回的 `warnings` 及 `verification.empty_on_default` / `always_empty_cards` / `always_missing_metrics`，确认没有因筛选映射遗漏或类别重复导致的空图。业务归因和有歧义的口径仍需根据证据核实。验收发现问题时回到相应环节修正，重新预览。通过 `get_preview_file(preview_id, offset, chars)` 可以在已登录的 MCP 通道分页读取正式预览。
 
 ## 5. 锁定验收结果并保存版本
 

@@ -453,8 +453,10 @@ const RATIO_METRIC_OPS = new Set(['ratio_of_sums', 'growth_of_sums']);
 
 function metricDraftFromEntry(name = '', m = {}) {
   const extra = {};
-  if (m.when && Object.keys(m.when).length) extra.when = m.when;
-  if (m.denominator_when && Object.keys(m.denominator_when).length) extra.denominator_when = m.denominator_when;
+  // 高级条件可以在 JSON 模式维护；切回表单时保留它们。
+  for (const key of ['when', 'denominator_when', 'when_parameters', 'denominator_parameters']) {
+    if (m[key] && Object.keys(m[key]).length) extra[key] = m[key];
+  }
   return {
     id: ++sceneTableKey,
     name,
@@ -500,7 +502,11 @@ function draftsToMetrics(drafts = []) {
       entry.filter_dimensions = (row.filterDimsTxt || '').split(/[,，]/).map(s => s.trim()).filter(Boolean);
     }
     if (row.extra?.when) entry.when = row.extra.when;
-    if (row.extra?.denominator_when) entry.denominator_when = row.extra.denominator_when;
+    if (row.extra?.when_parameters) entry.when_parameters = row.extra.when_parameters;
+    if (BINARY_METRIC_OPS.has(entry.op)) {
+      if (row.extra?.denominator_when) entry.denominator_when = row.extra.denominator_when;
+      if (row.extra?.denominator_parameters) entry.denominator_parameters = row.extra.denominator_parameters;
+    }
     out[name] = entry;
   }
   return out;

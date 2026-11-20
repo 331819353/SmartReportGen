@@ -430,24 +430,23 @@ def for_edit(html: str) -> str:
     return _DataBlocks(html).replace(fold)
 
 
-def deflate_static(html: str) -> str:
-    """入库前折迭与当前内置完全一致的固定静态脚本，保留业务数据与样式不变。"""
+def deflate_static(html: str) -> tuple[str, dict[str, str]]:
+    """仅折叠可无损还原的内置脚本，并返回要按内容哈希存储的原始字节。"""
     lower = html.lower()
     if VENDOR_MARKER not in lower and ASSET_MARKER not in lower:
-        return html
+        return html, {}
     parser = _DataBlocks(html)
     echarts = report_document.echarts_js()
     formatters = report_document.formatters_js()
+    assets = {}
 
     def fold(block: _DataBlock) -> tuple[str, str] | None:
         if block.fields[block.marker] != "embedded":
             return None
         if block.kind == "vendor":
             expected = echarts
-            ref = "echarts"
         elif block.kind == "asset":
             expected = formatters
-            ref = "report-formatters.js"
         else:
             return None
         if block.data != expected:
@@ -457,25 +456,38 @@ def deflate_static(html: str) -> str:
         )
         if html[block.start:block.end] != f"<{block.tag} {attributes}>{block.data}</{block.tag}>":
             return None
-        return ref, ""
+        digest = sha256(expected.encode()).hexdigest()
+        assets[digest] = expected
+        return f"sha256:{digest}", ""
 
-    return parser.replace(fold)
+    return parser.replace(fold), assets
 
 
-def inflate_static(html: str) -> str:
-    """读取时无损还原被折迭的内置静态脚本，确保对外字节和 SHA-256 完全一致。"""
+def inflate_static(html: str, load_assets: Callable[[set[str]], dict[str, str]]) -> str:
+    """按该报告引用的脚本版本恢复 HTML，兼容升级前保存的固定名称占位符。"""
     lower = html.lower()
-    if f'{VENDOR_MARKER}="echarts"' not in lower and f'{ASSET_MARKER}="report-formatters.js"' not in lower:
+    if not any(ref in lower for ref in (f'{VENDOR_MARKER}="echarts"', f'{ASSET_MARKER}="report-formatters.js"',
+                                        f'{VENDOR_MARKER}="sha256:', f'{ASSET_MARKER}="sha256:')):
         return html
+    parser = _DataBlocks(html)
+    digests = {ref[7:] for block in parser.blocks if block.kind in ("vendor", "asset") and not block.data.strip()
+               if (ref := block.fields[block.marker]) and re.fullmatch(r"sha256:[a-f0-9]{64}", ref)}
+    assets = load_assets(digests) if digests else {}
+    if any(digest not in assets or sha256(assets[digest].encode()).hexdigest() != digest for digest in digests):
+        raise ReportDataError("报告引用的离线脚本缺失或内容校验失败")
 
     def expand(block: _DataBlock) -> tuple[str, str] | None:
         ref = block.fields[block.marker] or ""
         if block.data.strip():
             return None
+        if block.kind in ("vendor", "asset") and ref.startswith("sha256:"):
+            if ref[7:] not in assets:
+                raise ReportDataError("报告引用的离线脚本标识无效")
+            return "embedded", assets[ref[7:]]
         if block.kind == "vendor" and ref == "echarts":
             return "embedded", report_document.echarts_js()
         if block.kind == "asset" and ref == "report-formatters.js":
             return "embedded", report_document.formatters_js()
         return None
 
-    return _DataBlocks(html).replace(expand)
+    return parser.replace(expand)

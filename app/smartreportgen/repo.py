@@ -15,7 +15,7 @@ from .embedding import EmbeddingError, embed_many, to_pgvector
 from .permission import PermissionDenied, source_scene_tables
 from .report_document import report_document_error
 from .scenario_filters import table_filters, table_sql
-from .textproc import add_words, tokenize
+from .textproc import add_words, scenario_tokens, tokenize
 
 log = logging.getLogger(__name__)
 
@@ -146,13 +146,13 @@ def delete_datasource(ds_id: int) -> None:
 
 # ============================ 数据集 ============================
 def _dataset_index(ds: dict, tables: list[dict]) -> dict:
-    kw_a = tokenize(" ".join([ds["business_scenario"], *ds.get("tags", [])]))
+    kw_a = scenario_tokens(" ".join([ds["business_scenario"], *ds.get("tags", [])]))
     kw_a += [w for w in [ds["business_scenario"].lower(), *[t.lower() for t in ds.get("tags", [])]] if w not in kw_a]
     approach = ds.get("analysis_approach") or ""
-    kw_b = tokenize(f"{ds.get('business_description') or ''} {approach}")
+    kw_b = scenario_tokens(f"{ds.get('business_description') or ''} {approach}")
     metrics = ds.get("semantic_metrics") or {}
     metric_text = " ".join(f"{k.replace('_', ' ')} {m.get('description') or ''}" for k, m in metrics.items())
-    kw_c = tokenize(
+    kw_c = scenario_tokens(
         " ".join(f"{t['table_name'].replace('_', ' ')} {t.get('table_description') or ''}" for t in tables)
         + (" " + metric_text if metric_text else "")
     )
@@ -189,9 +189,14 @@ def reindex_dataset(dataset_id: int) -> None:
     db.execute(
         "UPDATE dataset.dataset SET kw_a=%s, kw_b=%s, kw_c=%s, kw_all=%s, embedding=%s::vector, embedding_sig=%s "
         "WHERE id=%s",
-        (idx["kw_a"], idx["kw_b"], idx["kw_c"], idx["kw_all"], vec, settings.embedding_signature if vec else None,
+        (idx["kw_a"], idx["kw_b"], idx["kw_c"], idx["kw_all"], vec, _dataset_index_signature() if vec else None,
          dataset_id),
     )
+
+
+def _dataset_index_signature() -> str:
+    # 分析思路、指标描述与同义词规则纳入索引后，启动时补齐已有场景。
+    return f"{settings.embedding_signature}:scenario-v2"
 
 
 def _contains_pattern(q: str) -> str:
@@ -812,7 +817,7 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
         del row["markdown"]
         del row["source_owner"]
     if with_html and row.get("html"):
-        row["html"] = report_data.inflate_static(row["html"])
+        row["html"] = _read_report_html(row)
     return row
 
 
@@ -836,6 +841,94 @@ def report_spec_hash(html: str) -> str:
     from hashlib import sha256
 
     return sha256(html.encode()).hexdigest()
+
+
+def _load_report_assets(c, digests: set[str]) -> dict[str, str]:
+    return {row["sha256"]: row["body"] for row in c.execute(
+        "SELECT sha256, body FROM report.static_asset WHERE sha256=ANY(%s)", (sorted(digests),))}
+
+
+def _read_report_html(row: dict, connection=None) -> str:
+    def load(digests):
+        if connection is not None:
+            return _load_report_assets(connection, digests)
+        with db.conn() as c:
+            return _load_report_assets(c, digests)
+
+    html = report_data.inflate_static(row["html"], load)
+    expected = row["meta"].get("verification", {}).get("html_sha256")
+    if expected and report_spec_hash(html) != expected:
+        raise Invalid("保存的报告正文与原验收证据不一致，无法原样交付")
+    return html
+
+
+def _store_report_html(c, html: str) -> str:
+    folded, assets = report_data.deflate_static(html)
+    if assets:
+        known = {row["sha256"] for row in c.execute(
+            "SELECT sha256 FROM report.static_asset WHERE sha256=ANY(%s)", (sorted(assets),))}
+        for digest in sorted(assets.keys() - known):
+            # 并发写入相同脚本时在唯一键上合并，脚本与报告版本在同一事务提交。
+            c.execute("INSERT INTO report.static_asset(sha256, body) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                      (digest, assets[digest]))
+    return folded
+
+
+def migrate_report_versions() -> None:
+    """为可核实的历史版本固定离线脚本和数据源指纹，并清理主记录里的重复正文。"""
+    from .report_queries import source_target_hash
+
+    with db.conn() as c, c.transaction():
+        c.execute("SELECT pg_advisory_xact_lock(4242002)")
+        key = "report_evidence_migration_v1"
+        if c.execute("SELECT 1 FROM sys.setting WHERE key=%s", (key,)).fetchone():
+            return
+        c.execute("UPDATE report.report r SET html='' FROM report.report_version v "
+                  "WHERE v.report_id=r.id AND v.version=r.revision AND r.html<>'' AND r.html=v.html")
+        with c.cursor(name="legacy_report_assets") as rows:
+            # 旧正文可能各自内联完整图表库，分批读取避免启动时一次加载所有大文档。
+            rows.itersize = 16
+            rows.execute("SELECT report_id, version, html, meta FROM report.report_version "
+                         "WHERE html LIKE ANY(%s) FOR UPDATE", ([
+                             '%data-srg-vendor="echarts"%', '%data-srg-asset="report-formatters.js"%',
+                             '%data-srg-vendor="embedded"%', '%data-srg-asset="embedded"%',
+                         ],))
+            for row in rows:
+                try:
+                    html = _read_report_html(row, c)
+                    stored_html = _store_report_html(c, html)
+                except (Invalid, report_data.ReportDataError):
+                    # 原始字节不可恢复时保留记录，以便从备份修复。
+                    log.warning("无法核实旧脚本，保留原记录：报告 %s 版本 %s", row["report_id"], row["version"])
+                    continue
+                if stored_html != row["html"]:
+                    c.execute("UPDATE report.report_version SET html=%s WHERE report_id=%s AND version=%s",
+                              (stored_html, row["report_id"], row["version"]))
+        # 历史记录仅在来源修订可核实时升级。锁定来源直到迁移完成，避免同时修改地址。
+        sources = {row["id"]: row for row in c.execute(
+            "SELECT id, type, config, updated_at FROM datasource.datasource FOR SHARE")}
+        rows = c.execute(
+            "SELECT report_id, version, meta FROM report.report_version "
+            "WHERE jsonb_path_exists(meta, '$.scopes[*] ? (!exists(@.source_target_version))') FOR UPDATE"
+        ).fetchall()
+        for row in rows:
+            meta = row["meta"]
+            scopes = [*meta["scopes"], *(o["scope"] for o in meta.get("snapshot_origins", {}).values() if o.get("scope"))]
+            changed = False
+            for scope in scopes:
+                source = sources.get(scope["source_id"])
+                if (source is None or "source_target_version" in scope
+                        or str(source["updated_at"]) != scope.get("source_revision")):
+                    continue
+                prior = scope.get("source_target")
+                if prior is not None and prior != source_target_hash(source, scope["tables"], version=1):
+                    continue
+                scope.update(source_target=source_target_hash(source, scope["tables"]), source_target_version=2)
+                changed = True
+            if changed:
+                c.execute("UPDATE report.report_version SET meta=%s WHERE report_id=%s AND version=%s",
+                          (db.jsonb(meta), row["report_id"], row["version"]))
+        c.execute("INSERT INTO sys.setting(key, value) VALUES (%s, 'done')", (key,))
 
 
 def _report_name(name: str) -> str:
@@ -867,8 +960,8 @@ def save_report(name: str, html: str, template_id: int | None, template_version:
         raise Invalid(error)
     name = _report_name(name)
     meta = {**meta, "html_bytes": len(html.encode()), "html_chars": len(html), "single_file": True}
-    stored_html = report_data.deflate_static(html)
     with db.conn() as c, c.transaction():
+        stored_html = _store_report_html(c, html)
         row = c.execute(
             "INSERT INTO report.report(name, template_id, template_version, html, meta, created_by) "
             "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id, name, template_id, template_version, meta, created_at, created_by",
@@ -949,8 +1042,8 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
                               (report_id, base_version)).fetchone(), "报告版本")
         _require_report_data({**base, "created_by": row["created_by"]}, principal)
         meta, source = (base["meta"], base) if rendered is None else rendered
-        base_html = report_data.inflate_static(base["html"])
         if rendered is None:
+            base_html = _read_report_html(base, c)
             # 管理台仍可更新名称或说明。业务正文变更须经过新编译和验收。
             if html is not None and html not in (base_html, report_data.for_edit(base_html)):
                 raise Invalid("正文变更请用声明式模板生成已验收的修订预览")
@@ -968,7 +1061,8 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
             raise Invalid(error)
         meta = {**meta, "html_bytes": len(html.encode()), "html_chars": len(html),
                 "single_file": rendered is not None or meta.get("single_file", False)}
-        stored_html = report_data.deflate_static(html) if meta["single_file"] else html
+        # 仅改名称或说明时直接复用已核对的存储字节，沿用旧版本的脚本引用。
+        stored_html = base["html"] if rendered is None else _store_report_html(c, html)
         version = row["revision"] + 1
         template_id, template_version = source.get("template_id", base["template_id"]), source["template_version"]
         _insert_report_version(c, report_id, version, base_version, name, stored_html, meta, template_id,
@@ -1054,7 +1148,8 @@ def revoke_report_share(report_id: int, principal: Principal, emp_no: str) -> No
 def reindex_all(only_stale: bool = False) -> dict:
     cond = " WHERE embedding_sig IS DISTINCT FROM %s" if only_stale else ""
     params = (settings.embedding_signature,) if only_stale else None
-    ds_ids = [r["id"] for r in db.fetchall("SELECT id FROM dataset.dataset" + cond, params)]
+    ds_ids = [r["id"] for r in db.fetchall("SELECT id FROM dataset.dataset" + cond,
+                                          (_dataset_index_signature(),) if only_stale else None)]
     rule_ids = [r["id"] for r in db.fetchall("SELECT id FROM style_rule.style_rule" + cond, params)]
     for i in ds_ids:
         reindex_dataset(i)
