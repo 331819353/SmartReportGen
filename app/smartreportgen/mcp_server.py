@@ -2,14 +2,7 @@
 
 认证：每个请求通过 Authorization: Bearer 携带海尔 IAM access token；经 IAM 核实的工号用于查询权限表，
       决定可检索的业务场景与可访问的数据表。数据访问一律默认拒绝。
-工具按智能报告生成流程组织：
-  1. search_business_scenarios → get_dataset_tables
-  2. describe_tables / describe_table / run_query
-  3. 设计全局筛选、联动与结论指标着色（Agent 分析与设计，无独立 MCP 工具）
-  4. get_style_rules
-  5. save_report_spec / save_free_report_template / get_report_template
-  6. 模块编排 → preview_report_spec / preview_free_report → save_report
-  7. get_report / revise_report
+报告生成流程：授权场景检索 → Markdown 指南与快照 → HTML 分块拼装 → Chromium 校验入库。
 """
 from __future__ import annotations
 
@@ -31,15 +24,13 @@ from starlette.responses import JSONResponse
 
 from psycopg.errors import UniqueViolation
 
-from . import auth, db, design, repo, report_browser, report_data, report_free, report_pipeline, report_queries, report_spec, services
+from . import auth, db, design, repo, report_browser, report_data, report_draft, report_pipeline, report_queries, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
 from .permission import Access, PermissionDenied, access_for, source_scene_tables
 from .scenario_filters import effective_filters
-from .renderer import RenderError, validate as validate_md
-from .report_document import inline_legacy_echarts, report_document_error, skill_dir
-from .template_parser import TemplateError
+from .report_document import skill_dir
 from .telemetry import measure, observe_tool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -47,7 +38,6 @@ log = logging.getLogger("smartreportgen.mcp")
 
 SKILL_DIR = skill_dir()
 SKILL_FILE = SKILL_DIR / "SKILL.md"
-SPEC_FILE = SKILL_DIR / "references" / "template-spec.md"
 EXAMPLE_FILE = SKILL_DIR / "references" / "example-report.html"
 
 
@@ -63,9 +53,9 @@ def _skill_body() -> str:
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP。用 get_skill_guide 获取从报告分流到验收保存的主流程。
 先区分新建与修订。修订用报告链接或 list_reports 定位，多个匹配候选先请用户确认，再按 get_report 返回的 revision 锁定基准。
 新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景时，可用 list_scene_datasources 查看开放数据源与固定范围并配合 save_business_scenario 协助建场景，或给出 scenario_management_url 引导用户配置。
-已知场景后优先调用 prepare_report_context 一步加载分析思路、表画像、生效样式与模板契约，再以 query_report_data 同批次取数或核对证据。
-派生采用场景负责人登记的官方指标，多组报告数据使用同批快照。结构化模板用 save_report_spec（可选 expected_version）。自由版式用 save_free_report_template 保存 HTML/CSS 和受管绑定，
-用 patch_free_report_template 按模块修改。用对应的 preview_report_spec 或 preview_free_report 整页验收，核对返回 warnings 后提交验收通过的 preview_id。
+已知场景后调用 prepare_report_context 获取分析思路、表画像、Markdown 指南摘要和生效样式。
+读取匹配的指南，用 run_query(snapshot=True) 取得授权快照，创建 HTML 草稿并分轮填写章节。
+默认用 save_report 或 revise_report 提交 draft_id，服务端按需运行离线 Chromium。先审阅时可调用 verify_html_draft。
 采用海尔 IAM，场景及事实来源受当前员工授权约束。"""
 
 mcp = FastMCP("smartreportgen", instructions=INSTRUCTIONS, stateless_http=True, json_response=True)
@@ -74,7 +64,18 @@ mcp = FastMCP("smartreportgen", instructions=INSTRUCTIONS, stateless_http=True, 
 def _tool():
     """同步业务函数在线程池运行，避免慢查询阻塞整个 MCP 事件循环。"""
     def register(fn):
-        observed = observe_tool(fn)
+        @wraps(fn)
+        def guarded(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except _EXPECTED as exc:
+                return _err(exc)
+            except Exception as exc:
+                # 业务失败统一返回可观测结果，内部异常类型入日志，避免记录业务内容和凭证。
+                log.error("工具 %s 遇到内部异常：%s", fn.__name__, type(exc).__name__)
+                return {"ok": False, "error_type": "internal_error", "error": "工具执行失败，请按调用标识查询服务日志"}
+
+        observed = observe_tool(guarded)
 
         @wraps(fn)
         async def dispatch(*args, **kwargs):
@@ -87,7 +88,7 @@ def _tool():
     return register
 
 
-_EXPECTED = (repo.NotFound, repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeError, ValueError,
+_EXPECTED = (repo.NotFound, repo.Invalid, ConnectorError, RuntimeError, ValueError,
              PermissionDenied, AuthError)
 
 
@@ -101,6 +102,8 @@ def _err(e: Exception) -> dict:
         out["error_type"] = "permission_denied"
     if isinstance(e, repo.ReportConflict):
         out["error_type"] = "conflict"
+    if isinstance(e, report_browser.ReportVerifyError):
+        out.update(error_type="verify_failed", failed_stage=e.stage, diagnostics=e.diagnostics)
     return out
 
 
@@ -126,19 +129,8 @@ def _require_dataset(acc: Access, dataset_id: int) -> None:
         raise PermissionDenied(f"{acc.principal.label} 无权访问该业务场景（dataset_id={dataset_id}）")
 
 
-def _guard(acc: Access):
-    def g(dataset: dict | None) -> set[str] | None:
-        if dataset:
-            _require_dataset(acc, dataset["id"])
-            return None if acc.all else acc.tables.get(dataset["id"], set())
-        if not acc.all:
-            raise PermissionDenied("请为查询关联有权限的业务场景，并使用该场景的数据源")
-        return None
-    return g
-
-
 def _owner(acc: Access) -> str | None:
-    """非管理员只能看到/修改自己创建的模板与报告。"""
+    """返回非管理员的工号，用于模板查询同时匹配创建人和场景授权。"""
     return None if acc.all else (acc.principal.emp_no or "")
 
 
@@ -182,7 +174,7 @@ def whoami(ctx: Context) -> dict:
 # ============================== 1. 场景检索 ==============================
 @_tool()
 def search_business_scenarios(query: str, ctx: Context, top_k: int = 3,
-                              include_context: Literal["structured", "free"] | None = None) -> dict:
+                              include_context: bool = False) -> dict:
     """根据用户需求，在【当前员工有权限】的业务场景中做混合检索（向量 + 关键词，RRF 融合），
     返回最匹配的业务场景、分析思路及已授权表，并给出管理台业务场景入口。query 宜使用用户的原始需求。
     include_context 可在首个结果相关且与下一名有足够差距时一并返回其模板设计上下文。"""
@@ -214,7 +206,7 @@ def search_business_scenarios(query: str, ctx: Context, top_k: int = 3,
     result = {"ok": True, "query_tokens": res["query_tokens"], "hits": hits[:requested], "warnings": res["warnings"], "tip": tip,
               "scenario_management_url": f"{settings.public_base_url}/#datasets"}
     if include_context and hits and not tip:
-        result["context"] = prepare_report_context(hits[0]["dataset_id"], ctx, query, mode=include_context)
+        result["context"] = prepare_report_context.__wrapped__(hits[0]["dataset_id"], ctx, query)
     return _ok(result)
 
 
@@ -374,9 +366,8 @@ def describe_tables(dataset_id: int, ctx: Context, table_names: list[str] | None
 
 @_tool()
 def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
-                           mode: Literal["structured", "free"] = "structured",
                            sample_rows: int = 5, profile_rows: int = 100) -> dict:
-    """一步加载业务场景（分析思路、授权表、官方指标）、前 10 张表轻量画像、生效样式（含 style_id）与模板契约。"""
+    """一步加载业务场景（分析思路、授权表、官方指标）、前 10 张表轻量画像、生效样式（含 style_id）与 Markdown 指南。"""
     try:
         acc = _access(ctx)
         _require_dataset(acc, dataset_id)
@@ -386,7 +377,7 @@ def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
             sample_rows=sample_rows, profile_rows=profile_rows,
         )
         style = _resolve_style(acc.principal, ds["business_scenario"], query=query, include_css=False)
-        contract = get_free_report_spec() if mode == "free" else get_report_spec()
+        templates = repo.list_templates(owner=_owner(acc), dataset_id=dataset_id, allowed_datasets=acc.dataset_ids())
         return _ok({
             "ok": True,
             "scenario": _dataset_brief(ds, acc),
@@ -394,7 +385,9 @@ def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
             "total_tables": tables_page["total"],
             "next_offset": tables_page["next_offset"],
             "style": style,
-            "contract": contract,
+            "templates": [_template_brief(row) for row in templates[:50]],
+            "html_assembly_hint": "用 create_html_draft 绑定数据块与 snapshot_id，分轮编写章节。"
+                                  "浏览器端通过 window.SRG.rows(blockId) 访问授权快照。",
         })
     except _EXPECTED as e:
         return _err(e)
@@ -437,7 +430,7 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
     """在业务场景上执行只读 SQL（单条 SELECT/WITH），只能引用该场景中当前员工有权限的表或视图。
     场景的逐表取值条件由服务端在 JOIN、聚合前自动应用。
     SQL 方言与数据源类型一致（API 使用 DuckDB）。返回实际引用的 tables_used，列名统一转小写。
-    普通模式默认返回至多 200 行；按完整业务口径选择源端正式指标和证据行，不自行聚合补算业务值。
+    普通模式默认返回至多 200 行；支持按正式业务口径进行只读聚合、算术、排序及去重。
     snapshot=true 将完整 SQL 结果保存为 JSON，由报告使用 snapshot_id 引用。
     MCP 仅返回行数和少量明细样本（sample_rows 0–200），≤200 行的正式查询可一次同时取得完整证据与快照。
     truncated=true 表示超过返回行数上限，未创建快照；请缩小到所需正式指标或完整分批查询。
@@ -457,14 +450,14 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
                 result["warning"] = "查询结果超过行数上限，未保存快照。请缩小到所需正式指标或按完整口径分批查询。"
             else:
                 with measure("snapshot.write"):
+                    # 来源是否完整和权限是两项证据，探查快照也要记录经校验的表与行范围。
+                    origin = {"scope": report_queries.scope_for(dataset_id, ds, ds_row, result["tables_used"]),
+                              "consistency": "single_statement", "scales": {},
+                              "source_complete": result.get("source_complete", True)}
                     result.update(report_data.save_query(acc.principal.emp_no, result["columns"], rows,
-                                                         max(0, min(sample_rows, 200)),
-                                                         origin={"scope": report_queries.scope_for(dataset_id, ds, ds_row,
-                                                                                                  result["tables_used"]),
-                                                                 "consistency": "single_statement", "scales": {}}
-                                                         if result.get("source_complete", True) else None))
+                                                         max(0, min(sample_rows, 200)), origin=origin))
                 if result.get("source_complete") is False:
-                    result["warning"] = "API 未确认全量，该快照仅供探查，正式报告使用已配置完整合同的取数计划。"
+                    result["warning"] = "API 未确认全量，该快照仅供探查，正式报告须取得来源确认完整的快照。"
         return _ok({"ok": True, **result})
     except _EXPECTED as e:
         return _err(e)
@@ -472,33 +465,20 @@ def run_query(dataset_id: int, sql: str, ctx: Context, limit: int | None = None,
 
 @_tool()
 def get_skill_guide(include_example: bool = False,
-                    reference: Literal["fact-contract", "green-energy-september-facts", "display-contract", "declarative-report", "free-report"] | None = None,
-                    asset: Literal["report-formatters.js", "audit_report.py"] | None = None) -> str:
-    """返回 smart-report 技能全文：报告生成与修订流程、分析方法、权限及交付要求。
-    适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。
-    reference 可附带取数、展示及模板契约。旧绿能参考标识返回现行取数契约和历史复现说明。
-    asset 单独返回格式化模块或可执行审计脚本的完整原文，供没有本地技能的 agent 保存到同一目录；不可与其他选项并用。"""
+                    reference: Literal["fact-contract", "display-contract", "html-assembly"] | None = None,
+                    asset: Literal["report-formatters.js"] | None = None) -> str:
+    """返回 smart-report 技能原文，可附加取数、展示或 HTML 拼装说明。"""
     if asset is not None:
-        # 固定资产白名单，不开放客户端任意路径读取，也不在返回代码前混入技能正文。
-        if asset not in {"report-formatters.js", "audit_report.py"}:
-            raise ValueError("不支持的技能资产")
-        if reference is not None or include_example:
-            raise ValueError("asset 不能与 reference 或 include_example 同时使用")
+        if asset != "report-formatters.js" or reference is not None or include_example:
+            raise ValueError("资产仅支持 report-formatters.js，须单独读取")
         return (SKILL_DIR / "assets" / asset).read_text(encoding="utf-8")
     text = _skill_body()
-    if reference == "green-energy-september-facts":
-        # 已分发的客户端仍可调用旧标识。历史附件只有在用户指定基准后才用于核对。
-        text += "\n\n历史案例已归档。复现时先确认用户指定的报告版本和原始资料，再按授权取得同口径事实。"
-        reference = "fact-contract"
     if reference is not None:
-        # 仅允许已维护的参考名，不能把客户端参数当作任意文件路径读取。
-        files = {"fact-contract": "fact-contract.md", "display-contract": "display-contract.md",
-                 "declarative-report": "declarative-report.md", "free-report": "free-report.md"}
-        if reference not in files:
+        if reference not in {"fact-contract", "display-contract", "html-assembly"}:
             raise ValueError("不支持的技能参考文档")
-        text += "\n\n---\n\n" + (SKILL_DIR / "references" / files[reference]).read_text(encoding="utf-8")
+        text += "\n\n---\n\n" + (SKILL_DIR / "references" / f"{reference}.md").read_text(encoding="utf-8")
     if include_example:
-        text += "\n\n## 附：筛选联动与结论动态着色的 HTML 示例\n\n```html\n" + EXAMPLE_FILE.read_text(encoding="utf-8") + "```\n"
+        text += "\n\n## 附：筛选联动 HTML 示例\n\n```html\n" + EXAMPLE_FILE.read_text(encoding="utf-8") + "\n```\n"
     return text
 
 
@@ -508,13 +488,6 @@ def smart_report_prompt(requirement: str) -> str:
             "\n\n请严格按以上流程，使用 smartreportgen MCP 工具完成报告并交付验收通过的版本。")
 
 
-@_tool()
-def get_template_spec() -> str:
-    """返回服务端结构化报告模板的 Markdown 语法。维护结构化模板时使用。直接编写 HTML 报告时参考 get_skill_guide。"""
-    return SPEC_FILE.read_text(encoding="utf-8")
-
-
-# ============================== 4. 样式规则 ==============================
 def _resolve_style(principal: Principal, business_scenario: str, query: str = "", include_css: bool = True) -> dict:
     res = repo.style_rules_for(business_scenario, query or None, owner=principal.emp_no)
     builtin = design.builtin_style(res["specified"]["theme"])
@@ -544,8 +517,7 @@ def _resolve_style(principal: Principal, business_scenario: str, query: str = ""
                  "items 各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
                  "当前用户明确展示要求优先，低层许可不能豁免高层禁止；不得以智能体判断放宽数字格式、单位、口径、缺失处理和状态色。"
                  "章节、图表类型、筛选维度及未指定的装饰样式由用户需求和数据证据决定。"
-                 "保存前按技能执行源文档审计、展开后六类展示面及边界复核和最终门禁，失败不得保存。"
-                 "使用服务端结构化模板渲染时，theme 会自动应用。"),
+                 "草稿引用 builtin_style.style_id 后自动内联主题。交付前复核展示，再提交 Chromium 校验。"),
         "warnings": res["warnings"],
     }
 
@@ -570,166 +542,6 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "", inclu
 
 # ============================== 5–7. 模板与报告 ==============================
 @_tool()
-def validate_report_template(markdown: str, ctx: Context, dataset_id: int | None = None, execute: bool = True) -> dict:
-    """校验旧结构化模板的语法、图表参数、度量表达式。execute=true 时按权限执行查询并检查字段引用。
-    新报告的模板及服务端验收流程使用 get_report_spec 与 preview_report_spec。"""
-    try:
-        acc = _access(ctx)
-        if dataset_id:
-            _require_dataset(acc, dataset_id)
-        return _ok(validate_md(markdown, dataset_id, execute, guard=_guard(acc), owner=acc.principal.emp_no))
-    except _EXPECTED as e:
-        return _err(e)
-
-
-@_tool()
-def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int | None = None,
-                         user_requirement: str = "", analysis_goal: str = "", template_id: int | None = None,
-                         business_summary: str | None = None,
-                         template_type: Literal["business", "structured"] | None = None) -> dict:
-    """维护历史 Markdown 和旧结构化源码。新报告使用 save_report_spec 保存声明式模板。"""
-    try:
-        acc = _access(ctx)
-        if dataset_id:
-            _require_dataset(acc, dataset_id)
-        data = {"name": name, "markdown": markdown, "dataset_id": dataset_id,
-                "user_requirement": user_requirement, "analysis_goal": analysis_goal}
-        if template_id:  # 更新时只覆盖调用方实际提供的字段
-            _check_owner(acc, repo.get_template(template_id).get("created_by"), "报告模板")
-            data = {k: v for k, v in data.items() if k == "markdown" or v not in (None, "")}
-        else:
-            data["created_by"] = acc.principal.emp_no
-        # 省略时兼容旧客户端，显式传空字符串可以清除说明。
-        if business_summary is not None:
-            data["business_summary"] = business_summary
-        if template_type is not None:
-            data["template_type"] = template_type
-        t = repo.save_template(data, template_id)
-    except _EXPECTED as e:
-        return _err(e)
-    return _ok({"ok": True, "template_id": t["id"], "version": t["version"], "name": t["name"],
-                "template_type": t["template_type"], "summary": t["summary"]})
-
-
-@_tool()
-def get_report_template(template_id: int, ctx: Context, version: int | None = None,
-                        report_id: int | None = None, report_version: int | None = None) -> dict:
-    """读取本人的模板，或指定有编辑权限的报告和版本，读取该版本实际关联的声明式模板。"""
-    try:
-        acc = _access(ctx)
-        if report_id is not None:
-            t = repo.template_from_report(template_id, acc.principal, report_id, report_version)
-            if version is not None and t["version"] != version:
-                raise repo.Invalid("所请求的模板版本与报告关联版本不一致")
-        else:
-            t = repo.get_template(template_id)
-            _check_owner(acc, t.get("created_by"), "报告模板")
-            if version is not None:
-                t = {**{key: t[key] for key in ("id", "template_type")}, **repo.get_template_version(template_id, version)}
-        if decoded := report_spec.decode_template(t["markdown"]):
-            spec, dataset_id = decoded
-            key = "free_report" if isinstance(spec, report_free.FreeReport) else "spec"
-            return _ok({"ok": True, **{k: v for k, v in t.items() if k != "markdown"},
-                        key: spec.model_dump(mode="json"), "dataset_id": dataset_id})
-        return _ok({"ok": True, **t})
-    except _EXPECTED as e:
-        return _err(e)
-
-
-@_tool()
-def get_report_spec() -> dict:
-    """查看声明式报告及官方指标查询计划的 JSON 契约。"""
-    theme_groups = [{**group, "tokens": [token for token in group["tokens"] if token["key"] in design.BUILTIN_TOKENS]}
-                    for group in design.TOKEN_GROUPS if group["key"] != "advanced"]
-    return {"schema": report_spec.ReportSpec.model_json_schema(), "theme_tokens": theme_groups,
-            "guide": (SKILL_DIR / "references" / "declarative-report.md").read_text(encoding="utf-8")}
-
-
-@_tool()
-def save_report_spec(name: str, dataset_id: int, spec: report_spec.ReportSpec, ctx: Context,
-                     template_id: int | None = None, expected_version: int | None = None,
-                     business_summary: str = "") -> dict:
-    """保存有固定场景、字段和筛选映射的声明式模板；传 template_id 更新本人的模板版本，可用 expected_version 检查并发版本。"""
-    try:
-        acc = _access(ctx)
-        _require_dataset(acc, dataset_id)
-        if template_id is not None:
-            _check_owner(acc, repo.get_template(template_id)["created_by"], "报告模板")
-        elif expected_version is not None:
-            raise repo.Invalid("指定 expected_version 时须同时提供 template_id")
-        content = report_spec.encode_template(spec, dataset_id)
-        row = repo.save_template({"name": name, "dataset_id": dataset_id, "markdown": content,
-                                  "business_summary": business_summary, "created_by": acc.principal.emp_no,
-                                  "template_type": "business"}, template_id, expected_version=expected_version)
-        return _ok({"ok": True, "template_id": row["id"], "version": row["version"], "summary": row["summary"]})
-    except _EXPECTED as e:
-        return _err(e)
-
-
-@_tool()
-def get_free_report_spec() -> dict:
-    """查看自由 HTML/CSS、模块、受管数据槽位和 ECharts 声明式视觉选项。"""
-    return {"schema": report_free.FreeReport.model_json_schema(),
-            "guide": (SKILL_DIR / "references" / "free-report.md").read_text(encoding="utf-8")}
-
-
-def _store_free_template(acc, name, dataset_id, free_report, template_id=None,
-                         expected_version=None, business_summary=None):
-    _require_dataset(acc, dataset_id)
-    data = {"name": name, "dataset_id": dataset_id, "markdown": report_spec.encode_template(free_report, dataset_id),
-            "created_by": acc.principal.emp_no, "template_type": "business"}
-    if business_summary is not None:
-        data["business_summary"] = business_summary
-    row = repo.save_template(data, template_id, expected_version=expected_version)
-    return _ok({"ok": True, "template_id": row["id"], "version": row["version"], "summary": row["summary"]})
-
-
-@_tool()
-def save_free_report_template(name: str, dataset_id: int, free_report: report_free.FreeReport, ctx: Context,
-                              template_id: int | None = None, expected_version: int | None = None,
-                              business_summary: str | None = None) -> dict:
-    """保存自由版式模板。改页面骨架、绑定或全局 CSS 时提交完整定义。更新模板须提供当前版本。"""
-    try:
-        acc = _access(ctx)
-        if (template_id is None) != (expected_version is None):
-            raise repo.Invalid("更新自由模板时须同时提供模板 ID 和 expected_version")
-        if template_id is not None:
-            current = repo.get_template(template_id)
-            _check_owner(acc, current["created_by"], "报告模板")
-            if current["dataset_id"] != dataset_id:
-                raise repo.Invalid("自由模板的业务场景固定，改用其他场景时请另建模板")
-        return _store_free_template(acc, name, dataset_id, free_report, template_id,
-                                    expected_version, business_summary)
-    except _EXPECTED as e:
-        return _err(e)
-
-
-@_tool()
-def patch_free_report_template(template_id: int, expected_version: int,
-                               modules: dict[report_queries.Key, report_free.Module], ctx: Context) -> dict:
-    """只提交要替换的现有模块，保留布局、其他模块和全局绑定。版本已变化时返回 conflict。"""
-    try:
-        acc = _access(ctx)
-        current = repo.get_template(template_id)
-        _check_owner(acc, current["created_by"], "报告模板")
-        if current["version"] != expected_version:
-            raise repo.ReportConflict("报告模板已被修改，请读取最新版本后再提交")
-        decoded = report_spec.decode_template(current["markdown"])
-        if not decoded or not isinstance(decoded[0], report_free.FreeReport):
-            raise repo.Invalid("只能补丁更新自由版式模板")
-        original, dataset_id = decoded
-        if not modules or modules.keys() - original.modules.keys():
-            raise repo.Invalid("模块补丁须包含已有模块，增删模块请更新完整模板")
-        content = original.model_dump(mode="json")
-        content["modules"].update({key: module.model_dump(mode="json") for key, module in modules.items()})
-        updated = report_free.FreeReport.model_validate(content)
-        # 数据库事务持有模板行锁时再次校验版本，防止并发编辑覆盖对方的模块。
-        return _store_free_template(acc, current["name"], dataset_id, updated, template_id, expected_version)
-    except _EXPECTED as e:
-        return _err(e)
-
-
-@_tool()
 def query_report_data(dataset_id: int, queries: dict[report_queries.Key, report_queries.QueryPlan], ctx: Context,
                       parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
                       sample_rows: Annotated[int, Field(ge=0, le=200)] = 5) -> dict:
@@ -752,80 +564,6 @@ def query_report_data(dataset_id: int, queries: dict[report_queries.Key, report_
 
 
 @_tool()
-def preview_report_spec(ctx: Context, template_id: int | None = None, template_version: int | None = None,
-                        spec: report_spec.ReportSpec | None = None, dataset_id: int | None = None,
-                        bindings: dict[report_queries.Key, str] | None = None,
-                        parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
-                        report_id: int | None = None, base_version: int | None = None,
-                        theme_overrides: dict[str, Any] | None = None) -> dict:
-    """编译并验收离线报告。用 theme_overrides 和报告基准版本直接复用原数据调整样式；换图可提交编辑后的 spec。"""
-    return _preview_report(ctx, report_spec.ReportSpec, spec, dataset_id, template_id, template_version,
-                           bindings, parameters, report_id, base_version, theme_overrides)
-
-
-@_tool()
-def preview_free_report(ctx: Context, template_id: int | None = None, template_version: int | None = None,
-                        free_report: report_free.FreeReport | None = None, dataset_id: int | None = None,
-                        bindings: dict[report_queries.Key, str] | None = None,
-                        parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
-                        report_id: int | None = None, base_version: int | None = None) -> dict:
-    """整页验收自由版式。修订时指定基准并省略取数参数及绑定可复用原数据，重跑传新账期参数。"""
-    return _preview_report(ctx, report_free.FreeReport, free_report, dataset_id, template_id, template_version,
-                           bindings, parameters, report_id, base_version, None)
-
-
-def _preview_report(ctx, model, spec, dataset_id, template_id, template_version,
-                    bindings, parameters, report_id, base_version, theme_overrides):
-    try:
-        acc = _access(ctx)
-        base = template = None
-        if theme_overrides is not None and (report_id is None or any(value is not None for value in (
-                spec, template_id, template_version, dataset_id, bindings, parameters))):
-            raise repo.Invalid("theme_overrides 只和报告 ID、基准版本一起使用")
-        if base_version is not None and report_id is None:
-            raise repo.Invalid("指定基准版本时须同时指定报告 ID")
-        if report_id is not None:
-            base = repo.get_report(report_id, acc.principal, with_html=False, with_source=True, version=base_version)
-            if base["access_level"] not in ("manage", "edit"):
-                raise PermissionDenied("无权编辑该报告")
-        if template_id is not None and spec is None:
-            t = repo.get_template(template_id)
-            if acc.all or t["created_by"] == acc.principal.emp_no:
-                if template_version is not None:
-                    t = {**t, **repo.get_template_version(template_id, template_version)}
-            elif base:
-                t = repo.template_from_report(template_id, acc.principal, base["id"], base["revision"])
-                if template_version is not None and t["version"] != template_version:
-                    raise PermissionDenied("只能使用协作版本关联的模板版本")
-            else:
-                raise PermissionDenied("无权访问该模板")
-            decoded = report_spec.decode_template(t["markdown"])
-            if not decoded or not isinstance(decoded[0], model):
-                raise repo.Invalid("模板类型与预览工具不匹配，请使用该类型的预览入口")
-            spec, dataset_id = decoded
-            template = t
-        elif template_id is not None or template_version is not None:
-            raise repo.Invalid("声明式内容和模板 ID 只能提供一种")
-        elif spec is None and base and base.get("markdown"):
-            decoded = report_spec.decode_template(base["markdown"])
-            if decoded and isinstance(decoded[0], model):
-                spec, dataset_id = decoded
-                if theme_overrides is not None:
-                    # 局部样式修订复用基准快照，衍生定义随新报告版本保存。
-                    theme = {**spec.theme, **report_spec.resolve_report_theme(theme_overrides)}
-                    spec = spec.model_copy(update={"theme": theme})
-                elif base.get("template_id") is not None:
-                    template = {"id": base["template_id"], "version": base["template_version"]}
-        if spec is None or dataset_id is None:
-            raise repo.Invalid("请提供对应类型的模板 ID、报告基准或当前场景的完整定义")
-        _require_dataset(acc, dataset_id)
-        return _ok({"ok": True, **report_pipeline.preview(spec, dataset_id, acc.principal, bindings=bindings,
-                        parameters=parameters, template=template, base=base, requested_report_id=report_id)})
-    except _EXPECTED as e:
-        return _err(e)
-
-
-@_tool()
 def get_preview_file(preview_id: str, ctx: Context, offset: Annotated[int, Field(ge=0)] = 0,
                      chars: Annotated[int, Field(ge=1, le=24000)] = 12000) -> dict:
     """通过已登录的 MCP 读取验收预览，按字符分页，无需向 Shell 或浏览器传 IAM 令牌。"""
@@ -839,102 +577,144 @@ def get_preview_file(preview_id: str, ctx: Context, offset: Annotated[int, Field
         return _err(e)
 
 
-@_tool()
-def list_report_templates(ctx: Context, keyword: str = "") -> dict:
-    """列出本人创建的报告模板（可按名称/需求/业务场景关键字过滤），便于复用历史模板。"""
-    try:
-        acc = _access(ctx)
-    except _EXPECTED as e:
-        return _err(e)
-    rows = repo.list_templates(keyword or None, owner=_owner(acc))
-    return _ok({"ok": True, "templates": [
-        {"template_id": r["id"], "name": r["name"], "business_scenario": r["business_scenario"], "version": r["version"],
-         "template_type": r["template_type"],
-         "user_requirement": r["user_requirement"], "updated_at": r["updated_at"], "summary": r["summary"]} for r in rows[:50]]})
+def _template_brief(row: dict) -> dict:
+    return {"template_id": row["id"], "name": row["name"], "version": row["version"],
+            "dataset_id": row["dataset_id"], "business_scenario": row["business_scenario"],
+            "business_summary": row["business_summary"], "sections": row["summary"].get("sections", []),
+            "summary": row["summary"], "user_requirement": row["user_requirement"], "updated_at": row["updated_at"]}
 
 
 @_tool()
-def render_report_html(template_id: int, ctx: Context, report_name: str = "",
-                       parameters: dict[report_queries.Key, report_queries.ParamValue] | None = None,
-                       template_version: Annotated[int, Field(ge=1)] | None = None) -> dict:
-    """以当前权限执行本人模板。声明式模板传账期参数，服务端验收后直接保存报告。"""
-    try:
-        acc = _access(ctx)
-        tpl = repo.get_template(template_id)
-        _check_owner(acc, tpl.get("created_by"), "报告模板")
-        if template_version is not None:
-            tpl = {**tpl, **repo.get_template_version(template_id, template_version)}
-        r = services.render_template_to_report(tpl, report_name, acc.principal, parameters)
-    except _EXPECTED as e:
-        return _err(e)
-    return _ok({"ok": True, "report_id": r["id"], "name": r["name"], "version": r["revision"],
-                **repo.report_links(r["id"], r["revision"]), "html_bytes": r["meta"]["html_bytes"],
-                "warnings": r["warnings"], "queries": r["meta"].get("queries")})
+def list_report_templates(ctx: Context, keyword: str = "", dataset_id: int | None = None) -> dict:
+    """按关键词或业务场景检索自己创建或已授权场景的 Markdown 报告模板指南。"""
+    acc = _access(ctx)
+    rows = repo.list_templates(keyword or None, owner=_owner(acc), dataset_id=dataset_id,
+                               allowed_datasets=acc.dataset_ids())
+    return _ok({"ok": True, "templates": [_template_brief(row) for row in rows[:50]]})
+
+
+@_tool()
+def get_report_template(template_id: int, ctx: Context, version: int | None = None) -> dict:
+    """读取有访问权限的报告模板指南。可指定历史版本获取当时的 Markdown 正文。"""
+    acc = _access(ctx)
+    tpl = repo.get_template(template_id)
+    repo.require_template_access(tpl, acc)
+    if version is not None:
+        tpl = {**tpl, **repo.get_template_version(template_id, version)}
+        tpl["summary"] = repo._template_summary(tpl["markdown"], tpl["name"])
+    return _ok({"ok": True, **tpl, "template_id": tpl["id"]})
+
+
+@_tool()
+def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int | None = None,
+                         user_requirement: str = "", analysis_goal: str = "", business_summary: str | None = None,
+                         template_id: int | None = None, expected_version: int | None = None) -> dict:
+    """新建或更新 Markdown 报告指南。更新时可传 expected_version 检查并行修改。"""
+    acc = _access(ctx)
+    data = {"name": name, "markdown": markdown, "user_requirement": user_requirement, "analysis_goal": analysis_goal}
+    if dataset_id is not None:
+        _require_dataset(acc, dataset_id)
+        data["dataset_id"] = dataset_id
+    if template_id is not None:
+        current = repo.get_template(template_id)
+        _check_owner(acc, current["created_by"], "报告模板")
+        # 未传场景时沿用原关联；操作人的场景权限仍须有效。
+        if dataset_id is None and current["dataset_id"] is not None:
+            _require_dataset(acc, current["dataset_id"])
+        data = {k: v for k, v in data.items() if k in ("markdown", "dataset_id") or v != ""}
+    else:
+        data["created_by"] = acc.principal.emp_no
+    if business_summary is not None:
+        data["business_summary"] = business_summary
+    with measure("template.save"):
+        tpl = repo.save_template(data, template_id, expected_version=expected_version)
+    return _ok({"ok": True, **_template_brief(tpl), "template_type": "business"})
+
+
+@_tool()
+def create_html_draft(title: str, ctx: Context, dataset_id: int | None = None, snapshots: dict[str, str] | None = None,
+                      head_css: str = "", shell_html: str = "", shared_js: str = "", style_id: str | None = None,
+                      use_echarts: bool = True, template_id: int | None = None, template_version: int | None = None,
+                      report_id: int | None = None, base_version: int | None = None) -> dict:
+    """创建多轮拼装的 HTML 草稿。提供报告和基准版本时，可复用已保存的源码与快照。"""
+    with measure("draft.create"):
+        result = report_draft.create_draft(
+            title, _access(ctx).principal, dataset_id=dataset_id, snapshots=snapshots, head_css=head_css,
+            shell_html=shell_html, shared_js=shared_js, style_id=style_id, use_echarts=use_echarts,
+            template_id=template_id, template_version=template_version, report_id=report_id, base_version=base_version,
+        )
+    return _ok({"ok": True, **result})
+
+
+@_tool()
+def upsert_html_section(draft_id: str, ctx: Context, section_id: str | None = None, html: str = "", title: str = "",
+                        css: str = "", js: str = "", after_section_id: str | None = None, delete: bool = False,
+                        sections: list[dict[str, Any]] | None = None, snapshots: dict[str, str] | None = None,
+                        head_css: str | None = None, shell_html: str | None = None, shared_js: str | None = None) -> dict:
+    """增改、移动或删除章节，可批量应用。批量元素支持 index 和显式空字符串清除字段。"""
+    owner = _access(ctx).principal.emp_no
+    if sections is not None and section_id is not None:
+        raise repo.Invalid("请使用 section_id 更新单个章节，或使用 sections 批量更新")
+    if section_id is not None:
+        patch = {"section_id": section_id, "delete": delete}
+        patch.update({key: value for key, value in (("html", html), ("title", title), ("css", css), ("js", js))
+                      if value})
+        if after_section_id is not None:
+            patch["after_section_id"] = after_section_id
+        sections = [patch]
+    elif any((html, title, css, js, delete, after_section_id)):
+        raise repo.Invalid("单个章节的修改须提供 section_id")
+    with measure("draft.upsert"):
+        result = report_draft.upsert_sections(draft_id, owner, sections or [], snapshots=snapshots, head_css=head_css,
+                                              shell_html=shell_html, shared_js=shared_js)
+    return _ok({"ok": True, **result})
+
+
+@_tool()
+def get_html_draft(draft_id: str, ctx: Context, include_code: bool = False, section_id: str | None = None) -> dict:
+    """查询草稿进度、最近校验和失败诊断。必要时读取指定章节或全页的草稿源码。"""
+    with measure("draft.read"):
+        result = report_draft.get_draft_status(draft_id, _access(ctx).principal.emp_no,
+                                               include_code=include_code, section_id=section_id)
+    return _ok({"ok": True, **result})
+
+
+@_tool()
+def verify_html_draft(ctx: Context, draft_id: str | None = None, html: str | None = None,
+                      dataset_id: int | None = None, report_id: int | None = None, base_version: int | None = None) -> dict:
+    """展开报告，使用离线 Chromium 校验，并返回可审阅和入库的预览。"""
+    result = report_pipeline.verify_and_stage(_access(ctx).principal, draft_id=draft_id, html=html,
+                                               dataset_id=dataset_id, report_id=report_id, base_version=base_version)
+    return _ok({"ok": True, **result})
 
 
 @_tool()
 def preview_report_html(html: str, ctx: Context, report_id: int | None = None,
-                        base_version: int | None = None) -> dict:
-    """诊断旧单文件 HTML 的静态结构；正式交付使用 preview_report_spec。"""
-    try:
-        principal = _access(ctx).principal
-        if base_version is not None and report_id is None:
-            raise repo.Invalid("指定基准版本时须同时指定报告 ID")
-        base = None
-        if report_id is not None:
-            base = repo.get_report(report_id, principal, version=base_version)
-            if base["access_level"] not in ("manage", "edit"):
-                raise PermissionDenied("无权编辑该报告")
-        with measure("preview.embed"):
-            page = report_data.embed(html, principal.emp_no, base["html"] if base else "")
-        if base and not base["meta"].get("single_file"):
-            # 与保存修订版一致，旧版内置 ECharts 引用也可在预览中离线运行。
-            page = inline_legacy_echarts(page)
-        with measure("preview.validate"):
-            if error := report_document_error(page):
-                raise repo.Invalid(error)
-            audit = report_spec.audit_module()
-            diagnostics = audit.audit_html(html) + audit.audit_html(page, expanded=True)
-        with measure("preview.write"):
-            ref = report_data.save_preview(
-                principal.emp_no,
-                page,
-                source_html=html,
-                report_id=base["id"] if base else None,
-                requested_report_id=report_id,
-                base_version=base["revision"] if base else None,
-            )
-        url = f"{settings.public_base_url}/reports/preview/{ref}"
-    except _EXPECTED as e:
-        return _err(e)
-    return _ok({
-        "ok": True,
-        "preview_id": str(ref),
-        "draft_only": True,
-        "static_audit": list(dict.fromkeys(diagnostics)),
-        "url": url,
-        "download_url": f"{url}?download=true",
-        "html_bytes": len(page.encode("utf-8")),
-        "source_sha256": sha256(html.encode("utf-8")).hexdigest(),
-        "html_sha256": sha256(page.encode("utf-8")).hexdigest(),
-        "expires_in_seconds": report_data.TTL_SECONDS,
-    })
+                        base_version: int | None = None, dataset_id: int | None = None) -> dict:
+    """完整 HTML 的兼容预览入口，返回通过 Chromium 校验的预览。"""
+    result = report_pipeline.verify_and_stage(_access(ctx).principal, html=html, dataset_id=dataset_id,
+                                               report_id=report_id, base_version=base_version)
+    return _ok({"ok": True, **result})
+
+
+def _report_delivery(row: dict) -> dict:
+    verification = row["meta"].get("verification") or {}
+    return {"ok": True, "report_id": row["id"], "version": row["revision"],
+            "template_id": row["template_id"], "template_version": row["template_version"],
+            **repo.report_links(row["id"], row["revision"]), "html_bytes": row["meta"].get("html_bytes"),
+            "verification": verification, "warnings": verification.get("warnings", [])}
 
 
 @_tool()
-def save_report(name: str, html: str | None = None, ctx: Context = None, template_id: int | None = None,
-                template_version: int | None = None, preview_id: str | None = None) -> dict:
-    """保存服务端已验收的声明式预览。可提供匹配的模板 ID 和版本作为额外确认。"""
-    try:
-        if html is not None or preview_id is None:
-            raise repo.Invalid("新报告请提交正式模板预览工具返回且已验收的 preview_id")
-        r = report_pipeline.persist(name, _access(ctx).principal, preview_id,
-                                    template_id=template_id, template_version=template_version)
-    except _EXPECTED as e:
-        return _err(e)
-    return _ok({"ok": True, "report_id": r["id"], "version": r["revision"],
-                "template_id": r["template_id"], "template_version": r["template_version"],
-                **repo.report_links(r["id"], r["revision"]), "html_bytes": r["meta"]["html_bytes"]})
+def save_report(name: str, ctx: Context, draft_id: str | None = None, preview_id: str | None = None,
+                html: str | None = None, dataset_id: int | None = None, template_id: int | None = None,
+                template_version: int | None = None) -> dict:
+    """保存草稿、通过校验的预览或完整 HTML。草稿和 HTML 按需自动完成离线 Chromium 校验。"""
+    row = report_pipeline.persist_report(name, _access(ctx).principal, draft_id=draft_id, preview_id=preview_id,
+                                         html=html, dataset_id=dataset_id, template_id=template_id,
+                                         template_version=template_version)
+    return _ok(_report_delivery(row))
+
 
 
 @_tool()
@@ -956,17 +736,13 @@ def list_reports(ctx: Context, keyword: str = "", template_id: int | None = None
 def get_report(report_id: int, ctx: Context, include_html: bool = False, version: int | None = None,
                include_source: bool = False, omit_snapshot_data: bool = False) -> dict:
     """读取可访问的报告。显式 version 优先，省略时读取本账号的当前选择或最新版。
-    include_html 返回该版本的 HTML；include_source 返回有权限读取的版本 Markdown 源码。
+    include_html 返回该版本的 HTML；include_source 返回有权限读取的版本分块源码或历史源码。
     同时传 omit_snapshot_data=true 时，快照数据替换为可复用的基准引用，避免把它们读入模型。"""
     try:
         r = repo.get_report(report_id, _access(ctx).principal, with_html=include_html,
                             version=version, with_source=include_source)
         if include_html and omit_snapshot_data:
             r["html"] = report_data.for_edit(r["html"])
-        if include_source and r.get("markdown") and (decoded := report_spec.decode_template(r["markdown"])):
-            key = "free_report" if isinstance(decoded[0], report_free.FreeReport) else "spec"
-            r[key] = decoded[0].model_dump(mode="json")
-            del r["markdown"]
     except _EXPECTED as e:
         return _err(e)
     return _ok({"ok": True, **r, **repo.report_links(r["id"], r["revision"])})
@@ -993,25 +769,13 @@ def select_report_version(report_id: int, ctx: Context, version: int | None = No
 
 @_tool()
 def revise_report(report_id: int, name: str, ctx: Context, base_version: int | None = None,
-                  html: str | None = None, markdown: str | None = None, change_note: str = "",
-                  expected_version: int | None = None, preview_id: str | None = None) -> dict:
-    """追加同一报告的新版本。正文变更提交已验收的 preview_id；只改名称或说明时可省略正文。"""
-    try:
-        acc = _access(ctx)
-        with measure("report.revise"):
-            if preview_id is not None:
-                if html is not None or markdown is not None:
-                    raise repo.Invalid("预览 ID 须单独提交")
-                r = report_pipeline.persist(name, acc.principal, preview_id, report_id=report_id,
-                                            base_version=base_version, change_note=change_note,
-                                            expected_version=expected_version)
-            else:
-                r = services.revise_report(report_id, acc.principal, name, base_version=base_version,
-                                           html=html, markdown=markdown, change_note=change_note,
-                                           expected_version=expected_version)
-    except _EXPECTED as e:
-        return _err(e)
-    return _ok({"ok": True, "report_id": r["id"], **r})
+                  draft_id: str | None = None, preview_id: str | None = None, html: str | None = None,
+                  change_note: str = "", expected_version: int | None = None) -> dict:
+    """追加报告版本。正文支持草稿、已校验预览或完整 HTML。只改名称或说明时省略正文。"""
+    row = services.revise_report(report_id, _access(ctx).principal, name, base_version=base_version,
+                                 draft_id=draft_id, preview_id=preview_id, html=html,
+                                 change_note=change_note, expected_version=expected_version)
+    return _ok({**row, **_report_delivery(row)})
 
 
 # ============================== 启动 ==============================

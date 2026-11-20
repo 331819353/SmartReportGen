@@ -55,27 +55,18 @@ class BuiltinReportingRulesTest(unittest.TestCase):
         with patch.object(mcp_server, "SKILL_DIR", skill_dir), \
                 patch.object(mcp_server, "SKILL_FILE", skill_dir / "SKILL.md"):
             body = mcp_server.get_skill_guide()
-            for reference in ("fact-contract", "display-contract", "declarative-report", "free-report"):
+            for reference in ("fact-contract", "display-contract", "html-assembly"):
                 with self.subTest(reference=reference):
                     contents = (skill_dir / "references" / f"{reference}.md").read_text(encoding="utf-8")
                     self.assertEqual(mcp_server.get_skill_guide(reference=reference), body + "\n\n---\n\n" + contents)
-            # 旧客户端仍能传历史标识，并得到可执行的现行取数规则。
-            retired = mcp_server.get_skill_guide(reference="green-energy-september-facts")
-            self.assertIn("历史案例已归档", retired)
-            self.assertTrue(retired.endswith((skill_dir / "references/fact-contract.md").read_text(encoding="utf-8")))
-            with self.assertRaises(ValueError):
-                mcp_server.get_skill_guide(reference="../../config")
-            # MCP-only 客户端取得可直接保存运行的原文，不能混入指南或读取任意路径。
-            for asset in ("report-formatters.js", "audit_report.py"):
-                with self.subTest(asset=asset):
-                    contents = (skill_dir / "assets" / asset).read_text(encoding="utf-8")
-                    self.assertEqual(mcp_server.get_skill_guide(asset=asset), contents)
-            with self.assertRaises(ValueError):
-                mcp_server.get_skill_guide(asset="../../config.py")
-            with self.assertRaises(ValueError):
-                mcp_server.get_skill_guide(asset="audit_report.py", include_example=True)
-            with self.assertRaises(ValueError):
-                mcp_server.get_skill_guide(asset="audit_report.py", reference="display-contract")
+            failure = mcp_server.get_skill_guide(reference="../../config")
+            self.assertFalse(failure["ok"])
+            self.assertIn("timing", failure)
+            # MCP-only 客户端仍可读取原样格式化模块。
+            formatters = (skill_dir / "assets" / "report-formatters.js").read_text(encoding="utf-8")
+            self.assertEqual(mcp_server.get_skill_guide(asset="report-formatters.js"), formatters)
+            self.assertFalse(mcp_server.get_skill_guide(asset="report-formatters.js", include_example=True)["ok"])
+
 
 
 if __name__ == "__main__":

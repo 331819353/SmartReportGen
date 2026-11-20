@@ -4,13 +4,11 @@
 
 1. 管理员部署数据源，配置员工可引用的表和固定行范围。
 2. 员工提出新建或修改报告的需求。修改从报告库定位基准，多个匹配候选由用户确认。新建先找已有场景，缺少适用场景时，由员工从已授权的数据源自行建场景并填写分析思路。
-3. 模型根据场景的分析思路、授权表元数据、数据证据和样式规则设计并保存模板。已有汇总值优先按维度筛选、直取。
-4. 以模板为基础按章节与卡片多轮调整，由服务端编译 HTML。纯展示修订可复用原快照。
-5. 服务端验收通过后，保存对应 HTML 及版本记录，交付固定链接和离线文件。
+3. 模型读取场景、关联 Markdown 指南、表画像和样式，用只读 SQL 获取带权限指纹的数据快照。
+4. 创建 HTML 草稿，分轮添加原生 HTML、CSS 和 JS 章节。纯展示修订可复用原快照。
+5. 服务端展开完整离线 HTML，并用 Chromium 校验。可一步入库，也可预览后保存。交付固定的版本链接和下载链接。
 
-[主流程与 MCP 用法](skills/smart-report/SKILL.md) · [报表模板、图形与样式契约](skills/smart-report/references/declarative-report.md)
-
-标准布局使用结构化模板。需要自由 HTML/CSS 的报告可使用[自由版式模板](skills/smart-report/references/free-report.md)，通过 MCP 逐模块修改并由内置运行时绑定业务数字。两类模板共用正式验收和版本发布。
+[主流程与 MCP 用法](skills/smart-report/SKILL.md) · [HTML 拼装指南](skills/smart-report/references/html-assembly.md)
 
 ## 快速开始
 
@@ -60,7 +58,7 @@ export SMARTREPORT_TOKEN
 ## 目录结构
 
 ```
-skills/smart-report/        技能（唯一来源）：SKILL.md、单文件 HTML 示例与结构化模板参考
+skills/smart-report/        技能（唯一来源）：SKILL.md、单文件 HTML 示例与拼装指南
   ↑ .claude/skills/smart-report、.agents/skills/smart-report 为指向它的软链接（Claude Code / Codex 等自动发现）
 AGENTS.md                   通用 agent 指引（Codex、Cursor、Copilot 等读取）
 .mcp.json / .codex/config.toml   Claude Code / Codex 的项目级 MCP 配置（海尔 IAM 认证）
@@ -76,8 +74,8 @@ app/smartreportgen/
   schema.sql                PG 表结构（按类型分 schema）
   connectors/               mysql / postgresql / oracle / starrocks / api(DuckDB)
   search.py / embedding.py  混合检索（pgvector + 关键词 IDF，RRF 融合）/ 向量化
-  template_parser.py / renderer.py   模板解析校验 / 模板 → HTML
-  static/report/            筛选联动、事实展示和图表运行时
+  report_draft.py / report_pipeline.py   HTML 草稿拼装 / Chromium 校验及版本入库
+  static/report/            报告主题组件与历史运行时
   static/admin/             管理台（Vue 3，无构建）
 scripts/install-skill.sh    把技能安装到各 agent 的用户级技能目录（复制或软链接）
 scripts/mcp_call.py         MCP 调试客户端

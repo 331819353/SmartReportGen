@@ -1,16 +1,16 @@
 """用两张内存表验证多表取数、完整 JSON 快照和版本数据复用。"""
 import json
 import os
+from pathlib import Path
 import tempfile
 import time
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID
 
 from fastapi.testclient import TestClient
 
-from smartreportgen import mcp_server, report_data
+from smartreportgen import mcp_server, report_browser, report_data, report_document, report_queries
 from smartreportgen.api import app
 from smartreportgen.auth import Principal
 from smartreportgen.config import settings
@@ -23,7 +23,7 @@ def block(name, ref):
 
 
 def document(*blocks):
-    return ('<!doctype html><html><head><meta charset="utf-8"><style>body{margin:0}</style></head><body>'
+    return ('<!doctype html><html><head><meta charset="utf-8"><style>body{margin:0}</style></head><body><h1>授权快照</h1>'
             + '\n'.join(blocks) + '<script>document.body.dataset.ready = "1";</script></body></html>')
 
 
@@ -33,8 +33,8 @@ class ReportSnapshotsTest(unittest.TestCase):
         self.enterContext(patch.object(settings, "report_work_dir", self.work))
         self.owner = Principal("snapshot-owner")
         self.access = Access(self.owner, tables={1: {"orders", "targets"}})
-        self.source = {"type": "api", "name": "测试数据源"}
-        self.dataset = {"tables": [
+        self.source = {"id": 12, "type": "api", "name": "测试数据源", "enabled": True}
+        self.dataset = {"id": 1, "datasource_id": 12, "enabled": True, "tables": [
             {"table_name": "Orders", "table_description": "实际", "row_filters": [
                 {"column": "region", "values": ["华东"]},
             ]},
@@ -47,9 +47,12 @@ class ReportSnapshotsTest(unittest.TestCase):
             ],
             "Targets": [{"id": 1, "expected": 5}, {"id": 2, "expected": 4}],
         }
-        self.connector.fetch = records.__getitem__
+        self.connector._fetch_pages = lambda table: (records[table], "fixture", True)
         self.enterContext(patch.object(mcp_server, "_access", return_value=self.access))
         self.enterContext(patch.object(mcp_server.repo, "get_dataset", return_value=self.dataset))
+        self.enterContext(patch.object(mcp_server.repo, "get_datasource", return_value=self.source))
+        self.enterContext(patch.object(report_queries, "access_for", return_value=self.access))
+        self.addCleanup(self.connector.close)
         self.enterContext(patch.object(mcp_server.services, "datasource_for_dataset", return_value=self.source))
         self.enterContext(patch.object(mcp_server.services, "get_connector", return_value=self.connector))
 
@@ -71,6 +74,9 @@ class ReportSnapshotsTest(unittest.TestCase):
         self.assertEqual(list(Path(self.work).iterdir()), [])
 
     def test_multiple_snapshots_render_and_preview_is_private(self):
+        if not Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file():
+            self.skipTest("需要部署镜像中的 Chromium")
+        self.addCleanup(report_browser.close_pool)
         orders = mcp_server.run_query(1, "SELECT * FROM Orders ORDER BY id", None, snapshot=True, sample_rows=2)
         targets = mcp_server.run_query(1, "SELECT * FROM Targets", None, snapshot=True, sample_rows=0)
         self.assertEqual(orders["row_count"], 11)
@@ -78,7 +84,7 @@ class ReportSnapshotsTest(unittest.TestCase):
         self.assertEqual(targets["sample_rows"], [])
         self.assertNotIn("rows", orders)
         draft = document(block("orders", orders["snapshot_id"]), block("targets", targets["snapshot_id"]))
-        expected = report_data.embed(draft, self.owner.emp_no)
+        expected = report_document.enforce_offline_policy(report_data.embed(draft, self.owner.emp_no))
         preview = mcp_server.preview_report_html(draft, None)
         self.assertTrue(preview["ok"], preview)
         self.assertNotIn("html", preview)
@@ -134,7 +140,9 @@ class ReportSnapshotsTest(unittest.TestCase):
             report_data.embed(skeleton, "editor")
 
     def test_reject_snapshot_id_conflicts_during_preview_and_save(self):
-        snapshot = report_data.save_query(self.owner.emp_no, ["value"], [[42]], 0)
+        snapshot = report_data.save_query(self.owner.emp_no, ["value"], [[42]], 0, origin={
+            "scope": report_queries.scope_for(1, self.dataset, self.source, ["Orders"])
+        })
         data = block("forecast", snapshot["snapshot_id"])
         for draft in (
             document('<section id="fore&#99;ast">预测</section>', data),
@@ -142,13 +150,14 @@ class ReportSnapshotsTest(unittest.TestCase):
         ):
             with self.subTest(draft=draft):
                 preview = mcp_server.preview_report_html(draft, None)
-                saved = mcp_server.save_report("测试报告", draft, None)
+                saved = mcp_server.save_report("测试报告", None, html=draft)
                 self.assertFalse(preview["ok"])
-                self.assertIn("已验收", saved["error"])
+                self.assertIn("数据块 id 与页面元素重复：forecast", saved["error"])
                 self.assertIn("数据块 id 与页面元素重复：forecast", preview["error"])
         # 静态 template 的普通元素不与主文档争用 id；数据块本身必须在主文档中。
         valid = document('<template><section id="forecast"></section></template>', data)
-        self.assertTrue(mcp_server.preview_report_html(valid, None)["ok"])
+        with patch.object(report_browser, "verify_html", return_value={"status": "passed"}):
+            self.assertTrue(mcp_server.preview_report_html(valid, None)["ok"])
         inert = document(f"<template>{data}</template>")
         self.assertIn("数据块位于 template 内", mcp_server.preview_report_html(inert, None)["error"])
 
@@ -198,38 +207,6 @@ class ReportSnapshotsTest(unittest.TestCase):
         ambiguous_base = expanded.replace("</head>", '<style data-srg-style="embedded">body{margin:1px}</style></head>')
         with self.assertRaisesRegex(report_data.ReportDataError, "样式块"):
             report_data.embed(skeleton, "editor", ambiguous_base)
-
-    def test_preview_id_save_and_revise_reuse_and_isolation(self):
-        snap = mcp_server.run_query(1, "SELECT * FROM Targets", None, snapshot=True, sample_rows=0)
-        draft = document(block("targets", snap["snapshot_id"]))
-        preview = mcp_server.preview_report_html(draft, None)
-        self.assertTrue(preview["ok"], preview)
-        self.assertIn("preview_id", preview)
-        self.assertEqual(len(preview["source_sha256"]), 64)
-        self.assertEqual(len(preview["html_sha256"]), 64)
-        # 跨工号不能复用他人 preview_id。
-        other_access = Access(Principal("other-user"), tables={1: {"orders", "targets"}})
-        with patch.object(mcp_server, "_access", return_value=other_access):
-            denied = mcp_server.save_report("盗用预览", ctx=None, preview_id=preview["preview_id"])
-            self.assertFalse(denied["ok"])
-            self.assertIn("预览源码不可用", denied["error"])
-        # 历史 HTML 预览是诊断草稿，不能用预览 ID 绕过服务端验收或直接替换正文。
-        with patch.object(mcp_server.repo, "save_report") as save_mock:
-            denied = mcp_server.save_report("新报告", ctx=None, preview_id=preview["preview_id"])
-        self.assertFalse(denied["ok"], denied)
-        self.assertIn("验收证据", denied["error"])
-        save_mock.assert_not_called()
-        self.assertFalse(mcp_server.save_report("冲突", html=draft, ctx=None, preview_id=preview["preview_id"])["ok"])
-        self.assertFalse(mcp_server.save_report("缺失", ctx=None)["ok"])
-        expanded = report_data.embed(draft, self.owner.emp_no)
-        base_report = {"id": 99, "revision": 2, "access_level": "edit", "html": expanded, "meta": {"single_file": True}}
-        with patch.object(mcp_server.repo, "get_report", return_value=base_report):
-            rev_preview = mcp_server.preview_report_html(document(block("targets", "base")), None, report_id=99, base_version=2)
-        self.assertTrue(rev_preview["ok"], rev_preview)
-        with patch.object(mcp_server.repo, "update_report") as update_mock:
-            denied = mcp_server.revise_report(99, "修订报告", None, preview_id=rev_preview["preview_id"])
-        self.assertFalse(denied["ok"], denied)
-        update_mock.assert_not_called()
 
     def test_snapshot_query_returns_up_to_200_sample_rows_without_truncation(self):
         big_connector = APIConnector(self.source, "")

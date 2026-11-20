@@ -1,16 +1,16 @@
-"""服务端 Chromium 验收。证据由固定运行时与查询快照生成。"""
+"""以离线 Chromium 校验报告 DOM、图表、脚本和交互。"""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal, ROUND_HALF_UP, localcontext
-from itertools import product
-import json
-from math import isfinite, prod
+from contextvars import copy_context
 from os import getenv
+import re
 import threading
 from threading import BoundedSemaphore
+from typing import Any
 
-from .report_spec import ReportDefinition, ReportSpec, _project
+from .report_document import enforce_offline_policy, external_references
+from .telemetry import measure
 
 _WORKERS = max(1, min(8, int(getenv("SRG_BROWSER_WORKERS", "4"))))
 _slots = BoundedSemaphore(_WORKERS)
@@ -19,115 +19,6 @@ _thread_state = threading.local()
 _pool_lock = threading.Lock()
 _worker_threads: set[int] = set()
 _MAX_BROWSER_USES = 200
-
-_SNAPSHOT_JS = """async ({cards, free, changes, resized}) => {
-  // 使用页面自己的 change 事件更新筛选，变更和整页取证走一次浏览器调用。
-  for (const [id, value] of changes) {
-    const select = document.getElementById('filter-' + id);
-    if (select.value !== value) {
-      select.value = value;
-      select.dispatchEvent(new Event('change', {bubbles: true}));
-    }
-  }
-  // 等待窄屏布局和 ECharts 的 resize 事件完成，避免读取上一个视口的画布尺寸。
-  if (resized) await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  const contractEl = document.getElementById('srg-display-contract');
-  const rawColors = contractEl ? JSON.parse(contractEl.textContent).colors : {};
-  const palette = Object.fromEntries(Object.entries(rawColors).map(([key, color]) =>
-    [key, 'rgb(' + [1, 3, 5].map(i => parseInt(color.slice(i, i + 2), 16)).join(', ') + ')']));
-  const metrics = [...document.querySelectorAll('[data-metric]')].map(n => [
-    n.dataset.metric,
-    Boolean(n.dataset.metricState),
-    n.textContent,
-    [...n.classList].find(c => /^srg-(up|down|neutral|met|miss|warning)$/.test(c)) ?? null,
-    getComputedStyle(n).color,
-  ]);
-  const outputs = {};
-  for (const item of cards) {
-    const host = document.getElementById(item.id);
-    if (!host) {
-      outputs[item.id] = {missing: true, emptyCount: 0, canvasCount: 0};
-      continue;
-    }
-    const emptyCount = host.querySelectorAll('[data-empty]').length;
-    const canvasCount = host.querySelectorAll('canvas').length;
-    const info = {emptyCount, canvasCount};
-    if (item.type === 'table') {
-      info.rows = [...host.querySelectorAll('tbody tr')].map(r =>
-        [...r.cells].map(c => [c.textContent, getComputedStyle(c).color]));
-    } else {
-      const chartDom = host.querySelector('.srg-chart');
-      const chart = chartDom ? echarts.getInstanceByDom(chartDom) : null;
-      if (chart) {
-        const option = chart.getOption();
-        if (item.type === 'waterfall') {
-          info.waterfall = option.series[0].data.map(d => [
-            d.name, d.kind, d.displayed, d.itemStyle.color.toLowerCase(), d.label.position, d.value[1], d.value[2]
-          ]);
-          if (item.free_waterfall) {
-            chart.getZr().flush();
-            const series = chart.getModel().getSeriesByIndex(0);
-            const points = series.getData();
-            info.drawn = option.series[0].data.map((point, index) => {
-              const group = points.getItemGraphicEl(index);
-              const rect = group?.children().find(element => element.type === 'rect');
-              const label = group?.children().find(element => element.type === 'text');
-              return [
-                rect?.style.fill?.toLowerCase() ?? null,
-                label?.style.text ?? null,
-                label ? (label.style.y >= rect.shape.y + rect.shape.height ? 'bottom' :
-                  label.style.y < rect.shape.y ? 'top' : 'inside') : null,
-                option.tooltip[0].formatter({name: point.name, data: point}),
-              ];
-            });
-          }
-        } else {
-          info.categories = [...(option.xAxis || []), ...(option.yAxis || [])]
-            .find(axis => axis.type === 'category')?.data ?? null;
-          info.series = option.series.map(s => [s.name,
-            s.data.map(d => [d.name, d.value, d.displayed, d.itemStyle?.color?.toLowerCase() ?? null])]);
-        }
-      }
-    }
-    outputs[item.id] = info;
-  }
-  let freeHidden = false;
-  let freeText = null;
-  if (free) {
-    const slotNodes = document.querySelectorAll('.srg-free :is(srg-val,.srg-card-output,.srg-chart,canvas,select,#srg-reset)');
-    freeHidden = [...slotNodes].some(node => {
-      const rect = node.getBoundingClientRect();
-      return !rect.width || !rect.height || rect.left < -1 || rect.right > innerWidth + 1
-        || getComputedStyle(node).visibility !== 'visible'
-        || parseFloat(getComputedStyle(node).fontSize) < 1
-        || !node.checkVisibility({opacityProperty: true, visibilityProperty: true});
-    });
-    const freeRoot = document.querySelector('.srg-free');
-    if (freeRoot) {
-      const walker = document.createTreeWalker(freeRoot, NodeFilter.SHOW_TEXT);
-      const visible = [];
-      let block;
-      for (let item = walker.nextNode(); item; item = walker.nextNode()) {
-        const parent = item.parentElement;
-        if (parent.closest('srg-val,.srg-card-output,#srg-controls')) {
-          visible.push('|');
-        } else {
-          // 按块分隔合法的序号，同行的内联元素仍连在一起检查裸数字。
-          const current = parent.closest('p,li,h1,h2,h3,h4,h5,h6,div,section,article,header,footer,td,th,blockquote');
-          if (block !== current) visible.push('\\n');
-          visible.push(item.data);
-          block = current;
-        }
-      }
-      freeText = visible.join('');
-    }
-  }
-  const tocOk = [...document.querySelectorAll('.rf-toc a')].every(a => document.getElementById(a.hash.slice(1)));
-  const widthOk = document.documentElement.scrollWidth <= innerWidth;
-  const bodyText = document.body.innerText;
-  return {colors: rawColors, palette, metrics, outputs, freeHidden, freeText, tocOk, widthOk, bodyText};
-}"""
-
 
 def _reset_thread_browser() -> None:
     browser = getattr(_thread_state, "browser", None)
@@ -209,356 +100,250 @@ def close_pool() -> None:
     executor.shutdown()
 
 
-def _decimal(value):
-    if isinstance(value, dict):
-        return Decimal(value["$decimal"])
-    return Decimal(str(value)) if type(value) in (int, float) else None
+
+class ReportVerifyError(ValueError):
+    def __init__(self, message: str, stage: str, diagnostics: dict[str, Any]):
+        super().__init__(message)
+        self.stage = stage
+        self.diagnostics = diagnostics
 
 
-def _expect(value, fmt, rate_symbols):
-    raw = _decimal(value)
-    if fmt.kind == "text":
-        if raw is None:
-            return ("—" if value is None else str(value).lower() if type(value) is bool else str(value), "neutral")
-        # 数字类型的类别只作标签，不参与业务计算。
-        fmt = fmt.model_copy(update={"kind": "number", "digits": 0})
-    if raw is None:
-        return "—", "neutral"
-    direction = 1 if fmt.direction == "higher" else -1
-    state = "neutral"
-    if fmt.signal == "trend" and raw:
-        state = "up" if raw * direction > 0 else "down"
-    elif fmt.signal == "attainment":
-        if (raw >= Decimal(fmt.threshold) if direction > 0 else raw <= Decimal(fmt.threshold)):
-            state = "met"
-        elif fmt.warning_threshold is not None and (raw >= Decimal(fmt.warning_threshold)
-                if direction > 0 else raw <= Decimal(fmt.warning_threshold)):
-            state = "warning"
-        else:
-            state = "miss"
-    with localcontext() as ctx:
-        ctx.prec = max(80, len(str(raw)) + abs(raw.adjusted()) + 16)
-        converted = raw * (100 if fmt.scale == "decimal" else 1) / fmt.divisor
-        value = converted.quantize(Decimal(1).scaleb(-fmt.digits), rounding=ROUND_HALF_UP)
-    signed = fmt.signed or fmt.kind in ("delta", "rate_delta")
-    if not value:
-        value = value.copy_abs()
-    sign = "+" if signed and value > 0 else ""
-    suffix = (("pp" if fmt.kind == "rate_delta" and rate_symbols == "semantic" else "%")
-              if fmt.kind in ("rate", "rate_delta") else fmt.unit)
-    return f"{sign}{value:,.{fmt.digits}f}{suffix}", state
+_SECTION_SOURCE = re.compile(r"(?:srg-section-|\[SRG )([A-Za-z_][A-Za-z0-9_-]*)[.\]]")
+_FRAME_WAIT = """() => new Promise(resolve =>
+  requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 25))))"""
+_CONTROLS = 'select, button[data-filter], [role="tab"], [type="reset"], [data-reset], #srg-reset'
+_RUNTIME_PROBE = """<script>(() => {
+  const results = {requests: [], errors: []};
+  window.__srgProbe = results;
+  // CSP 先于网络路由阻断部分请求。保留 URL 和节点所属的章节，便于从草稿定位。
+  addEventListener('securitypolicyviolation', event => {
+    const url = event.blockedURI;
+    if (!url || ['inline', 'eval', 'wasm-eval'].includes(url)) return;
+    const node = event.target instanceof Element ? event.target : null;
+    const resource = [...document.querySelectorAll('[src],[href],[poster]')].find(element =>
+      [element.src, element.href, element.poster].includes(url));
+    const section = (node || resource)?.closest('[data-srg-section]') ||
+      resource?.closest('[data-srg-section]');
+    results.requests.push({url, section_id: section?.dataset.srgSection ?? null,
+      location: event.sourceFile || event.violatedDirective});
+  });
+  addEventListener('error', event => {
+    if (event.message) results.errors.push({message: event.message, line: event.lineno, location: event.filename});
+  });
+})();</script>"""
+_INSPECT = """expected => {
+  function visible(node) {
+    if (!node || !node.getClientRects().length) return false;
+    return node.checkVisibility({opacityProperty: true, visibilityProperty: true});
+  }
+  function textVisible(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let node; (node = walker.nextNode()); ) {
+      const parent = node.parentElement;
+      if (!node.textContent.trim() || parent.closest('script,style,template,noscript') || !visible(parent)) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rect = range.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) return true;
+    }
+    return false;
+  }
+  const sections = new Map([...document.querySelectorAll('[data-srg-section]')]
+    .map(node => [node.dataset.srgSection, node]));
+  const emptySections = [];
+  for (const id of expected) {
+    const node = sections.get(id);
+    if (!node || !(textVisible(node) || [...node.querySelectorAll('table,svg,canvas')].some(visible))) {
+      emptySections.push(id);
+    }
+  }
+  const charts = [...document.querySelectorAll('[_echarts_instance_], .echarts, [data-chart]')];
+  const badCharts = charts.filter(node => {
+    const chart = window.echarts?.getInstanceByDom(node);
+    const box = node.getBoundingClientRect();
+    const hasSurface = [...node.querySelectorAll('canvas,svg')].some(surface => {
+      const rect = surface.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 &&
+        (surface.tagName !== 'CANVAS' || (surface.width > 0 && surface.height > 0));
+    });
+    // 不比较像素和数据点。检查实例有绘制对象，且图表容器与实际绘图表面有尺寸。
+    const unrendered = chart ? !chart.getOption() || !chart.getZr().storage.getDisplayList().length
+      : node.matches('[_echarts_instance_], .echarts');
+    return unrendered || box.width <= 0 || box.height <= 0 || !hasSurface;
+  }).map(node => ({id: node.id || null, section_id: node.closest('[data-srg-section]')?.dataset.srgSection ?? null}));
+  return {
+    blank: !document.body?.innerText.trim() || !textVisible(document.body),
+    emptySections, badCharts, chartCount: charts.length,
+    checked: expected.length ? expected : [...sections.keys()],
+    emptyTables: [...document.querySelectorAll('table')].filter(table => !table.querySelector('tbody tr')).length,
+  };
+}"""
 
 
-def _equal(left, right):
-    return type(left) is type(right) and left == right or type(left) in (int, float) and type(right) in (int, float) and left == right
+def _failure(message: str, **diagnostics) -> ReportVerifyError:
+    return ReportVerifyError(message, "chromium.verify", diagnostics)
 
 
-def _category(value):
-    if value is None:
-        return "—"
-    if isinstance(value, dict):
-        return value["$decimal"]
-    if isinstance(value, bool):
-        return str(value).lower()
-    if isinstance(value, float):
-        # JS 在这个区间使用普通小数，科学计数法的指数没有前导零。
-        if not value or 1e-6 <= abs(value) < 1e21:
-            return format(Decimal(str(value)).normalize(), "f") if value else "0"
-        coefficient, exponent = str(value).split("e")
-        return f"{coefficient}e{int(exponent):+d}"
-    return str(value)
+def _section(text: str) -> str | None:
+    match = _SECTION_SOURCE.search(text)
+    return match[1] if match else None
 
 
-def _chart_coordinate(value, fmt):
-    raw = _decimal(value)
-    if raw is None:
-        return None
-    coordinate = float(raw) * (100 if fmt.scale == "decimal" else 1) / fmt.divisor
-    return coordinate if isfinite(coordinate) else None
+def _verify_on_thread(page_html: str, expected_sections: list[str] | None, executable_path: str) -> dict:
+    from playwright.sync_api import Error as BrowserError
+    from playwright.sync_api import TimeoutError as BrowserTimeout
 
-
-def _matches(row, by, selected):
-    return all(selected[key] is None or _equal(row[field], selected[key]) for key, field in by.items())
-
-
-def _card_facts(card, rows, selected):
-    sources = getattr(card, "sources", None)
-    if not sources:
-        return [
-            row for row in rows[card.query]
-            if _matches(row, card.by, selected)
-            and all(_equal(row[k], v) for k, v in getattr(card, "where", {}).items())
-        ]
-    axis = {f for src in sources for f in src.by}
-    active = {f for f in axis if selected[f] is not None}
-    binding = next((src for src in sources if set(src.by) == active), None)
-    if not binding:
-        return []
-    return [
-        row for row in rows[binding.query]
-        if _matches(row, binding.by, selected)
-        and all(_equal(row[k], v) for k, v in binding.where.items())
+    requests, errors = [], []
+    observed_html = enforce_offline_policy(page_html, probe=_RUNTIME_PROBE)
+    section_lines = [
+        (observed_html.count("\n", 0, match.start()) + 1,
+         observed_html.count("\n", 0, match.end()) + 1, match[1])
+        for match in re.finditer(r'<script data-srg-for="([A-Za-z_][A-Za-z0-9_-]*)">.*?</script>',
+                                 observed_html, flags=re.S)
     ]
+    try:
+        with measure("chromium.launch"):
+            browser = _get_browser(executable_path)
+            context = browser.new_context(offline=True, service_workers="block",
+                                          viewport={"width": 1280, "height": 900}, accept_downloads=False)
+    except BrowserError as exc:
+        raise _failure("无法启动 Chromium", message_detail=str(exc)) from exc
 
+    def block(route):
+        url = route.request.url
+        if url.lower().startswith(("data:", "blob:", "about:")):
+            route.continue_()
+        else:
+            requests.append(url)
+            route.abort()
 
-def _waterfall_expected(card, facts, rate_symbols, colors):
-    # 独立用 Decimal 对账并确定标签顺序，覆盖运行时的 BigInt 实现。
-    category, amount = card.columns
-    config = card.waterfall
-    role_field = config.role_field or category.field
-    first = [row for row in facts if row[role_field] == config.opening]
-    last = [row for row in facts if row[role_field] == config.closing]
-    if len(first) != 1 or len(last) != 1 or len(facts) > card.limit:
-        return None
-    middle = [row for row in facts if row[role_field] == config.change] if config.role_field else [
-        row for row in facts if row[role_field] not in (config.opening, config.closing)]
-    if len(middle) + 2 != len(facts) or len({_category(row[category.field]) for row in facts}) != len(facts):
-        return None
-    values = [(row, _decimal(row[amount.field])) for row in middle]
-    opening, closing = _decimal(first[0][amount.field]), _decimal(last[0][amount.field])
-    if opening is None or closing is None or any(raw is None for _, raw in values):
-        return None
-    values.sort(key=lambda entry: 0 if entry[1] > 0 else 2 if entry[1] < 0 else 1)
-    unit = amount.format.divisor
-    series = []
-    def record(row, raw, start, end, role):
-        direction = "up" if raw > 0 else "down" if raw < 0 else "neutral"
-        lookup = role == "step" and direction != "neutral"
-        kind = "rate_delta" if amount.format.kind == "rate" and role == "step" else amount.format.kind
-        fmt = amount.format.model_copy(update={"kind": kind, "signed": role == "step"})
-        multiplier = 100 if fmt.scale == "decimal" else 1
-        displayed, _ = _expect(row[amount.field], fmt, rate_symbols)
-        return [_category(row[category.field]), role if role == "total" else direction, displayed,
-                (colors[direction] if lookup else config.total_color).lower(),
-                "bottom" if lookup and direction == "up" else "top",
-                float(start) * multiplier / unit, float(end) * multiplier / unit]
+    def console(msg):
+        if msg.type == "error":
+            errors.append({"kind": "console", "message": msg.text, "section_id": _section(
+                f"{msg.location.get('url', '')} {msg.text}")})
 
-    with localcontext() as ctx:
-        ctx.prec = 3300  # 包含由快照格式支持的十进制数位与规模。
-        current = opening
-        series.append(record(first[0], opening, 0, opening, "total"))
-        for row, raw in values:
-            after = current + raw
-            series.append(record(row, raw, current, after, "step"))
-            current = after
-        if current != closing:
-            return None
-        series.append(record(last[0], closing, 0, closing, "total"))
-    return series if all(isfinite(row[-2]) and isfinite(row[-1]) for row in series) else None
+    def page_error(error):
+        stack = error.stack or ""
+        errors.append({"kind": "pageerror", "message": str(error), "section_id": _section(stack), "stack": stack})
 
-
-def _verify_on_thread(page_html: str, spec: ReportDefinition, rows: dict, executable_path: str) -> dict:
-    from playwright.sync_api import Error
-    from .report_spec import audit_module
-
-    errors, requests, checked = [], [], 0
-    free = not isinstance(spec, ReportSpec)
-    outputs = list(spec.card_outputs())
-    unverified_bridges = {output_id for output_id, card in outputs if free and card.type == "waterfall"}
-    card_meta = [{"id": output_id, "type": card.type, "free_waterfall": free and card.type == "waterfall"}
-                 for output_id, card in outputs]
-    card_rendered = {output_id: False for output_id, _ in outputs}
-    metric_non_missing = {key: False for key in spec.metrics}
-    empty_on_default: list[str] = []
-    invalid_cards: set[str] = set()
-    ambiguous_metrics: set[str] = set()
+    def check_runtime(static=(), control=None):
+        data = page.evaluate("""() => ({
+          probe: window.__srgProbe || {errors: [], requests: []},
+          wrapped: Array.isArray(window.__srgErrors) ? window.__srgErrors : []
+        })""")
+        detail = [{"kind": "section", "section_id": item.get("section"), "message": item.get("message"),
+                   "stack": item.get("stack")} for item in data["wrapped"] if isinstance(item, dict)]
+        for item in data["probe"]["errors"]:
+            line = item.get("line") or 0
+            section_id = _section(item.get("location") or "")
+            if not section_id and item.get("location", "").startswith("about:"):
+                section_id = next((ident for start, end, ident in section_lines if start <= line <= end), None)
+            detail.append({**item, "kind": "script", "section_id": section_id})
+        grouped_requests = list(static)
+        known = {item["url"] for item in grouped_requests}
+        for item in data["probe"]["requests"]:
+            if item["url"] not in known:
+                grouped_requests.append({**item, "section_id": item["section_id"] or _section(item["location"])})
+                known.add(item["url"])
+        for url in dict.fromkeys(requests):
+            if url not in known:
+                grouped_requests.append({"url": url, "section_id": None})
+        if grouped_requests or errors or detail:
+            # 模块包装器的诊断比 Playwright 的全局 console 事件更精确，优先返回。
+            diagnostics = {"errors": [*detail, *errors][:20], "external_requests": grouped_requests[:20]}
+            if control:
+                diagnostics["control"] = control
+            ids = list(dict.fromkeys(item["section_id"] for item in [*detail, *errors, *grouped_requests]
+                                     if item.get("section_id")))
+            if control and control.get("section_id") and control["section_id"] not in ids:
+                ids.append(control["section_id"])
+            diagnostics["section_ids"] = ids
+            diagnostics["section_id"] = ids[0] if ids else None
+            raise _failure("报告尝试加载外部资源" if grouped_requests else "报告脚本运行或资源加载出错", **diagnostics)
 
     try:
-        browser = _get_browser(executable_path)
-        context = browser.new_context(viewport={"width": 1280, "height": 850}, service_workers="block", offline=True)
-        try:
-            context.route("**/*", lambda route: route.abort())
-            page = context.new_page()
-            page.set_default_timeout(5000)
-            page.on("request", lambda request: requests.append(request.resource_type))
-            page.on("pageerror", lambda error: errors.append(str(error)[:300]))
-            page.on("console", lambda message: errors.append(message.text[:300]) if message.type == "error" else None)
-            page.set_content(page_html, wait_until="load", timeout=12000)
-            page.locator("html[data-srg-ready=true]").wait_for(state="attached")
-            defaults = {f.id: (f.default if any(_equal(row[f.field], f.default) for row in rows[f.query]) else None)
-                        for f in spec.filters}
-            selected = dict(defaults)
+        context.route("**/*", block)
+        page = context.new_page()
+        page.set_default_timeout(3500)
+        page.on("pageerror", page_error)
+        page.on("console", console)
+        with measure("chromium.load"):
+            page.set_content(observed_html, wait_until="load", timeout=15000)
+            page.evaluate(_FRAME_WAIT)
+        with measure("chromium.inspect"):
+            check_runtime(external_references(page_html))
+            inspection = page.evaluate(_INSPECT, expected_sections or [])
+            if inspection["blank"] or inspection["emptySections"] or inspection["badCharts"]:
+                empty = inspection["emptySections"]
+                charts = inspection["badCharts"]
+                ids = list(dict.fromkeys([*empty, *(item["section_id"] for item in charts if item["section_id"])]))
+                raise _failure("报告页面、章节或图表未呈现", blank_page=inspection["blank"], empty_sections=empty,
+                               invalid_charts=charts, section_ids=ids, section_id=ids[0] if ids else None)
 
-            def same(actual, expected, label):
-                if actual != expected:
-                    raise ValueError(f"浏览器对账失败：{label}")
-
-            def check(changes=(), *, resized=False):
-                nonlocal checked
-                snap = page.evaluate(_SNAPSHOT_JS, {"cards": card_meta, "free": free,
-                                                    "changes": list(changes), "resized": resized})
-                actual = snap["metrics"]
-                palette = snap["palette"]
-                colors = snap["colors"]
-                expected = {}
-                for key, metric in spec.metrics.items():
-                    axes = {f for binding in metric.sources for f in binding.by if selected[f] is not None}
-                    binding = next((s for s in metric.sources if set(s.by) == axes), None)
-                    facts = [row[binding.field] for row in rows[binding.query]
-                             if _matches(row, binding.by, selected) and all(_equal(row[k], v) for k, v in binding.where.items())] if binding else []
-                    if len(facts) > 1:
-                        ambiguous_metrics.add(key)
-                    expected[key] = _expect(facts[0] if len(facts) == 1 else None, metric.format, spec.rate_symbols)
-                same({result[0] for result in actual}, set(expected), "指标节点")
-                state_labels = {"up": "向好", "down": "承压", "neutral": "无变化", "met": "达标",
-                                "warning": "关注", "miss": "未达标"}
-                for key, is_status, label, css, color in actual:
-                    value, state = expected[key]
-                    if is_status and value != "—":
-                        value = (state_labels[state] if spec.metrics[key].format.signal == "trend" or
-                                 state != "neutral" else "—")
-                    same((label, css, color), (value, "srg-" + state, palette[state]), key)
-                    if expected[key][0] != "—":
-                        metric_non_missing[key] = True
-                    elif checked == 0 and key not in empty_on_default:
-                        empty_on_default.append(key)
-
-                for output_id, card in outputs:
-                    actual_card = snap["outputs"][output_id]
-                    facts = _card_facts(card, rows, selected)
-                    if card.type == "waterfall":
-                        expected_path = _waterfall_expected(card, facts, spec.rate_symbols, colors)
-                        if expected_path is None:
-                            same(actual_card["emptyCount"], 1, card.title)
-                            if facts:
-                                invalid_cards.add(card.title)
-                            if checked == 0:
-                                empty_on_default.append(card.title)
-                        else:
-                            same(actual_card["canvasCount"] > 0, True, card.title)
-                            same(actual_card.get("waterfall"), expected_path, card.title)
-                            if free:
-                                same(actual_card.get("drawn"),
-                                     [[color, label if card.waterfall.labels else None,
-                                       position if card.waterfall.labels else None, name + " " + label]
-                                      for name, _, label, color, position, _, _ in expected_path],
-                                     "瀑布图实际绘制及提示")
-                                unverified_bridges.discard(output_id)
-                            card_rendered[output_id] = True
-                    elif card.type == "table" and facts:
-                        expect = [[[shown, palette[state]] for shown, state in [
-                            _expect(row[c.field], c.format, spec.rate_symbols) for c in card.columns]]
-                            for row in facts[:card.limit]]
-                        same(actual_card.get("rows"), expect, card.title)
-                        if any(cell[0] != "—" for row in expect for cell in row):
-                            card_rendered[output_id] = True
-                        elif checked == 0:
-                            empty_on_default.append(card.title)
-                    elif card.type != "table" and facts and len(facts) <= card.limit and len({
-                            _category(row[card.columns[0].field]) for row in facts}) == len(facts) and any(
-                            _chart_coordinate(row[col.field], col.format) is not None
-                            for row in facts for col in card.columns[1:]):
-                        same(actual_card["canvasCount"] > 0, True, card.title)
-                        categories = [_category(row[card.columns[0].field]) for row in facts]
-                        if card.type not in ("pie", "donut"):
-                            same(actual_card.get("categories"), categories, f"{card.title}的类别轴")
-                        expected_series = []
-                        for col in card.columns[1:]:
-                            point_states = [_expect(row[col.field], col.format, spec.rate_symbols) for row in facts]
-                            expected_series.append([col.label, [
-                                [label, _chart_coordinate(row[col.field], col.format), shown,
-                                 colors[state].lower() if state != "neutral" else None]
-                                for row, label, (shown, state) in zip(facts, categories, point_states)
-                            ]])
-                        same(actual_card.get("series"), expected_series, card.title)
-                        card_rendered[output_id] = True
+        with measure("chromium.interaction_smoke"):
+            tested = 0
+            controls = page.locator(_CONTROLS).all()
+            for index, locator in enumerate(controls):
+                if tested >= 8:
+                    break
+                if not locator.is_visible() or not locator.is_enabled():
+                    continue
+                info = locator.evaluate("""node => ({
+                  id: node.id, tag: node.tagName.toLowerCase(),
+                  section_id: node.closest('[data-srg-section]')?.dataset.srgSection ?? null
+                })""")
+                info["selector"] = f'#{info["id"]}' if info["id"] else f"{_CONTROLS} (index {index})"
+                try:
+                    if info["tag"] == "select":
+                        alternative = locator.evaluate("""node => [...node.options].findIndex(option =>
+                          !option.selected && !option.disabled && !option.closest('optgroup[disabled]'))""")
+                        if alternative < 0:
+                            continue
+                        locator.select_option(index=alternative)
                     else:
-                        same(actual_card["emptyCount"], 1, card.title)
-                        if facts:
-                            invalid_cards.add(card.title)
-                        if checked == 0:
-                            empty_on_default.append(card.title)
-                if free:
-                    from .report_free import _author_text
+                        locator.click()
+                    page.evaluate(_FRAME_WAIT)
+                except BrowserError as exc:
+                    check_runtime(control=info)
+                    raise _failure("交互控件未能完成操作", control=info, section_id=info["section_id"],
+                                   message_detail=str(exc)) from exc
+                tested += 1
+                check_runtime(control=info)
 
-                    if snap["freeHidden"]:
-                        raise ValueError("浏览器对账失败：存在不可见或超出页面的自由版式数据槽")
-                    _author_text(snap["freeText"] or "", "浏览器正文")
-                same(snap["tocOk"], True, "目录")
-                same(snap["widthOk"], True, "页面宽度")
-                if spec.rate_symbols == "percent-only" and audit_module().BANNED.search(snap["bodyText"]):
-                    raise ValueError("展开后的文案包含当前契约禁用的率差符号")
-                if errors or requests:
-                    raise ValueError("离线运行出现浏览器错误或外部请求" + (f"：{errors[0]}" if errors else ""))
-                checked += 1
-
-            check()
-            # 小组合逐项测试，大组合测试各维度首尾及复合筛选。
-            options = page.evaluate("""ids => ids.map(id => {
-                const sel = document.getElementById('filter-' + id);
-                return sel ? [...sel.options].map(o => o.value) : [];
-            })""", [f.id for f in spec.filters]) if spec.filters else []
-            same(all(options), True, "筛选控件")
-
-            def apply(values):
-                changes = [(f.id, value) for f, value in zip(spec.filters, values)
-                           if not _equal(selected[f.id], json.loads(value))]
-                if changes:
-                    selected.update({key: json.loads(option) for key, option in changes})
-                    check(changes)
-
-            if options and prod(map(len, options)) <= 12:
-                for values in product(*options):
-                    apply(values)
-            elif options:
-                default_options = [next(option for option in opts if _equal(json.loads(option), defaults[f.id]))
-                                   for f, opts in zip(spec.filters, options)]
-                for index, opts in enumerate(options):
-                    for option in dict.fromkeys((options[index][0], options[index][-1])):
-                        values = default_options.copy()
-                        values[index] = option
-                        apply(values)
-                apply([opts[-1] for opts in options])
+        with measure("chromium.inspect"):
             page.set_viewport_size({"width": 390, "height": 844})
-            check(resized=True)
-            if spec.filters:
-                page.locator("#srg-reset").click()
-                selected = dict(defaults)
-                check()
-            if unverified_bridges:
-                raise ValueError("浏览器对账失败：瀑布图在已验收筛选状态下缺少可对账的桥接事实")
-        finally:
-            context.close()
-    except Error as exc:
-        _reset_thread_browser()
-        # 不把进程命令、路径或业务数据放入浏览器启动错误。
-        raise ValueError("服务端 Chromium 验收未完成，请查看部署日志与 Chromium 配置") from exc
+            page.evaluate(_FRAME_WAIT)
+            check_runtime()
+            warnings = []
+            if page.evaluate("() => document.documentElement.scrollWidth > innerWidth + 4"):
+                warnings.append("390px 窄屏出现横向溢出")
+            if inspection["emptyTables"]:
+                warnings.append(f'{inspection["emptyTables"]} 张表没有数据行')
 
-    always_empty_cards = list(dict.fromkeys(card.title for output_id, card in outputs if not card_rendered[output_id]))
-    always_missing_metrics = [key for key, seen in metric_non_missing.items() if not seen]
-    empty_default_unique = list(dict.fromkeys(empty_on_default))
-    warnings: list[str] = []
-    if always_empty_cards:
-        warnings.append(f"卡片在全部已验收筛选状态下均为空或未绘图：{'、'.join(always_empty_cards)}")
-    if always_missing_metrics:
-        warnings.append(f"指标在全部已验收筛选状态下均显示缺数：{'、'.join(always_missing_metrics)}")
-    if invalid_cards:
-        warnings.append(f"受测筛选中有卡片类别重复、超限、无可绘制数值或桥接不平：{'、'.join(sorted(invalid_cards))}")
-    if ambiguous_metrics:
-        warnings.append(f"受测筛选中有指标匹配到多条事实：{'、'.join(sorted(ambiguous_metrics))}")
-    remaining_default = [name for name in empty_default_unique if name not in set(always_empty_cards) | set(always_missing_metrics)]
-    if remaining_default:
-        warnings.append(f"默认初始筛选下存在空卡片或缺失指标：{'、'.join(remaining_default)}")
-    if not any(card_rendered.values()) and not any(metric_non_missing.values()):
-        raise ValueError("浏览器对账失败：所有已验收筛选状态下均没有有效卡片或指标")
-    return {"status": "passed", "engine": "chromium", "states_checked": checked,
-            "viewport_widths": [1280, 390], "external_requests": 0, "browser_errors": 0,
-            "empty_on_default": empty_default_unique, "always_empty_cards": always_empty_cards,
-            "always_missing_metrics": always_missing_metrics, "warnings": warnings}
+        return {"status": "passed", "engine": "chromium", "sections_checked": inspection["checked"],
+                "chart_count": inspection["chartCount"], "interactive_controls_tested": tested,
+                "viewport_widths": [1280, 390], "external_requests": 0, "browser_errors": 0, "warnings": warnings}
+    except BrowserTimeout as exc:
+        raise _failure("Chromium 加载或操作超时", message_detail=str(exc), errors=errors[:20],
+                       external_requests=list(dict.fromkeys(requests))[:20]) from exc
+    except BrowserError as exc:
+        raise _failure("Chromium 无法完成报告校验", message_detail=str(exc), errors=errors[:20]) from exc
+    finally:
+        context.close()
 
 
-def verify(page_html: str, spec: ReportDefinition, snapshots: dict, dataset_id: int) -> dict:
+def verify_html(page_html: str, expected_sections: list[str] | None = None) -> dict:
     global _executor
-    data, _ = _project(spec, snapshots, dataset_id)
-    rows = {key: [dict(zip(v["columns"], row)) for row in v["rows"]] for key, v in data.items()}
-    if not _slots.acquire(timeout=30):
-        raise ValueError("浏览器验收繁忙，请稍后重试")
+    with measure("chromium.acquire_slot"):
+        if not _slots.acquire(timeout=30):
+            raise _failure("浏览器校验队列繁忙，请稍后重试")
     try:
         executable_path = getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")
         with _pool_lock:
             if _executor is None:
                 _executor = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="srg-chromium")
-            future = _executor.submit(_verify_on_thread, page_html, spec, rows, executable_path)
+            context = copy_context()
+            future = _executor.submit(context.run, _verify_on_thread, page_html, expected_sections, executable_path)
         return future.result()
     finally:
         _slots.release()

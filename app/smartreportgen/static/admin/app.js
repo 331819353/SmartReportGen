@@ -44,10 +44,8 @@ const pretty = v => JSON.stringify(v || {}, null, 2);
 const state = reactive({ page: location.hash.slice(1) || 'home', meta: null, needLogin: false, me: null, authCfg: null });
 window.addEventListener('hashchange', () => { state.page = location.hash.slice(1) || 'home'; });
 
-// 模板和报告库复用同一个生成入口，生成后刷新报告库。
-const reportDraft = ref(null);
+// 报告版本变动后刷新管理总览与报告库。
 const reportRevision = ref(0);
-function startReport(template = null) { reportDraft.value = { template }; }
 const reportPath = r => appPath('/reports/' + r.id);
 const reportVersionPath = (r, action = '') => reportPath(r) + action + '?version=' + r.revision;
 
@@ -185,74 +183,6 @@ const Home = {
 };
 
 async function loadMeta() { state.meta = await api('/api/meta'); }
-
-// ------------------------------------------------------------ 从模板生成报告
-const GenerateReport = {
-  components: { Drawer },
-  props: ['template'],
-  emits: ['close'],
-  template: `<Drawer title="从模板生成报告" compact :busy="busy" @close="$emit('close')">
-    <div v-if="result" class="generation-result" role="status">
-      <span class="result-icon" v-html="icon('check')"></span><h3>报告已生成</h3>
-      <p>{{result.name}}</p>
-      <details v-if="result.warnings?.length" class="msg warn report-warnings">
-        <summary>查看 {{result.warnings.length}} 条生成提示</summary><ul><li v-for="(w,i) in result.warnings" :key="i">{{w}}</li></ul>
-      </details>
-    </div>
-    <form v-else id="generate-report-form" @submit.prevent="generate">
-      <p class="form-intro">选择可在管理台运行的结构化模板。业务模板可交给已接入的 AI 助手开发报告。</p>
-      <div class="collection-state" v-if="loading" role="status">正在加载模板…</div>
-      <div class="msg err" v-else-if="loadError" role="alert">模板加载失败。<button class="link" type="button" @click="load">重试</button></div>
-      <div class="collection-state" v-else-if="!list.length">
-        还没有可运行的结构化模板。
-        <div class="actions"><a class="btn" href="#templates" @click="$emit('close')">前往报告模板</a></div>
-      </div>
-      <template v-else>
-        <div class="field"><label for="generate-template">报告模板</label>
-          <select id="generate-template" class="in" v-model="selectedId" :disabled="busy" required>
-            <option :value="null" disabled>请选择模板</option>
-            <option v-for="t in list" :key="t.id" :value="t.id">{{t.name}}{{t.business_scenario ? ' · ' + t.business_scenario : ''}}{{admin && t.created_by ? ' · ' + (t.creator_name || t.created_by) : ''}}</option>
-          </select></div>
-        <div class="field"><label for="generate-name">报告名称 <small>选填</small></label>
-          <input id="generate-name" class="in" v-model.trim="name" :placeholder="selected ? selected.name : '默认使用模板名称'" :disabled="busy"></div>
-        <div v-if="selected" class="field"><label for="generate-params">取数参数 <small>有账期等模板参数时填写</small></label>
-          <textarea id="generate-params" class="in mono" v-model="params" rows="3" :disabled="busy" placeholder='{"period":"2026-09"}'></textarea></div>
-        <div v-if="error" class="msg err" role="alert">{{error}}</div>
-      </template>
-    </form>
-    <template #foot>
-      <template v-if="result">
-        <a class="btn" href="#reports" @click="$emit('close')">前往报告库</a>
-        <a class="btn primary" :href="appPath('/reports/'+result.id)" target="_blank" rel="noopener">查看报告</a>
-      </template>
-      <template v-else>
-        <button class="btn" :disabled="busy" @click="$emit('close')">取消</button>
-        <button class="btn primary" type="submit" form="generate-report-form" :disabled="!selected || busy || loading || !!loadError">{{busy ? '正在生成…' : '生成报告'}}</button>
-      </template>
-    </template>
-  </Drawer>`,
-  setup(props) {
-    const templates = useCollection('/api/templates', props.template ? [props.template] : []);
-    const { loading, loadError, load } = templates;
-    // 此入口直接调用服务端渲染，只展示支持该流程的模板。
-    const list = computed(() => templates.list.value.filter(t => t.summary?.declarative));
-    const selectedId = ref(props.template?.id ?? null), name = ref(''), params = ref(''), busy = ref(false), error = ref(''), result = ref(null);
-    const selected = computed(() => list.value.find(t => t.id === selectedId.value));
-    watch(selectedId, () => { error.value = ''; });
-    async function generate() {
-      if (!selected.value || busy.value || loading.value || loadError.value) return;
-      busy.value = true;
-      error.value = '';
-      try {
-        result.value = await api('/api/templates/' + selectedId.value + '/render', { method: 'POST', body: { name: name.value, parameters: jsonOrThrow(params.value, '取数参数') } });
-        reportRevision.value += 1;
-      } catch (e) { error.value = e.message; }
-      finally { busy.value = false; }
-    }
-    return { list, loading, loadError, load, selectedId, selected, name, params, busy, error, result, generate,
-      admin: computed(isAdmin), icon, appPath };
-  }
-};
 
 // ------------------------------------------------------------ 数据源
 function emptyDs() {
@@ -923,42 +853,6 @@ const Datasets = {
 };
 
 // ------------------------------------------------------------ 报告模板
-const STARTER = `---
-title: 新报告
-subtitle: 数据范围说明
-scenario: 零售销售经营分析
-analysis_goal: 用一句话写清楚本报告要回答的问题
-filters:
-  - {id: month, label: 月份, type: range, field: month}
-  - {id: region, label: 大区, type: multi, field: region}
-queries:
-  sales:
-    sql: |
-      SELECT to_char(order_date, 'YYYY-MM') AS month, region, sum(amount) AS amount, sum(profit) AS profit, count(*) AS orders
-      FROM demo_retail.sales_order GROUP BY 1, 2
-    measures:
-      gmv: {expr: "sum(amount)", name: 销售额, format: wan}
-      margin: {expr: "sum(profit)/sum(amount)", name: 毛利率, format: percent}
-      orders: {expr: "sum(orders)", name: 订单数, format: int}
----
-
-## 一、经营概览
-> 期间销售额 {{gmv}}，毛利率 {{margin}}。
-
-### 销售规模
-\`\`\`chart
-type: kpi
-y: gmv
-sub: [margin, orders]
-\`\`\`
-\`\`\`chart
-type: line
-title: 月度销售额趋势
-x: month
-y: gmv
-note: 说明该图如何支撑结论
-\`\`\`
-`;
 const Templates = {
   components: { Drawer },
   template: `<div>
@@ -984,8 +878,8 @@ const Templates = {
           <tbody><tr v-for="t in shown" :key="t.id">
             <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.business_summary || t.analysis_goal || t.user_requirement}}</div></td>
             <td data-label="业务场景">{{t.business_scenario || '—'}}</td><td v-if="admin" data-label="创建人">{{creator(t)}}</td><td data-label="更新时间"><time :datetime="t.updated_at">{{fmtTime(t.updated_at)}}</time></td>
-            <td><div class="links"><button class="link" @click="view(t)">查看</button><button v-if="t.summary?.declarative" class="link" @click="gen(t)">生成报告</button>
-              <button class="link danger" @click="del(t)">删除</button></div></td>
+            <td><div class="links"><button class="link" @click="view(t)">查看</button>
+              <button v-if="canEdit(t)" class="link danger" @click="del(t)">删除</button></div></td>
           </tr></tbody>
         </table></div>
       </section>
@@ -994,7 +888,7 @@ const Templates = {
       <div class="page-head">
         <div><h1 ref="templateHeading" tabindex="-1">{{form.name}}</h1><p>{{form.business_scenario || '未关联业务场景'}} · v{{form.version}}</p></div>
         <div class="actions"><button class="btn ghost" @click="form=null">返回模板列表</button>
-          <button class="btn" @click="edit(form)">编辑模板</button><button v-if="form.summary?.declarative" class="btn primary" @click="gen(form)">生成报告</button></div>
+          <button v-if="canEdit(form)" class="btn" @click="edit(form)">编辑模板</button></div>
       </div>
       <div class="card card-pad template-brief">
         <h2>模板用途</h2>
@@ -1002,91 +896,77 @@ const Templates = {
         <template v-if="form.business_summary && form.analysis_goal && form.analysis_goal !== form.business_summary">
           <h2>分析目标</h2><p class="business-copy">{{form.analysis_goal}}</p>
         </template>
-        <template v-if="form.template_type === 'business' && !form.summary?.declarative">
-          <h2>业务模板正文</h2><p class="business-copy">{{form.markdown}}</p>
-        </template>
-        <template v-else-if="form.summary?.sections?.some(Boolean)">
-          <h2>报告章节</h2>
-          <ol><li v-for="(title, i) in form.summary.sections.filter(Boolean)" :key="i">{{title}}</li></ol>
-        </template>
+        <div v-if="form.versions?.length > 1" class="field">
+          <label for="template-view-version">正文版本</label>
+          <select id="template-view-version" class="in" v-model="viewVersion" @change="readVersion">
+            <option v-for="v in form.versions" :key="v.version" :value="v.version">v{{v.version}} · {{fmtTime(v.created_at)}}</option>
+          </select>
+        </div>
+        <h2>Markdown 指南</h2>
+        <p class="business-copy">{{viewMarkdown}}</p>
       </div>
     </template>
     <template v-else>
       <div class="page-head"><h1 ref="templateHeading" tabindex="-1">{{form.id ? '编辑模板' : '新建模板'}}</h1>
         <div class="actions"><button class="btn ghost" :disabled="busy" @click="cancelEdit">取消</button>
-          <button v-if="form.summary?.declarative" class="btn" @click="save(true)" :disabled="busy || !form.markdown.trim()">保存并生成…</button>
-          <button class="btn primary" @click="save(false)" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
+          <button class="btn primary" @click="save" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
       <div class="card card-pad meta-bar">
         <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
-        <div v-if="!form.id" class="field"><label for="template-type">模板类型</label>
-          <select id="template-type" class="in" v-model="form.template_type" :disabled="busy"><option value="business">声明式模板或历史 Markdown</option><option value="structured">历史结构化模板</option></select></div>
         <div class="field"><label for="template-scenario">业务场景</label>
-          <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">选择默认取数的业务场景</option>
+          <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">不关联业务场景</option>
             <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
             <option v-for="d in datasets" :key="d.id" :value="d.id">{{d.business_scenario}}</option></select></div>
         <div class="field"><label for="template-requirement">原始分析需求 <small>选填</small></label><input id="template-requirement" class="in" v-model="form.user_requirement" placeholder="填写需要回答的业务问题"></div>
+        <div class="field"><label for="template-goal">分析目标 <small>选填</small></label>
+          <input id="template-goal" class="in" v-model="form.analysis_goal"></div>
         <div class="field template-summary-field"><label for="template-business-summary">业务说明 <small>选填</small></label>
           <textarea id="template-business-summary" class="in" v-model="form.business_summary" rows="4" placeholder="例如：用于月度销售复盘，比较各渠道的销售额和毛利率，找出变化最大的区域和品类。"></textarea></div>
       </div>
-      <div v-if="form.template_type === 'business'" class="card card-pad template-brief">
-        <div class="field"><label for="business-markdown">{{form.summary?.declarative ? '声明式模板（JSON）' : '业务模板正文（JSON 或 Markdown）'}}</label>
+      <div class="card card-pad template-brief">
+        <div class="field"><label for="business-markdown">Markdown 指南</label>
           <textarea id="business-markdown" class="in" v-model="form.markdown" rows="14" :disabled="busy"></textarea></div>
         <div v-for="v in form.versions" :key="v.version" class="hit"><span>v{{v.version}} · {{fmtTime(v.created_at)}}</span>
           <button class="link" @click="loadVer(v.version)" :disabled="busy">载入正文</button></div>
       </div>
-      <template v-else>
-      <div class="actions template-technical">
-        <button class="btn" :aria-expanded="technical" aria-controls="template-source" :disabled="busy" @click="technical=!technical">{{technical ? '收起高级编辑' : form.id ? '高级编辑' : '编写模板源码'}}</button>
-        <span v-if="!form.id && !technical" class="muted small">新建模板需要填写源码。</span>
-      </div>
-      <div id="template-source"><template v-if="technical">
-      <div class="actions template-source-actions">
-        <button v-if="!form.id && !form.markdown.trim()" class="btn" @click="form.markdown=starter">载入零售示例</button>
-        <button class="btn" @click="doValidate" :disabled="busy || !form.markdown.trim()">检查数据</button>
-        <button class="btn" @click="preview" :disabled="busy || !form.markdown.trim()">预览报告</button>
-      </div>
-      <div class="editor"><div class="pane"><label class="editor-label" for="template-markdown">模板源码（Markdown）</label>
-        <textarea id="template-markdown" class="in code" v-model="form.markdown" :disabled="busy" spellcheck="false"></textarea></div>
-        <div class="right"><div class="subtabs"><button :class="{on:side==='check'}" @click="side='check'">校验结果</button><button :class="{on:side==='preview'}" @click="side='preview'">预览</button>
-          <button v-if="form.versions && form.versions.length" :class="{on:side==='ver'}" @click="side='ver'">版本 ({{form.versions.length}})</button></div>
-          <div class="body" v-show="side==='check'">
-            <div v-if="!vr" class="muted small">点击“检查数据”执行模板中的查询并检查字段。</div>
-            <div v-else class="msgs">
-              <div class="msg ok" v-if="vr.ok">校验通过：{{vr.summary.sections.length}} 个章节，{{vr.summary.chart_count}} 个图表，{{vr.summary.filter_count}} 个筛选器</div>
-              <div class="msg err" v-for="e in vr.errors">{{e}}</div><div class="msg warn" v-for="w in vr.warnings">{{w}}</div>
-              <template v-if="vr.queries"><h4 style="margin:10px 0 4px">查询</h4>
-                <div v-for="(q,k) in vr.queries" class="hit"><b class="mono">{{k}}</b> <span class="small muted">{{q.datasource}} · {{q.rows}} 行 · {{q.ms}} ms</span>
-                  <div class="small mono muted" style="margin-top:4px">{{q.columns.join(', ')}}</div></div></template>
-              <template v-if="vr.filters"><h4 style="margin:10px 0 4px">筛选器取值</h4>
-                <div v-for="(f,k) in vr.filters" class="small"><b class="mono">{{k}}</b>：{{f.distinct}} 个取值 · {{f.examples.join('、')}}</div></template>
-            </div></div>
-          <div class="body" v-show="side==='preview'" style="padding:0"><iframe v-if="previewHtml" title="报告模板预览" :srcdoc="previewHtml"></iframe><div v-else class="empty">点击“预览”渲染</div></div>
-          <div class="body" v-show="side==='ver'"><div v-for="v in form.versions" class="hit" style="display:flex;justify-content:space-between;align-items:center"><span>v{{v.version}} · {{fmtTime(v.created_at)}} · {{fmtSize(v.size)}}</span><button class="link" @click="loadVer(v.version)">载入编辑器</button></div></div>
-        </div></div></template></div>
-      </template>
     </template>
   </div>`,
   setup() {
     const templates = useCollection('/api/templates');
     const { load } = templates;
-    const form = ref(null), datasets = ref([]), busy = ref(false), vr = ref(null), side = ref('check'), previewHtml = ref(''), kw = ref('');
-    const editing = ref(false), technical = ref(false), templateHeading = ref(null);
+    const form = ref(null), datasets = ref([]), busy = ref(false), kw = ref('');
+    const editing = ref(false), templateHeading = ref(null), viewVersion = ref(null), viewMarkdown = ref('');
     let savedTemplate = null;
     const shown = computed(() => templates.list.value.filter(t => matches(kw.value, t.name, t.business_scenario, t.business_summary, t.analysis_goal, t.user_requirement)));
     onMounted(async () => { datasets.value = await run(() => api('/api/datasets')); });
     async function view(t) {
       form.value = await run(() => api(`/api/templates/${t.id}`));
+      viewVersion.value = form.value.version;
+      viewMarkdown.value = form.value.markdown;
       editing.value = false;
       await nextTick();
       templateHeading.value?.focus();
     }
+    async function readVersion() {
+      const id = form.value.id, version = viewVersion.value;
+      const stillSelected = () => form.value?.id === id && viewVersion.value === version;
+      viewMarkdown.value = '';
+      try {
+        const result = await run(() => api('/api/templates/' + id + '/versions/' + version));
+        if (stillSelected()) viewMarkdown.value = result.markdown;
+      } catch {
+        // 请求失败时恢复最新正文与对应版本，避免把旧内容显示为所选版本。
+        if (stillSelected()) {
+          viewVersion.value = form.value.version;
+          viewMarkdown.value = form.value.markdown;
+        }
+      }
+    }
+    const canEdit = t => isAdmin() || t.created_by === state.me?.emp_no;
     async function edit(t) {
       // 编辑使用副本，取消时还原已保存的业务说明与源码。
       savedTemplate = t ? { ...t } : null;
       editing.value = true;
-      technical.value = false;
-      vr.value = null; previewHtml.value = ''; side.value = 'check';
-      form.value = t ? { ...t } : { id: null, name: '', dataset_id: null, user_requirement: '', business_summary: '', markdown: '', version: 1, template_type: 'business' };
+      form.value = t ? { ...t } : { id: null, name: '', dataset_id: null, user_requirement: '', analysis_goal: '', business_summary: '', markdown: '', version: 1 };
       await nextTick();
       templateHeading.value?.focus();
     }
@@ -1096,37 +976,25 @@ const Templates = {
       await nextTick();
       templateHeading.value?.focus();
     }
-    async function doValidate() {
-      busy.value = true; side.value = 'check';
-      try { vr.value = await run(() => api('/api/templates/validate', { method: 'POST', body: { markdown: form.value.markdown, dataset_id: form.value.dataset_id } })); } finally { busy.value = false; }
-    }
-    async function preview() {
-      busy.value = true;
-      try { previewHtml.value = await run(() => api('/api/templates/preview', { method: 'POST', body: { markdown: form.value.markdown, dataset_id: form.value.dataset_id } })); side.value = 'preview'; } finally { busy.value = false; }
-    }
-    async function save(andRender) {
+    async function save() {
       busy.value = true;
       const f = form.value, body = { name: f.name, markdown: f.markdown, dataset_id: f.dataset_id,
-        user_requirement: f.user_requirement, business_summary: f.business_summary, template_type: f.template_type };
+        user_requirement: f.user_requirement, analysis_goal: f.analysis_goal, business_summary: f.business_summary };
+      // 带上开始编辑时的版本，避免覆盖别人刚保存的正文。
+      if (f.id) body.expected_version = f.version;
       try {
-        const t = await run(() => {
-          if (f.template_type === 'business' && f.markdown.trim().startsWith('{')) {
-            const parsed = jsonOrThrow(f.markdown, '声明式模板');
-            body.spec = parsed.smartreportgen_spec || parsed;
-          }
-          return f.id ? api(`/api/templates/${f.id}`, { method: 'PUT', body }) : api('/api/templates', { method: 'POST', body });
-        }, '模板已保存');
+        const t = await run(() => f.id
+          ? api('/api/templates/' + f.id, { method: 'PUT', body })
+          : api('/api/templates', { method: 'POST', body }), '模板已保存');
         await view(t);
         load();
-        if (andRender) startReport(t);
       } finally { busy.value = false; }
     }
-    function gen(t) { startReport(t); }
     async function del(t) { if (!confirm(`删除模板「${t.name}」？已生成的报告会保留。`)) return; await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load(); }
     async function loadVer(v) { const r = await run(() => api(`/api/templates/${form.value.id}/versions/${v}`)); form.value.markdown = r.markdown; toast(`已载入 v${v}，保存后成为新版本`); }
     const admin = computed(isAdmin);
-    return { ...templates, admin, creator, shown, form, datasets, busy, vr, side, previewHtml, kw, editing, technical, templateHeading,
-      starter: STARTER, view, edit, cancelEdit, doValidate, preview, save, gen, del, loadVer, fmtTime, fmtSize, icon };
+    return { ...templates, admin, creator, shown, form, datasets, busy, kw, editing, templateHeading,
+      viewVersion, viewMarkdown, readVersion, canEdit, view, edit, cancelEdit, save, del, loadVer, fmtTime, icon };
   }
 };
 
@@ -1301,12 +1169,7 @@ const ReportEditor = {
         <input id="report-edit-name" class="in" v-model.trim="form.name" required :disabled="busy"></div>
       <div class="field"><label for="report-edit-note">修改说明 <small>选填</small></label>
         <input id="report-edit-note" class="in" v-model.trim="form.change_note" maxlength="500" :disabled="busy"></div>
-      <div v-if="original.spec" class="field">
-        <label for="report-edit-spec">声明式报告 JSON</label>
-        <textarea id="report-edit-spec" class="in mono" v-model="form.spec" rows="14" spellcheck="false" :disabled="busy"></textarea>
-        <p class="field-help">保存时使用基准版本的数据，服务端重新验收。</p>
-      </div>
-      <p v-else class="field-help">历史报告在此编辑名称和说明。正文可通过声明式模板迁移。</p>
+      <p class="field-help">正文修订可通过已接入的 AI 助手完成。</p>
       <a :href="preview" target="_blank" rel="noopener">打开基准版本</a>
     </form>
     <template #foot>
@@ -1318,15 +1181,15 @@ const ReportEditor = {
     const path = '/api/reports/' + props.report.id;
     const form = ref(null), original = ref(null), preview = ref('');
     const loading = ref(true), busy = ref(false), error = ref('');
-    const dirty = computed(() => !!form.value && (form.value.name !== original.value.name || form.value.spec !== original.value.spec || !!form.value.change_note));
+    const dirty = computed(() => !!form.value && (form.value.name !== original.value.name || !!form.value.change_note));
     async function load() {
       loading.value = true;
       error.value = '';
       try {
         // 抽屉打开后锁定基准，即使另一个页面切换了版本也不会误编辑。
-        const { name, spec, revision, access_level, url } = await api(path + '?include_source=true&version=' + props.report.revision);
+        const { name, revision, access_level, url } = await api(path + '?version=' + props.report.revision);
         if (access_level === 'view') throw new Error('当前账号无权编辑该报告');
-        original.value = { name, spec: spec ? pretty(spec) : '', base_version: revision, change_note: '' };
+        original.value = { name, base_version: revision, change_note: '' };
         form.value = { ...original.value };
         preview.value = url;
       } catch (e) { error.value = e.message; }
@@ -1341,9 +1204,7 @@ const ReportEditor = {
       busy.value = true;
       error.value = '';
       try {
-        const { spec, ...body } = form.value;
-        if (spec !== original.value.spec) body.spec = jsonOrThrow(spec, '声明式报告');
-        const saved = await api(path, { method: 'PUT', body });
+        const saved = await api(path, { method: 'PUT', body: form.value });
         toast('已保存版本 ' + saved.revision, 'ok');
         emit('saved', saved);
       } catch (e) { error.value = e.message; }
@@ -1477,7 +1338,6 @@ const Reports = {
       <div class="actions">
         <button type="button" class="btn" ref="mergeButton" :disabled="!selecting && (loading || !!loadError || list.length < 2)"
           @click="toggleMerge">{{selecting ? '取消选择' : '合并报告'}}</button>
-        <button class="btn primary" @click="create"><span class="ico" v-html="icon('plus')"></span>生成报告</button>
       </div></div>
     <section class="card list-panel" aria-label="报告列表" :aria-busy="loading">
       <div class="list-tools">
@@ -1493,9 +1353,9 @@ const Reports = {
       <div v-else-if="!shown.length" class="collection-state">
         <span class="empty-icon" v-html="icon(kw.trim() ? 'search' : 'rep')"></span>
         <h2>{{kw.trim() ? '未找到匹配的报告' : '还没有报告'}}</h2>
-        <p>{{kw.trim() ? '可以修改关键词，或查看全部报告。' : '选择已有模板，使用当前数据生成第一份报告。'}}</p>
+        <p>{{kw.trim() ? '可以修改关键词，或查看全部报告。' : '在已接入的 AI 助手中提交分析需求即可生成报告。'}}</p>
         <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
-        <button v-else class="btn" @click="create">选择模板</button>
+        <a v-else class="btn" href="#templates">查看报告模板</a>
       </div>
       <div v-else class="scroll-x" tabindex="0" aria-label="报告表格"><table class="tbl report-table" role="table">
         <thead><tr><th scope="col">报告名称</th><th scope="col">版本</th><th scope="col">来源模板</th><th scope="col" v-if="admin">创建人</th><th scope="col">版本时间</th><th scope="col">操作</th></tr></thead>
@@ -1558,7 +1418,7 @@ const Reports = {
     onBeforeUnmount(() => window.removeEventListener('focus', reports.load));
     return { ...reports, admin: computed(isAdmin), creator, shown, kw, sharing, editing, versions, saved, selected, del,
       selecting, picked, pickedIds, merging, mergeButton, toggleMerge, pick, merged,
-      create: () => startReport(), fmtTime, fmtSize, queryRows, icon, reportVersionPath };
+      fmtTime, fmtSize, queryRows, icon, reportVersionPath };
   }
 };
 
@@ -2176,7 +2036,7 @@ const appRoot = document.getElementById('app');
 if (appRoot.dataset.reportId) {
   createApp(ReportViewer, { reportId: appRoot.dataset.reportId, initialVersion: appRoot.dataset.reportVersion }).mount(appRoot);
 } else createApp({
-  components: { Login, GenerateReport },
+  components: { Login },
   template: `<Login v-if="state.needLogin"/>
   <div class="shell" v-else-if="state.me">
     <aside class="side">
@@ -2204,7 +2064,6 @@ if (appRoot.dataset.reportId) {
       </header>
       <main id="main-content" ref="main" class="main" tabindex="-1"><component :is="page" :key="pageKey"/></main>
     </div>
-    <GenerateReport v-if="reportDraft" :template="reportDraft.template" @close="reportDraft=null"/>
   </div>
   <div v-else class="app-pending" role="status">
     <template v-if="bootError"><p>无法打开管理台。{{bootError}}</p><button class="btn" @click="init">重试</button></template>
@@ -2261,6 +2120,6 @@ if (appRoot.dataset.reportId) {
     }
     onMounted(() => { init(); window.addEventListener('focus', refreshIdentity); });
     onBeforeUnmount(() => window.removeEventListener('focus', refreshIdentity));
-    return { state, page, pageKey, groups, currentGroup, current, person, menuOpen, main, reportDraft, bootError, init, icon, toasts, logout };
+    return { state, page, pageKey, groups, currentGroup, current, person, menuOpen, main, bootError, init, icon, toasts, logout };
   }
 }).mount('#app');

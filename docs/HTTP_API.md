@@ -2,7 +2,7 @@
 
 本指南面向调用 SmartReportGen 的开发者。管理台、HTTP API 和 MCP 共用一个服务入口。接口路径均相对于部署地址 `BASE_URL`，例如 `https://report.example.com/api/me`。域名、工号、资源 ID 和数据都是示例。部署实例的 Swagger 在 `$BASE_URL/docs`，OpenAPI 文档在 `$BASE_URL/openapi.json`，本指南的在线版在 `$BASE_URL/api-guide`。
 
-[首次调用](#quickstart) · [获取凭证](#authentication) · [运行结构化模板并下载报告](#report-quickstart) · [常见问题](#troubleshooting) · [接口参考](#api-reference)
+[首次调用](#quickstart) · [获取凭证](#authentication) · [生成并下载报告](#report-quickstart) · [常见问题](#troubleshooting) · [接口参考](#api-reference)
 
 <a id="quickstart"></a>
 
@@ -80,20 +80,18 @@ IAM 返回 `resultCode=0` 时从 `data.access_token` 读取令牌，部分 IAM �
 
 <a id="report-quickstart"></a>
 
-## 运行声明式模板并下载报告
+## 生成并下载报告
 
-先完成 [首次调用](#quickstart)，再选择已配置、包含查询计划的声明式模板。运行会按当前账号取数，完成编译和 Chromium 验收，成功时保存报告。
+报告新建从 MCP 发起。用 `prepare_report_context` 获取场景及 Markdown 指南，用 `run_query(snapshot=true)` 获取快照，用 `create_html_draft` 与 `upsert_html_section` 拼装章节。将 `draft_id` 传给 `save_report`，服务端展开为离线 HTML，通过 Chromium 后返回 `report_id`、`version` 及 `download_url`。需先审阅时，调用 `verify_html_draft` 获取 `preview_id` 和预览链接，确认后将 `preview_id` 传给 `save_report`。
+
+用同一个 IAM 账号访问预览及报告，或使用获得报告分享及底层数据授权的账号查看已保存版本。
 
 ```bash
-TEMPLATE_ID=12
-report=$(api "$BASE_URL/api/templates/$TEMPLATE_ID/render" -H 'Content-Type: application/json' --data-binary '{"parameters":{"period":"2026-09"}}')
-REPORT_ID=$(printf '%s\n' "$report" | jq -er '.id | numbers')
-api "$BASE_URL/reports/$REPORT_ID/download" --output "report-$REPORT_ID.html"
+curl -fsS "$BASE_URL/reports/$REPORT_ID/download?version=$VERSION" \
+  -H "Authorization: Bearer $SMARTREPORT_TOKEN" -o report.html
 ```
 
-使用模板实际声明的参数名，无参数时传 `{}`。模板可通过 `POST /api/templates` 提交 `{"dataset_id":12,"spec":{...}}` 创建。[完整 Spec 和官方指标示例](../skills/smart-report/references/declarative-report.md)
-
-<a id="troubleshooting"></a>
+[HTML 拼装指南](../skills/smart-report/references/html-assembly.md)
 
 ## 常见问题
 
@@ -104,7 +102,7 @@ api "$BASE_URL/reports/$REPORT_ID/download" --output "report-$REPORT_ID.html"
 | `/api/me` 返回 `200`，但 `registered:false` | IAM 已识别该工号。请管理员检查 SmartReportGen 的员工登记和启用状态 |
 | `403`、场景列表为空，或校验结果提示无权访问表 | 用 `/api/me/permissions` 核对授权。管理员接口要求管理员身份，模板修改要求创建人权限，报告操作按报告分享级别校验 |
 | `404` | 对照接口的 HTTP 方法与路径，使用列表或创建响应中的真实 ID。数据源或场景对该账号不可见时也可能返回 `404` |
-| `422` 或 `400` | 查看 `detail`，核对路径和查询参数类型、JSON 字段及 `Content-Type`。模板校验返回 `200` 时也要检查 `ok` 和 `errors` |
+| `422` 或 `400` | 查看 `detail`，核对路径和查询参数类型、JSON 字段及 `Content-Type` |
 | 报告编辑返回 `409` | 重新读取报告及其最新版本号，对照冲突前的基准版本后再保存 |
 | 收到 `302` 或 HTML 登录页 | 程序调用报告正文或下载接口时发送 Bearer，并检查响应 `Content-Type`。调试时先用 `api -i "$BASE_URL/实际请求路径"` 查看状态和 `Location` |
 | IAM 校验返回 `503` | 请部署方检查 IAM 配置和服务到 IAM 的连通性。浏览器也可用 `/api/auth/config` 查看 `iam_configured` |
@@ -119,7 +117,7 @@ api "$BASE_URL/reports/$REPORT_ID/download" --output "report-$REPORT_ID.html"
 
 | 状态 | 含义 |
 |---|---|
-| `400` | 业务参数、连接、SQL 或渲染失败。模板校验接口有单独的 `200` 与 `ok:false` 约定 |
+| `400` | 业务参数、连接、SQL 或浏览器校验失败 |
 | `401` | 缺少有效身份或 IAM 票无效、过期。REST 接口返回 `WWW-Authenticate` |
 | `403` | 账号未登记、已停用或权限不足。部分资源接口用 `404` 隐藏不可见资源 |
 | `404` | 资源不存在、不可见或路径不匹配 |
@@ -141,8 +139,7 @@ REST 业务错误通常为 `{"detail":"错误说明"}`，`422` 的 `detail` 是�
 | `GET /` | `200 text/html` | 管理台页面，带 `Cache-Control: no-cache`。页面加载后查询当前登录身份 |
 | `GET /healthz` | `200`，`{"ok":true}` | 检查 HTTP 服务及元数据库连通性。失败返回非 2xx |
 | `GET /api-guide` | `200 text/html` | 本文的在线版本 |
-| `GET /api-guide/report-spec` | `200 text/plain` | 声明式报告模板及官方指标配置 |
-| `GET /api-guide/template-spec` | `200 text/plain` | Markdown 报告模板规范全文 |
+| `GET /api-guide/html-assembly` | `200 text/plain` | HTML 草稿与快照绑定指南 |
 | `GET /docs` | `200 text/html` | Swagger UI |
 | `GET /docs/oauth2-redirect` | `200 text/html` | FastAPI 自带的 Swagger OAuth 回调页 |
 | `GET /redoc` | `200 text/html` | ReDoc 页面 |
@@ -319,7 +316,7 @@ Oracle 的 `config.schema` 用作默认浏览范围及 SQL 会话的当前 Schem
 {"datasource":"客服工单接口","dialect":"api","columns":["resolve_hours"],"rows":[[3.5],[4.0]],"row_count":2,"truncated":true}
 ```
 
-SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 DuckDB 方言。`dialect` 返回数据源类型，列名转为小写，重名列会追加后缀。`row_count` 是本次实际返回的行数，`truncated:true` 表示有更多行。普通员工可使用已授权的模板校验、预览或 MCP 场景级工具查询数据。
+SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 DuckDB 方言。`dialect` 返回数据源类型，列名转为小写，重名列会追加后缀。`row_count` 是本次实际返回的行数，`truncated:true` 表示有更多行。普通员工通过 MCP 场景级工具查询授权数据。
 
 ## 业务场景
 
@@ -374,75 +371,22 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 ## 报告模板
 
-自由版式模块使用 MCP 的 `save_free_report_template`、`patch_free_report_template` 和 `preview_free_report`。HTTP 的模板运行可按已保存的自由模板取数验收，报告读取的 `include_source=true` 返回 `free_report` 定义，报告修订可提交同账号的验收 `preview_id`。[自由版式模板契约](../skills/smart-report/references/free-report.md)
+模板是 `business` 类型的 Markdown 指南，用于记录分析目标、章节结构、指标口径、取数和展示要求。历史定义在读取时转换成 Markdown。
 
-声明式模板保存场景、取数计划和报告定义。历史 Markdown 与旧结构化模板可查看、诊断及迁移。
-
-| 方法与路径 | 权限 | 请求 | 响应 |
-|---|---|---|---|
-| `GET /api/templates` | 登录 | 可选查询参数 `q`，按模板名、场景、业务说明、目标、需求搜索 | 模板摘要数组，按更新时间降序。普通用户仅见本人模板 |
-| `POST /api/templates` | 登录 | JSON 模板写入对象，提交 `spec` 或 `markdown`，其他字段见下方 | 模板详情，初始 `version:1`。源码非法返回 `400`，无权使用指定场景返回 `403` |
-| `POST /api/templates/validate` | 登录 | JSON 传 `markdown`，可选整数 `dataset_id`、布尔值 `execute`（默认 `true`） | 校验结果。结构、SQL 或字段校验失败仍返回 `200`，以 `ok:false` 及 `errors` 表示。对请求中指定的场景无权访问时返回 `403` |
-| `POST /api/templates/preview` | 登录 | JSON 传 `markdown`，可选整数 `dataset_id`。管理员可传 `owner`（工号）按其个人样式预览 | `200 text/html`，即时渲染的报告页面。源码、SQL 或渲染失败返回 `400`，无权使用指定场景返回 `403` |
-| `GET /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id` | 模板详情，额外附 `versions`。不存在返回 `404`，非本人且非管理员返回 `403` |
-| `PUT /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`。JSON 提交 `spec` 或 `markdown`，可同时更新管理字段或传正整数 `expected_version` | 更新后的模板详情，源码变化时新增版本。版本冲突返回 `409`，不存在返回 `404`，权限或校验失败同新增及详情 |
-| `DELETE /api/templates/{tpl_id}` | 本人 | 路径 `tpl_id`，无请求体 | `{"ok":true}`，删除模板及历史版本，已生成的报告保留。不存在返回 `404`，越权返回 `403` |
-| `GET /api/templates/{tpl_id}/versions/{version}` | 本人 | 路径 `tpl_id`、`version` | `{"version":1,"markdown":"历史 Markdown 源码","created_at":"2026-01-01T00:00:00+00:00"}`。模板或版本不存在返回 `404`，越权返回 `403` |
-| `POST /api/templates/{tpl_id}/render` | 本人 | 路径 `tpl_id`。可省略请求体，或传 `name`、`template_version` 与模板声明的 `parameters` | 运行声明式模板并验收保存。旧格式、取数或验收失败返回 `400`，越权返回 `403`，模板不存在返回 `404` |
-
-**模板写入字段**
-
-| 字段 | 类型 | 说明 |
+| 方法与路径 | 权限 | 请求与响应 |
 |---|---|---|
-| `spec` | 对象 | 完整声明式模板，须指定 `dataset_id`，按 `business` 类型保存 |
-| `markdown` | 字符串 | 历史 Markdown；旧结构化模板写入时做语法校验 |
-| `template_type` | `business` 或 `structured`，可选 | `business` 为声明式模板或历史业务文档，`structured` 为旧结构化格式。新增省略时沿用 `structured` 默认值，创建后类型固定 |
-| `name` | 字符串，可选 | 模板名，省略或空字符串时取源码标题，更新时也是如此 |
-| `dataset_id` | 整数或 `null`，可选 | 关联场景。新增省略时无关联，更新省略时沿用原值，传 `null` 解除关联 |
-| `user_requirement` | 字符串，可选 | 用户需求 |
-| `analysis_goal` | 字符串，可选 | 分析目标。无有效值时尝试读取源码中的 `analysis_goal` |
-| `business_summary` | 字符串，可选 | 业务说明 |
+| `GET /api/templates` | 登录 | 可用 `q` 与 `dataset_id` 筛选。返回本人及授权场景的模板，管理员可查看全部 |
+| `POST /api/templates` | 登录 | 提交 Markdown、名称或正文一级标题，以及可选业务字段。返回 `version:1` |
+| `GET /api/templates/{tpl_id}` | 本人或有场景权限 | 返回指南正文、概要及 `versions` |
+| `PUT /api/templates/{tpl_id}` | 创建人或管理员 | 提交 Markdown 与待更新字段。可传 `expected_version`，冲突返回 `409` |
+| `GET /api/templates/{tpl_id}/versions/{version}` | 本人或有场景权限 | 返回 `version`、`markdown`、`created_at` |
+| `DELETE /api/templates/{tpl_id}` | 创建人或管理员 | 删除模板及其历史版本，已保存报告仍可访问 |
 
-更新省略 `user_requirement`、`analysis_goal`、`business_summary` 时沿用原字段。创建人由服务端记录。版本接口的 `markdown` 可重新提交到更新接口以恢复旧内容。`validate` 和 `preview` 用于结构化模板。结构化源码格式见 [报告模板说明](../skills/smart-report/references/template-spec.md)。
+写入字段包括 `name`、`markdown`、`dataset_id`、`user_requirement`、`analysis_goal`、`business_summary`。`markdown` 必填。更新时省略可选业务字段会沿用原值，`dataset_id:null` 可解除关联。正文或模板业务字段变化时追加版本。载入历史版本的 `markdown` 再提交更新即可恢复正文。摘要包含 `title`、`sections` 和 `format:"markdown"`。
 
-**模板写入请求示例**（`POST /api/templates`）
+## 报告草稿
 
-```json
-{
-  "dataset_id":12,
-  "business_summary":"查看客服工单数量。",
-  "markdown":"---\ntitle: 客服工单日报\nqueries:\n  q1:\n    sql: SELECT COUNT(*) AS ticket_count FROM tickets\n---\n\n## 工单概况\n\n按日跟踪工单变化。"
-}
-```
-
-**模板摘要示例**
-
-```json
-{
-  "id":7,"name":"客服工单日报","dataset_id":12,"business_scenario":"客服工单分析","template_type":"structured",
-  "user_requirement":"","analysis_goal":"","business_summary":"查看处理时长。",
-  "summary":{"title":"客服工单日报","sections":["工单概况"],"chart_count":0,"filter_count":0,"query_count":1,"chart_types":[]},
-  "version":1,"created_at":"2026-01-01T00:00:00+00:00","updated_at":"2026-01-01T00:00:00+00:00",
-  "created_by":"E10001","creator_name":"示例员工"
-}
-```
-
-模板详情在摘要上增加字符串 `markdown`。详情 GET 还增加 `versions`（按版本降序），每项为 `{"version":1,"created_at":"2026-01-01T00:00:00+00:00","size":120}`，`size` 是该版本源码的字符数。新增和更新的响应不含 `versions`。未关联场景时 `dataset_id`、`business_scenario` 可为 `null`，历史记录的 `created_by`、`creator_name` 也可为 `null`。
-
-**校验结果示例**
-
-```json
-{
-  "ok":true,"errors":[],"warnings":[],
-  "summary":{"title":"客服工单日报","sections":["工单概况"],"chart_count":0,"filter_count":0,"query_count":1,"chart_types":[]},
-  "queries":{"q1":{"datasource":"客服工单接口","rows":1,"columns":["ticket_count"],"truncated":false,"ms":12,"sample":[[50]]}},
-  "filters":{}
-}
-```
-
-结构校验通过且 `execute:true` 时返回 `queries` 和 `filters`，分别按查询 ID 和筛选器 ID 索引。查询结果的 `rows` 为行数，`sample` 最多 5 行，列顺序与 `columns` 一致，`ms` 为执行毫秒数。筛选器项为 `{"distinct":2,"examples":["在线客服","电话"]}`，`examples` 最多 12 个。指定 `execute:false` 或存在结构错误时，响应只含 `ok`、`errors`、`warnings` 和 `summary`。普通用户实际执行的 SQL 须通过表级权限检查，查询权限失败会出现在 `errors` 中。
-
-已有 UTF-8 Markdown 文件时，可用 `jq --rawfile markdown template.md` 构造请求。完整调用见[运行结构化模板并下载报告](#report-quickstart)。HTTP 生成使用模板创建人的个人样式，报告归属模板创建人。报告保存生成时的数据和样式，浏览器在这份数据上执行交互筛选。
+`GET /api/report-drafts` 返回按最近操作排序的草稿摘要。普通员工仅见自己的草稿，管理员可查看所有草稿的进度。每项包含 `draft_id`、`revision`、`status`、有序 `sections`、最近的 `events`、`last_verification` 和 `last_error`。草稿与预览在工作卷中保留 24 小时，分块源码随正式报告版本入库。MCP 的 `get_html_draft` 可按需读取单个章节源码。
 
 ## 报告库
 
@@ -453,7 +397,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `GET /api/reports/{report_id}` | 本人或获分享 | 可选查询参数 `version`（正整数）、`include_html`、`include_source`（布尔值，均默认 `false`） | 报告详情与固定版本链接。按需增加 `html`（字符串）及 `markdown`（字符串或 `null`） |
 | `GET /api/reports/{report_id}/versions` | 本人或获分享 | 无额外参数 | 默认查看的版本详情（无链接字段）及 `versions` 数组，按版本号降序 |
 | `PUT /api/reports/{report_id}/selection` | 本人或获分享 | JSON 必填 `version`，正整数或 `null`。例如 `{"version":2}` | 保存当前账号的版本选择，返回所选版本详情。`{"version":null}` 恢复跟随最新。格式错误返回 `422` |
-| `PUT /api/reports/{report_id}` | 本人或获编辑权限 | JSON 必填 `name`。修改正文传 `spec` 或同账号生成的验收 `preview_id`。可选 `base_version`、`expected_version`、`revision`、`change_note` | 在同一报告追加版本，返回新版本详情。并发冲突返回 `409`，字段校验失败返回 `422`，内容或渲染失败返回 `400` |
+| `PUT /api/reports/{report_id}` | 本人或获编辑权限 | JSON 必填 `name`。修改正文传其中一项 `draft_id`、`preview_id` 或 `html`。可选 `base_version`、`expected_version`、`revision`、`change_note` | 在同一报告追加版本，返回新版本详情。并发冲突返回 `409`，字段校验失败返回 `422`，内容或渲染失败返回 `400` |
 | `DELETE /api/reports/{report_id}` | 本人 | 无额外参数 | `{"ok":true}`，删除报告及版本和分享记录 |
 | `GET /api/reports/{report_id}/shares` | 本人 | 无额外参数 | 分享对象数组，按工号升序 |
 | `GET /api/reports/{report_id}/share-recipients` | 本人 | 可选查询参数 `q`（姓名或工号，最多 100 个字符） | 最多 20 个已启用接收人，仅返回 `emp_no`、`name` |
@@ -492,7 +436,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | 响应 | 字段区别 |
 |---|---|
 | 列表摘要 | 以上详情去掉 `dataset_id`、`source_available`、三个 URL 字段，增加 `template_name`、`creator_name`（均可为 `null`） |
-| 详情、编辑、版本选择 | 以上结构。仅详情 GET 可按查询参数返回 `html` 或 `markdown`。`source_available` 表示当前账号有权获取该版本保存的 Markdown。请求源码但无法提供时，`markdown` 为 `null` |
+| 详情、编辑、版本选择 | 以上结构。仅详情 GET 可按查询参数返回 `html` 或 `markdown`。`source_available` 表示当前账号有权获取该版本保存的分块源码或历史源码。请求源码但无法提供时，`markdown` 为 `null` |
 | 版本列表 | 以上详情去掉三个 URL 字段，增加 `versions` 数组。每项含 `version`、`base_version`、`name`、`created_at`、`created_by`、`creator_name`、`change_note` |
 | 生成结果 | `id`、`name`、`template_id`、`template_version`、`meta`、`created_at`、`created_by`、`size`、`revision`、`latest_version`、`current_version`、`base_version`、三个 URL 字段和顶层 `warnings`。三个版本号初始为 `1`，`base_version` 为 `null`，链接省略 `version` |
 
@@ -511,14 +455,15 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | 字段 | 类型及用途 |
 |---|---|
 | `name` | 必填，非空字符串。保存时去除首尾空白 |
-| `spec` | 声明式正文。省略 `parameters` 时复用基准数据，提交 `parameters` 时重新取数 |
+| `draft_id` | 由当前账号从相同报告及基准版本创建的草稿，服务端按需校验 |
+| `html` | 完整 HTML，可用 `dataset_id` 指定场景，服务端校验后追加版本 |
 | `preview_id` | 与报告和基准版本匹配、由当前账号生成的服务端验收预览 |
 | `base_version` | 可选正整数，从详情的 `revision` 读取。指定编辑使用的版本，允许从历史版本生成新版本。省略时使用个人选定版本或最新版本，旧链接默认用原快照 |
 | `expected_version` | 可选正整数，从详情的 `latest_version` 读取。传入后，如果报告在读取后产生了新版本，保存返回 `409` |
 | `revision` | 兼容旧客户端的可选正整数，同时作为 `base_version` 与 `expected_version`。传入时省略另外两个版本字段 |
 | `change_note` | 可选字符串，默认空，最多 500 字符 |
 
-例如当前已有 v1–v4，使用 `base_version:2`、`expected_version:4` 成功保存时产生 v5，响应中 `base_version` 为 2，`revision` 和 `latest_version` 为 5。保存后编辑者恢复跟随最新版本。声明式正文变更重新执行服务端验收，并留存新版本源码。收到 `409` 时先读取最新内容和版本，再决定如何合并修改。
+例如当前已有 v1–v4，使用 `base_version:2`、`expected_version:4` 成功保存时产生 v5，响应中 `base_version` 为 2，`revision` 和 `latest_version` 为 5。保存后编辑者恢复跟随最新版本。正文变更使用通过 Chromium 校验的内容。草稿分块源码随版本保存。收到 `409` 时先读取最新内容和版本，再决定如何合并修改。
 
 **分享请求与响应示例**（`POST /api/reports/15/shares`）
 
@@ -596,7 +541,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `general_rules`、`scenario_rules` | 生效的通用规则和当前用户个人场景规则数组。规则的 `items` 附 `category_label`。有检索命中时规则附 `relevance`，结构同业务场景检索命中去掉 `dataset` |
 | `warnings` | 字符串数组，例如相关度检索的向量降级提示 |
 
-MCP 的 `get_style_rules` 和 `prepare_report_context` 也提供同一份 `reporting_rules`。声明式报告由服务端完成静态审计及 Chromium 验收。本地审计脚本可诊断历史草稿，不能签发保存凭证。场景负责人可通过 `semantic_metrics` 配置官方指标，见[声明式模板和取数计划](../skills/smart-report/references/declarative-report.md)。
+MCP 的 `get_style_rules` 和 `prepare_report_context` 也提供同一份 `reporting_rules`。草稿可以引用 `style_id` 内联主题。场景负责人可通过 `semantic_metrics` 配置官方指标。
 
 **`effective` 与 `preview` 请求示例**
 

@@ -19,6 +19,9 @@ RESOURCE_ATTRIBUTES = {
     "image": ("href", "xlink:href"), "use": ("href", "xlink:href"), "feimage": ("href", "xlink:href"),
 }
 LEGACY_ECHARTS = re.compile(r'<script src="(?:[^"<>]*/)?static/vendor/echarts\.min\.js"></script>')
+OFFLINE_POLICY = ("default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; "
+                  "style-src 'unsafe-inline' data:; img-src data: blob:; font-src data:; "
+                  "base-uri 'none'; form-action 'none'")
 
 
 def skill_dir() -> Path:
@@ -51,16 +54,24 @@ class _ReportDocument(HTMLParser):
         self.inline_style = False
         self.inline_script = False
         self.references: set[str] = set()
+        self.external: list[dict] = []
         self._block = ""
+        self._sections: list[str | None] = []
+        self._block_section: str | None = None
+        self.head_position: tuple[int, int] | None = None
+        self.close_positions: dict[str, tuple[int, int]] = {}
+        self.csp_positions: list[tuple[int, int, int]] = []
 
     def handle_decl(self, decl: str) -> None:
         self.doctype |= decl.lower() == "doctype html"
 
     def _resource(self, value: str, location: str, *, script: bool = False) -> None:
         # data URI 和文档内锚点不需要随报告另行分发文件。
-        value = value.strip().lower()
-        if value and (script or not value.startswith(("data:", "#"))):
+        value = value.strip()
+        if value and (script or not value.lower().startswith(("data:", "blob:", "#"))):
             self.references.add(location)
+            self.external.append({"url": value, "location": location, "section_id": self._block_section or
+                                  next((item for item in reversed(self._sections) if item), None)})
 
     def _css(self, data: str) -> None:
         for match in CSS_REFERENCE.finditer(CSS_COMMENT.sub("", data)):
@@ -69,18 +80,29 @@ class _ReportDocument(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.elements.add(tag)
         attrs = {key: value or "" for key, value in attrs}
+        if tag == "head" and self.head_position is None:
+            line, column = self.getpos()
+            self.head_position = (line, column + len(self.get_starttag_text()))
+        if tag == "section":
+            self._sections.append(attrs.get("data-srg-section"))
         if tag == "style":
             self._block = "style"
+            self._block_section = attrs.get("data-srg-for")
         elif tag == "script":
             # 内嵌 JSON 只是数据，不能替代可执行的联动脚本。
             if attrs.get("type", "").split(";", 1)[0].strip().lower() in SCRIPT_TYPES and "src" not in attrs:
                 self._block = "script"
             if "src" in attrs and not attrs["src"].strip():
-                self.references.add("script[src]")
+                self._resource("(空地址)", "script[src]", script=True)
         for key in RESOURCE_ATTRIBUTES.get(tag, ()):
             self._resource(attrs.get(key, ""), f"{tag}[{key}]", script=tag == "script")
         if tag == "link" and set(attrs.get("rel", "").lower().split()) & {"stylesheet", "preload", "modulepreload", "icon"}:
             self._resource(attrs.get("href", ""), "link[href]")
+        if tag == "meta" and attrs.get("http-equiv", "").strip().lower() == "refresh":
+            self._resource(attrs.get("content", ""), "meta[http-equiv=refresh]", script=True)
+        if tag == "meta" and attrs.get("http-equiv", "").strip().lower() == "content-security-policy":
+            line, column = self.getpos()
+            self.csp_positions.append((line, column, len(self.get_starttag_text())))
         if "style" in attrs:
             self._css(attrs["style"])
         if tag in ("img", "source"):
@@ -94,8 +116,13 @@ class _ReportDocument(HTMLParser):
                 candidates = (remainder if url.endswith(",") else remainder.partition(",")[2]).lstrip(" ,\t\r\n\f")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in ("head", "main", "body"):
+            self.close_positions.setdefault(tag, self.getpos())
+        if tag == "section" and self._sections:
+            self._sections.pop()
         if tag in ("style", "script"):
             self._block = ""
+            self._block_section = None
 
     def handle_data(self, data: str) -> None:
         if self._block == "style":
@@ -105,7 +132,50 @@ class _ReportDocument(HTMLParser):
             self.inline_script |= bool(data.strip())
 
 
-def report_document_error(html: str, *, legacy: bool = False) -> str | None:
+def external_references(html: str) -> list[dict]:
+    document = _ReportDocument()
+    document.feed(html)
+    document.close()
+    return document.external
+
+
+def _line_offsets(html: str) -> list[int]:
+    return [0, *(match.end() for match in re.finditer("\n", html))]
+
+
+def extend_legacy_document(html: str, *, styles: str, sections: str, runtime: str) -> str:
+    """追加到旧页面元素的结束标签。原报告版本仍保留入库时的 CSP 和原始字节。"""
+    document = _ReportDocument()
+    document.feed(html)
+    if not {"head", "body"} <= document.close_positions.keys():
+        raise ValueError("基准 HTML 无法追加章节，请提供包含章节占位符的新骨架")
+    lines = _line_offsets(html)
+    edits = [(lines[line - 1] + col, length, "") for line, col, length in document.csp_positions]
+    for tag, content in (("head", styles), ("main" if "main" in document.close_positions else "body", sections),
+                         ("body", runtime)):
+        line, col = document.close_positions[tag]
+        edits.append((lines[line - 1] + col, 0, content))
+    # 从后往前改写，使源位置不受插入内容影响。同一位置先放脚本，再在脚本之前放章节。
+    for pos, size, content in sorted(reversed(edits), key=lambda edit: edit[0], reverse=True):
+        html = html[:pos] + content + html[pos + size:]
+    return enforce_offline_policy(html)
+
+
+def enforce_offline_policy(html: str, *, probe: str = "") -> str:
+    """把统一策略放进首个真实 head，供浏览器预览及下载的离线文件共同使用。"""
+    document = _ReportDocument()
+    document.feed(html)
+    if document.head_position is None:
+        return html
+    line, column = document.head_position
+    pos = _line_offsets(html)[line - 1] + column
+    csp = f'<meta http-equiv="Content-Security-Policy" content="{OFFLINE_POLICY}">'
+    rest = html[pos + len(csp):] if html.startswith(csp, pos) else html[pos:]
+    return html[:pos] + csp + probe + rest
+
+
+def report_document_error(html: str, *, legacy: bool = False, structural_only: bool = False,
+                          require_runtime: bool = True) -> str | None:
     """检查单文件结构与静态依赖；联动、着色和脚本发出的请求须在浏览器验证。"""
     if "\x00" in html:
         return "HTML 内容包含无效字符"
@@ -120,10 +190,12 @@ def report_document_error(html: str, *, legacy: bool = False) -> str | None:
         not document.doctype or not {"head", "body"} <= document.elements
     )):
         return "请提交包含 <!doctype html>、<html>、<head> 和 <body> 的完整 HTML"
+    if structural_only:
+        return None
     if document.references:
         return "请将报告依赖内联到单文件 HTML，发现外部资源引用：" + "、".join(sorted(document.references))
     # 旧版允许保存静态 HTML。合并时仍检查外部依赖，保持旧报告可用。
-    if not legacy and (not document.inline_style or not document.inline_script):
+    if require_runtime and not legacy and (not document.inline_style or not document.inline_script):
         return "请在同一个 HTML 文件中内联 <style> 样式和可执行的 <script> 脚本"
     return None
 

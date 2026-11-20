@@ -1,4 +1,4 @@
-"""受控取数：只投影直接事实，或按场景负责人登记的公式在数据源聚合。"""
+"""受控取数计划、官方指标和报告权限指纹。"""
 from __future__ import annotations
 
 from contextlib import nullcontext
@@ -16,7 +16,7 @@ from . import report_data
 from .connectors import ConnectorError, get_connector
 from .connectors.base import norm_value
 from .connectors.sql import DEFAULT_PORTS
-from .permission import DIALECT, PermissionDenied
+from .permission import DIALECT, PermissionDenied, access_for
 from .scenario_filters import _table_name, effective_filters, query_in_scenario
 
 Key = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,47}$")]
@@ -235,21 +235,43 @@ def scope_for(dataset_id: int, dataset: dict, source: dict, tables: list[str]) -
             "scope_sha256": sha256(policy.encode()).hexdigest()}
 
 
-def direct_projection(sql: str, ds_type: str) -> None:
-    """兼容直接事实 SQL。聚合、算术和可拼造投影仅可通过受控计划进入报告。"""
-    try:
-        tree = sqlglot.parse_one(sql, read=DIALECT[ds_type])
-    except sqlglot.errors.SqlglotError as exc:
-        raise ConnectorError("报告快照的直接事实 SQL 无法解析") from exc
-    if not isinstance(tree, exp.Select):
-        raise ConnectorError("报告快照只接受直接事实 SELECT，派生请使用官方指标计划")
-    for select in tree.find_all(exp.Select):
-        if (not select.args.get("from_") or any(select.args.get(k) for k in
-                ("group", "distinct", "having", "qualify", "limit", "offset"))
-                or any(not isinstance(x.unalias(), (exp.Column, exp.Star)) for x in select.expressions)):
-            raise ConnectorError("报告快照只允许投影直接事实字段，派生请使用官方指标计划")
-    if any(tree.find_all(exp.AggFunc, exp.Window, exp.SetOperation, exp.Values, exp.Add, exp.Sub, exp.Mul, exp.Div)):
-        raise ConnectorError("报告快照禁止自行计算业务指标，请使用官方指标计划")
+def validate_scopes(scopes: list[dict], principal) -> None:
+    """交付前验证当前表授权、物理来源指纹及场景行范围，改密码或无关配置不影响历史报告。"""
+    from . import repo
+
+    acc = access_for(principal)
+    datasets, sources = {}, {}
+    for recorded in scopes:
+        ds_id = recorded["dataset_id"]
+        if not principal.registered or not all(acc.can_table(ds_id, t) for t in recorded["tables"]):
+            raise PermissionDenied("当前账号无权访问该报告版本包含的数据表")
+        try:
+            if ds_id not in datasets:
+                datasets[ds_id] = repo.get_dataset(ds_id)
+            dataset = datasets[ds_id]
+            ds_source = dataset.get("datasource_id")
+            if ds_source != recorded["source_id"] or not dataset["enabled"]:
+                raise PermissionDenied("报告来源已变化，请按当前数据权限重新取数")
+            if ds_source not in sources:
+                sources[ds_source] = repo.get_datasource(ds_source)
+            source = sources[ds_source]
+            current = scope_for(ds_id, dataset, source, recorded["tables"])
+            # 没有历史指纹时只能核实同一数据源修订，不能用今天的地址替历史快照作证。
+            if "source_target" in recorded:
+                version = recorded.get("source_target_version", 1)
+                same_target = version in (1, 2) and recorded["source_target"] == (
+                    current["source_target"] if version == 2 else source_target_hash(source, recorded["tables"], version=1))
+            else:
+                same_target = bool(current["source_revision"]) and current["source_revision"] == recorded.get("source_revision")
+            if (not source["enabled"]
+                    or current["dataset_id"] != recorded.get("dataset_id")
+                    or current["source_id"] != recorded.get("source_id")
+                    or current["tables"] != recorded.get("tables")
+                    or current["scope_sha256"] != recorded.get("scope_sha256")
+                    or not same_target):
+                raise PermissionDenied("报告数据源或行范围已变化，请重新取数")
+        except repo.NotFound as exc:
+            raise PermissionDenied("报告来源已删除，无法核实该版本的数据权限") from exc
 
 
 def _predicates_for(col_expr: exp.Expr, cond: Any, bind_fn) -> list[exp.Expr]:

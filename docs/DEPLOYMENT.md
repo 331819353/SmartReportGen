@@ -160,23 +160,23 @@ docker compose logs -f api # 首次启动可看到建表、迁移与向量化日
 
 `sample_rows` 控制响应展示行数，`profile_rows` 控制画像采样行数（0–2,000）；默认轻量模式下 `sample_rows=0` 且省略 `profile_rows` 时不执行样本查询。`run_query(snapshot=true, sample_rows=...)` 最多可返回 200 行样本（样本预览字节预算按需扩展至 64 KiB），≤200 行的正式事实查询可一次同时取得完整核数证据与 `snapshot_id`。数据库的 `LIMIT` 约束读取结果；HTTP API 连接器在缓存有效期内复用已物化的内存 DuckDB 表。初次读取按数据源分页合同取数，样本上限仅约束返回给调用方的行数。管理台的 HTTP 探查接口继续使用完整模式，保留既有调用行为。
 
-结构化报告使用 `preview_report_spec`，自由版式报告使用 `preview_free_report`。服务端 Chromium 与 Playwright 由镜像安装。独立部署可用 `SRG_CHROMIUM_PATH` 指定浏览器路径。验收过程需要可运行的无头浏览器，报告查看及筛选无需服务端浏览器。使用 `verification` 和 `timing` 分别查看验收结果与阶段耗时。
+报告可用 `verify_html_draft` 预览，也可直接传 `draft_id` 给 `save_report` 或 `revise_report`，按需完成验收并入库。服务端 Chromium 与 Playwright 由镜像安装。独立部署可用 `SRG_CHROMIUM_PATH` 指定浏览器路径。验收过程需要可运行的无头浏览器，报告查看及筛选无需服务端浏览器。使用 `verification` 和 `timing` 分别查看验收结果与阶段耗时。
 
 字段缓存随数据源连接器隔离，数据源修改后自动更换连接器；每次工具调用仍先校验当前权限。数据库字段发生变化时用 `refresh_schema=true` 刷新探查结果，或将 `SCHEMA_CACHE_SECONDS` 设为 0；API 字段来自记录推断，不叠加字段缓存。
 
-MCP 同步工具在线程池中执行，慢查询不会占用整个事件循环。成功的字典响应附带 `timing`：
+MCP 同步工具在线程池中执行，慢查询不会占用整个事件循环。成功和失败的字典响应均附带 `timing`：
 
 ```json
 {"timing":{"request_id":"调用标识","elapsed_ms":123.4,"stages":{"query.execute":{"calls":1,"elapsed_ms":110.2},"snapshot.write":{"calls":1,"elapsed_ms":2.1}}}}
 ```
 
-每次工具执行都会写入 `event="tool_timing"` 日志，包括失败；字符串指南和代码资产保持原文，错误响应保持原协议，通过日志定位计时。日志只记录工具名、调用标识、状态和耗时，不记录 SQL、业务值或令牌。
+每次工具执行均写入 `event="tool_timing"` 日志。字典错误响应提供 `failed_stage` 和 `diagnostics`，Chromium 子阶段见 `timing.stages`。指南字符串保持原文。日志只记录工具名、调用标识、状态和耗时，不记录 SQL、业务值或令牌。
 
 ```sh
 docker compose logs --since=1h --timestamps mcp | rg '"event": "tool_timing"'
 ```
 
-`elapsed_ms` 是工具在线程池内的执行时间，不含线程池排队、IAM 验证、网络传输和模型思考；`sql.execute` 含数据库连接池等待、执行和取回结果。各阶段可能嵌套或重复调用，不能相加当作端到端耗时。网关日志的 `request_time` 与 `upstream_time` 用于识别 HTTP 层等待；同时记录 Agent 取数、模板、HTML 开发、浏览器验收的阶段起止时间，才能判断一份报告的完整耗时。已有展示门禁和修订后的完整复核要求保持生效。
+`elapsed_ms` 是工具在线程池内的执行时间，不含线程池排队、IAM 验证、网络传输和模型思考；`sql.execute` 含数据库连接池等待、执行和取回结果。各阶段可能嵌套或重复调用，不能相加当作端到端耗时。网关日志的 `request_time` 与 `upstream_time` 用于识别 HTTP 层等待；同时记录 Agent 取数、模板、HTML 开发、浏览器验收的阶段起止时间，才能判断一份报告的完整耗时。可用 MCP 的 `get_html_draft` 或 HTTP 的 `GET /api/report-drafts` 查看阶段、最近校验诊断及操作。
 
 ## 5. 单点登录与身份
 
@@ -273,7 +273,7 @@ server {
   gunzip -c smartreportgen-images.tar.gz | docker load
   docker compose up -d          # 不带 --build
   ```
-- **前端资源**：管理台的 Vue 和结构化报告所用的 ECharts 随镜像提供。新报告直接保存内联样式、脚本和数据的单文件 HTML。下载历史结构化报告时，服务会内联旧版引用的内置 ECharts。
+- **前端资源**：管理台的 Vue 和报告所用的 ECharts 随镜像提供。新报告直接保存内联样式、脚本和数据的单文件 HTML。下载历史报告时，服务会内联旧版引用的内置 ECharts。
 - **数据源在宿主机上**：容器内用 `host.docker.internal` 访问宿主机服务（compose 已配置 `extra_hosts`）。
 
 ## 8. 初始化（管理台）
@@ -282,7 +282,7 @@ server {
 
 1. **数据源**：管理员在「数据源」配置并测试连接，通过「开放给员工构建业务场景」设置 `config.scenario_tables`，按表填写员工工号或角色及可选的固定行范围。已有数据源可在原配置补充开放范围。支持 PostgreSQL、MySQL、StarRocks、Oracle 和 HTTP API。[数据源开放配置](HTTP_API.md#数据源开放配置)
 2. **业务场景**：新建报告先复用适用的已有场景。找不到时，普通用户在「业务场景 → 新建业务场景」选择可引用的数据源和表，填写业务描述与分析思路。个人场景可加筛选，数据源的固定行范围同时生效。MCP 返回 `scenario_management_url` 作为该分支入口。[smart-report 主流程](../skills/smart-report/SKILL.md)
-3. **样式规则**的生效顺序是“当前用户明确要求 > 业务场景规则 > 通用规则 > 内置展示默认值”。后三者合并为一份指定样式，包含视觉样式和展示要求。低层条目及智能体判断不能豁免高层要求；智能体只可裁量章节、选图、筛选维度及未指定的装饰样式，不能自行放宽数字格式、单位、口径、缺失处理和状态色。通用规则由管理员配置，现行声明式预览按操作者加载个人场景样式，由服务端完成静态审计和 Chromium 验收。MCP 客户端可通过 `get_skill_guide` 查看展示契约，通过 `get_preview_file` 读取验收后的 HTML。
+3. **样式规则**的生效顺序是“当前用户明确要求 > 业务场景规则 > 通用规则 > 内置展示默认值”。后三者合并为一份指定样式，包含视觉样式和展示要求。低层条目及智能体判断不能豁免高层要求；智能体只可裁量章节、选图、筛选维度及未指定的装饰样式，不能自行放宽数字格式、单位、口径、缺失处理和状态色。通用规则由管理员配置，草稿可绑定操作者的场景样式，服务端内联并完成 Chromium 校验。MCP 客户端可通过 `get_skill_guide` 查看展示契约，通过 `get_preview_file` 读取验收后的 HTML。
    - 通用规则对所有报告生效；业务场景规则写该场景的特殊要求。
    - 每条规则可设置「展示要求」和「视觉样式」，右侧实时预览。升级前保存的版式结构、图表选择、必备筛选条目可在样式详情的「已停用的分析要求」中查阅。
    - 用“查看最终效果”确认某场景叠加后的样式，每项都标明来源。

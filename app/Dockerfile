@@ -24,7 +24,7 @@ COPY --from=dependencies /opt/python/ /usr/local/
 RUN useradd -r -u 10001 -m app && install -d -m 700 -o app -g app /srv/report-work
 
 COPY app/smartreportgen ./smartreportgen
-# Skill 单一来源：仓库根目录 skills/（MCP 通过 get_skill_guide / get_template_spec / smart_report 提示词对外提供）
+# Skill 单一来源：仓库根目录 skills/（MCP 通过 get_skill_guide / smart_report 提示词对外提供）
 COPY skills/smart-report ./smartreportgen/docs/skill
 COPY docs/HTTP_API.md ./smartreportgen/docs/HTTP_API.md
 

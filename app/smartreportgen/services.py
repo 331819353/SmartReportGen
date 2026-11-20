@@ -138,37 +138,25 @@ def run_query(ds_row: dict, sql: str, limit: int | None = None,
     max_rows = max(1, settings.query_max_rows) if snapshot else 5000
     limit = max(1, min(int(limit or (max_rows if snapshot else 200)), max_rows))
     conn = get_connector(ds_row)
-    validator = None
-    if snapshot and dataset:
-        from .report_queries import direct_projection
-
-        validator = direct_projection
     with measure("query.execute"):
-        res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed,
-                                validate_sql=validator) if dataset else conn.query(sql, limit)
+        res = query_in_scenario(ds_row, dataset, sql, limit, conn, allowed) if dataset else conn.query(sql, limit)
     return {"datasource": ds_row["name"], "dialect": ds_row["type"], **res, "row_count": len(res["rows"])}
 
 
-def render_template_to_report(tpl: dict, name: str | None, principal: Principal, parameters: dict | None = None) -> dict:
-    """从版本化模板执行已授权取数，经过同一验收门禁后保存。"""
-    from . import report_pipeline, report_spec
-
-    decoded = report_spec.decode_template(tpl["markdown"]) if tpl["template_type"] == "business" else None
-    if not decoded:
-        raise repo.Invalid("请将历史模板迁移为声明式模板后生成新报告")
-    spec, dataset_id = decoded
-    staged = report_pipeline.preview(spec, dataset_id, principal, parameters=parameters or {}, template=tpl)
-    return {**report_pipeline.persist(name or tpl["name"], principal, staged["preview_id"]), "warnings": []}
-
-
 def revise_report(report_id: int, principal: Principal, name: str, *, base_version: int | None = None,
-                  html: str | None = None, markdown: str | None = None, change_note: str = "",
-                  expected_version: int | None = None) -> dict:
-    """历史 API 继续支持元数据更新。正文由通过验收的声明式预览提交。"""
-    if markdown is not None:
-        raise repo.Invalid("正文变更请提交通过验收的声明式预览")
-    return repo.update_report(report_id, principal, name, html, base_version,
-                              change_note=change_note, expected_version=expected_version)
+                  draft_id: str | None = None, preview_id: str | None = None, html: str | None = None,
+                  dataset_id: int | None = None, change_note: str = "", expected_version: int | None = None) -> dict:
+    """正文修订走浏览器验收，纯元数据更新沿用原版本内容与证据。"""
+    if any(item is not None for item in (draft_id, preview_id, html)):
+        from . import report_pipeline
+
+        return report_pipeline.persist_report(name, principal, report_id=report_id, base_version=base_version,
+                                              draft_id=draft_id, preview_id=preview_id, html=html,
+                                              dataset_id=dataset_id, change_note=change_note,
+                                              expected_version=expected_version)
+    with measure("report.persist"):
+        return repo.update_report(report_id, principal, name, None, base_version,
+                                  change_note=change_note, expected_version=expected_version)
 
 
 def merge_reports(principal: Principal, name: str, versions: list[tuple[int, int]]) -> str:

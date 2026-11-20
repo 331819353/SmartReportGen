@@ -91,9 +91,9 @@ CREATE TABLE IF NOT EXISTS report_template.report_template (
     user_requirement text NOT NULL DEFAULT '',
     analysis_goal    text NOT NULL DEFAULT '',
     business_summary text NOT NULL DEFAULT '',  -- 展示给业务人员的模板说明
-    template_type    text NOT NULL DEFAULT 'structured' CHECK (template_type IN ('structured', 'business')),  -- 结构化源码或业务 Markdown
+    template_type    text NOT NULL DEFAULT 'business' CHECK (template_type IN ('structured', 'business')),  -- 业务 Markdown，兼容历史记录
     markdown         text NOT NULL,
-    summary          jsonb NOT NULL DEFAULT '{}'::jsonb,  -- 解析摘要：章节/图表/筛选数量
+    summary          jsonb NOT NULL DEFAULT '{}'::jsonb,  -- Markdown 指南标题与章节摘要
     version          int NOT NULL DEFAULT 1,
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now()
@@ -166,9 +166,10 @@ CREATE INDEX IF NOT EXISTS iam_session_expiry ON permission.iam_session(expires_
 ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_approach text NOT NULL DEFAULT '';
 ALTER TABLE dataset.dataset_table ADD COLUMN IF NOT EXISTS row_filters jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS business_summary text NOT NULL DEFAULT '';
-ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS template_type text NOT NULL DEFAULT 'structured'
+ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS template_type text NOT NULL DEFAULT 'business'
     CHECK (template_type IN ('structured', 'business'));
 ALTER TABLE report_template.report_template ADD COLUMN IF NOT EXISTS created_by text;
+ALTER TABLE report_template.report_template ALTER COLUMN template_type SET DEFAULT 'business';
 -- 样式规则的结构化条目 [{category, text}]；content 由条目生成，供模型阅读
 ALTER TABLE style_rule.style_rule ADD COLUMN IF NOT EXISTS items jsonb NOT NULL DEFAULT '[]'::jsonb;
 -- 创建人：通用规则由管理员配置；业务场景规则归属创建人，只对其本人的报告生效

@@ -8,6 +8,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
+from functools import cache
 from hashlib import sha256
 from html import escape
 from html.parser import HTMLParser
@@ -28,7 +29,7 @@ VENDOR_MARKER = "data-srg-vendor"
 ASSET_MARKER = "data-srg-asset"
 STYLE_MARKER = "data-srg-style"
 MARKERS = (MARKER, VENDOR_MARKER, ASSET_MARKER, STYLE_MARKER)
-_FILE_PATTERN = re.compile(r"[0-9a-f]{64}-[0-9a-f]{32}\.(?:json|html|css|meta\.json)|\.srg-[\w-]+")
+_FILE_PATTERN = re.compile(r"[0-9a-f]{64}-(?:draft-[0-9a-f]{32}\.json|[0-9a-f]{32}\.(?:json|html|css|meta\.json))|\.srg-[\w-]+")
 log = logging.getLogger(__name__)
 _cleanup_lock = Lock()
 _next_cleanup = 0.0
@@ -44,7 +45,8 @@ def _json(data) -> str:
 
 def _path(owner: str, ref: UUID, suffix: str) -> Path:
     # 访问者的工号参与寻址。即使知道别人的引用 ID，也只能在本人工号范围内查找。
-    return Path(settings.report_work_dir) / f"{sha256(owner.encode()).hexdigest()}-{ref.hex}.{suffix}"
+    stem = f"draft-{ref.hex}.json" if suffix == "draft.json" else f"{ref.hex}.{suffix}"
+    return Path(settings.report_work_dir) / f"{sha256(owner.encode()).hexdigest()}-{stem}"
 
 
 def _cleanup(directory: Path) -> None:
@@ -329,18 +331,33 @@ def _escape_style_text(css: str) -> str:
     return re.sub(r"</style", lambda m: "<\\/" + m.group(0)[2:], css, flags=re.I)
 
 
+def legacy_queries(document: _DataBlocks) -> dict:
+    """历史编译页把多组事实集中存入 srg-data，修订时也可按原查询名读取。"""
+    packed = next((b for b in document.blocks if b.kind == "snapshot" and b.fields.get("id") == "srg-data"
+                   and b.fields.get(MARKER) == "embedded"), None)
+    if packed is None:
+        return {}
+    data = json.loads(packed.data).get("data", {})
+    return {key: query for key, query in data.items()
+            if isinstance(query, dict) and {"columns", "rows"} <= query.keys()} if isinstance(data, dict) else {}
+
+
 def embed(html: str, owner: str, base_html: str = "") -> str:
     """展开本人的快照、样式及内置运行时，或复用有权编辑的基准版本中的数据/样式块。"""
     lower = html.lower()
     if not any(marker in lower for marker in MARKERS):
         return html
-    base_blocks: list[_DataBlock] | None = None
+    base_document: _DataBlocks | None = None
 
-    def get_base_blocks() -> list[_DataBlock]:
-        nonlocal base_blocks
-        if base_blocks is None:
-            base_blocks = _DataBlocks(base_html).blocks
-        return base_blocks
+    def get_base_document() -> _DataBlocks:
+        nonlocal base_document
+        if base_document is None:
+            base_document = _DataBlocks(base_html)
+        return base_document
+
+    @cache
+    def get_legacy_queries() -> dict:
+        return legacy_queries(get_base_document())
 
     def resolve(block: _DataBlock) -> tuple[str, str] | None:
         ref = block.fields[block.marker] or ""
@@ -353,10 +370,13 @@ def embed(html: str, owner: str, base_html: str = "") -> str:
             if data.strip():
                 raise ReportDataError(f"待展开的数据块应为空：{block_id}")
             if ref == "base":
-                base = next((b for b in get_base_blocks() if b.kind == "snapshot" and b.fields.get("id") == block_id), None)
-                if not base or base.fields[MARKER] != "embedded" or not base.data.strip():
-                    raise ReportDataError(f"基准版本没有数据块：{block_id}")
-                return "embedded", base.data
+                document = get_base_document()
+                base = next((b for b in document.blocks if b.kind == "snapshot" and b.fields.get("id") == block_id), None)
+                if base and base.fields[MARKER] == "embedded" and base.data.strip():
+                    return "embedded", base.data
+                if query := get_legacy_queries().get(block_id):
+                    return "embedded", _json(query).replace("<", "\\u003c")
+                raise ReportDataError(f"基准版本没有数据块：{block_id}")
             try:
                 snapshot_id = UUID(ref)
             except ValueError as exc:
@@ -386,7 +406,7 @@ def embed(html: str, owner: str, base_html: str = "") -> str:
         if data.strip():
             raise ReportDataError("待展开的内嵌样式引用应为空")
         if ref == "base":
-            base_styles = [b for b in get_base_blocks()
+            base_styles = [b for b in get_base_document().blocks
                            if b.kind == "style" and b.fields.get(STYLE_MARKER) == "embedded" and b.data.strip()]
             style_id_attr = block.fields.get("id")
             if style_id_attr:

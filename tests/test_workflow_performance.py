@@ -74,11 +74,11 @@ class WorkflowPerformanceTest(unittest.TestCase):
             self.assertIn("营业收入", keyword.call_args.args[1])
         result = {"hits": [{"dataset": ds, "relevance": 0.9}], "query_tokens": ["营收"], "warnings": []}
         with patch.object(repo, "search_datasets", return_value=result) as find, \
-                patch.object(mcp_server, "prepare_report_context", return_value={"ok": True}) as prepare:
-            response = mcp_server.search_business_scenarios("营收", None, top_k=1, include_context="structured")
+                patch.object(mcp_server.prepare_report_context, "__wrapped__", return_value={"ok": True}) as prepare:
+            response = mcp_server.search_business_scenarios("营收", None, top_k=1, include_context=True)
         self.assertTrue(response["context"]["ok"])
         find.assert_called_once_with("营收", 2, dataset_ids=[1])
-        prepare.assert_called_once_with(1, None, "营收", mode="structured")
+        prepare.assert_called_once_with(1, None, "营收")
 
     def test_light_probe_skips_full_scans_and_limits_sample(self):
         with patch.object(self.connector, "query", wraps=self.connector.query) as query:
@@ -219,11 +219,13 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"dataset_id", "table_name", "mode", "profile_rows"}.issubset(schema))
         self.assertFalse({"ctx", "args", "kwargs"}.intersection(schema))
         for tool_name, expected_keys in (
-            ("save_report", {"name", "html", "preview_id", "template_id", "template_version"}),
-            ("save_report_spec", {"name", "dataset_id", "spec", "template_id", "expected_version"}),
+            ("save_report", {"name", "draft_id", "html", "preview_id", "dataset_id", "template_id", "template_version"}),
+            ("save_report_template", {"name", "dataset_id", "markdown", "template_id", "expected_version"}),
+            ("create_html_draft", {"title", "snapshots", "style_id", "report_id", "base_version"}),
+            ("upsert_html_section", {"draft_id", "section_id", "sections", "shared_js"}),
             ("revise_report", {"report_id", "name", "base_version", "html", "preview_id"}),
             ("get_style_rules", {"business_scenario", "query", "include_css"}),
-            ("prepare_report_context", {"dataset_id", "query", "mode", "sample_rows", "profile_rows"}),
+            ("prepare_report_context", {"dataset_id", "query", "sample_rows", "profile_rows"}),
             ("list_scene_datasources", set()),
             ("save_business_scenario", {"business_scenario", "business_description", "datasource_id", "tables", "semantic_metrics"}),
         ):
@@ -231,7 +233,7 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(expected_keys.issubset(props), tool_name)
             self.assertFalse({"ctx", "args", "kwargs"}.intersection(props), tool_name)
 
-    def test_prepare_report_context_bundles_scenario_style_and_contract(self):
+    def test_prepare_report_context_bundles_scenario_style_and_guides(self):
         dataset = {"id": 1, "business_scenario": "测试场景", "business_description": "描述",
                    "analysis_approach": "先看总量", "datasource_id": 2, "datasource_name": "源",
                    "datasource_type": "api", "tags": ["测试"], "semantic_metrics": {},
@@ -246,14 +248,17 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(mcp_server.services, "get_connector", return_value=MetadataConnector()), \
                 patch.object(mcp_server.services, "describe_table", return_value={"columns": [{"name": "v"}], "sample_rows": []}), \
                 patch.object(mcp_server.repo, "style_rules_for", return_value=style_stub), \
-                patch.object(mcp_server.report_data, "save_style", return_value="style-uuid"):
-            res = mcp_server.prepare_report_context(1, None, mode="structured")
+                patch.object(mcp_server.report_data, "save_style", return_value="style-uuid"), \
+                patch.object(repo, "list_templates", return_value=[]) as templates:
+            res = mcp_server.prepare_report_context(1, None)
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["scenario"]["analysis_approach"], "先看总量")
         self.assertEqual(res["total_tables"], 1)
         self.assertEqual(res["style"]["builtin_style"]["style_id"], "style-uuid")
         self.assertNotIn("css", res["style"]["builtin_style"])
-        self.assertIn("schema", res["contract"])
+        self.assertIn("SRG.rows", res["html_assembly_hint"])
+        self.assertEqual(res["templates"], [])
+        templates.assert_called_once_with(owner="context-reader", dataset_id=1, allowed_datasets=[1])
 
     def test_list_scene_datasources_and_save_business_scenario(self):
         reader = Access(Principal("E100", roles=["analyst"]), tables={})

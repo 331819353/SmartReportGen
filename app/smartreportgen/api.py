@@ -22,15 +22,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from . import auth, db, design, embedding, iam, permission, repo, report_browser, report_data, report_pipeline, report_spec, seed, services
+from . import auth, db, design, embedding, iam, permission, repo, report_browser, report_data, report_draft, report_pipeline, seed, services
 from .config import settings
 from .connectors import ConnectorError, get_connector
-from .renderer import RenderError, render, standalone, validate
-from .report_document import skill_dir
-from .template_parser import TemplateError
+from .report_document import inline_legacy_echarts, skill_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("smartreportgen.api")
@@ -155,7 +153,7 @@ async def auth_middleware(request: Request, call_next):
     if principal.is_admin or path.startswith("/reports/") or _user_allowed(request.method, path):
         response = await call_next(request)
         # 每次打开报告都重新校验分享权限，避免撤销后浏览器继续使用缓存。
-        if path.startswith(("/reports/", "/api/reports")):
+        if path.startswith(("/reports/", "/api/reports", "/api/report-drafts", "/api/templates")):
             response.headers["Cache-Control"] = "no-store"
         return response
     return JSONResponse({"detail": "需要管理员权限；如需开通请联系管理员"}, status_code=403)
@@ -170,10 +168,10 @@ USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
     ("POST", r"^/api/style-rules(/effective|/preview)?$"), ("PUT", r"^/api/style-rules/\d+$"),
     ("DELETE", r"^/api/style-rules/\d+$"),
-    ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates(/validate|/preview|/\d+/render)?$"),
+    ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates$"),
     ("PUT", r"^/api/templates/\d+$"), ("DELETE", r"^/api/templates/\d+$"),
     ("GET", r"^/api/reports(/\d+(/shares|/share-recipients|/versions)?)?$"), ("PUT", r"^/api/reports/\d+(/selection)?$"),
-    ("POST", r"^/api/reports/(merge|\d+/shares)$"), ("DELETE", r"^/api/reports/\d+(/shares/[^/]+)?$"),
+    ("GET", r"^/api/report-drafts$"), ("POST", r"^/api/reports/(merge|\d+/shares)$"), ("DELETE", r"^/api/reports/\d+(/shares/[^/]+)?$"),
 ]]
 
 
@@ -186,9 +184,15 @@ async def _nf(_r, e):
     return JSONResponse({"detail": str(e)}, status_code=404)
 
 
-for _exc in (repo.Invalid, ConnectorError, RenderError, TemplateError, RuntimeError, auth.AuthError,
+for _exc in (repo.Invalid, ConnectorError, RuntimeError, auth.AuthError,
              report_data.ReportDataError, ValueError, ValidationError):
     app.add_exception_handler(_exc, lambda _r, e: JSONResponse({"detail": str(e)}, status_code=400))
+
+
+@app.exception_handler(report_browser.ReportVerifyError)
+async def _verify_failed(_r, exc):
+    return JSONResponse({"detail": str(exc), "error_type": "verify_failed", "failed_stage": exc.stage,
+                         "diagnostics": exc.diagnostics}, status_code=400)
 
 
 @app.exception_handler(permission.PermissionDenied)
@@ -247,10 +251,8 @@ def _api_guide_html() -> str:
     # 页面直接渲染同一份仓库文档，避免在两处维护 HTTP 契约。
     renderer = MarkdownIt("commonmark").enable("table")
     markdown = (DOCS / "HTTP_API.md").read_text(encoding="utf-8")
-    markdown = markdown.replace("../skills/smart-report/references/template-spec.md",
-                                settings.public_path("/api-guide/template-spec"))
-    markdown = markdown.replace("../skills/smart-report/references/declarative-report.md",
-                                settings.public_path("/api-guide/report-spec"))
+    markdown = markdown.replace("../skills/smart-report/references/html-assembly.md",
+                                settings.public_path("/api-guide/html-assembly"))
     body = renderer.render(markdown)
     home = settings.public_path("/")
     docs = settings.public_path("/docs")
@@ -269,16 +271,10 @@ def api_guide():
     return _api_guide_html()
 
 
-@app.get("/api-guide/template-spec", include_in_schema=False)
-def api_template_spec():
-    spec = skill_dir() / "references" / "template-spec.md"
-    return Response(spec.read_text(encoding="utf-8"), media_type="text/plain")
-
-
-@app.get("/api-guide/report-spec", include_in_schema=False)
-def api_report_spec():
-    spec = skill_dir() / "references" / "declarative-report.md"
-    return Response(spec.read_text(encoding="utf-8"), media_type="text/plain")
+@app.get("/api-guide/html-assembly", include_in_schema=False)
+def api_html_assembly():
+    guide = skill_dir() / "references" / "html-assembly.md"
+    return Response(guide.read_text(encoding="utf-8"), media_type="text/plain")
 
 
 IAM_BROWSER_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
@@ -423,23 +419,6 @@ def _check_owner(request: Request, created_by: str | None, what: str) -> None:
         raise HTTPException(403, f"只能操作本人创建的{what}")
 
 
-def _guard(request: Request):
-    """普通用户在管理台校验 / 预览 / 生成报告时，与 MCP 一样按其数据权限校验每条 SQL。"""
-    if _is_admin(request):
-        return None
-    acc = _access(request)
-
-    def guard(dataset):
-        # 普通用户的取数权限来自场景；直填数据源不能绕过场景的逐表条件。
-        if not dataset:
-            raise permission.PermissionDenied("请为查询关联有权限的业务场景，并使用该场景的数据源")
-        if not acc.can_dataset(dataset["id"]):
-            raise permission.PermissionDenied("无权使用该业务场景（数据集）")
-        return acc.tables.get(dataset["id"], set())
-
-    return guard
-
-
 def _require_dataset(request: Request, dataset_id) -> None:
     if dataset_id and not _is_admin(request) and not _access(request).can_dataset(int(dataset_id)):
         raise HTTPException(403, "无权使用该业务场景（数据集）")
@@ -458,7 +437,7 @@ def meta(request: Request):
         me_no = _p(request).emp_no or ""
         ds = [d for d in repo.list_datasets() if d["enabled"] and acc.can_dataset(d["id"])]
         stats = {"datasources": len({d["datasource_id"] for d in ds}), "datasets": len(ds),
-                 "templates": len(repo.list_templates(owner=me_no)), "reports": len(repo.list_reports(_p(request))),
+                 "templates": len(repo.list_templates(owner=me_no, allowed_datasets=acc.dataset_ids())), "reports": len(repo.list_reports(_p(request))),
                  "style_rules": len(repo.list_rules(owner=me_no, all_owners=False)), "employees": 0}
     return J({
         "datasource_types": [
@@ -784,66 +763,39 @@ def rule_delete(request: Request, rule_id: int):
     return {"ok": True}
 
 
-# ------------------------------------------------------------------ 报告模板（每人只看自己的，管理员看全部）
+# ------------------------------------------------------------------ Markdown 报告模板与草稿
 @app.get("/api/templates")
-def tpl_list(request: Request, q: str | None = None):
-    return J(repo.list_templates(q, owner=_owner_filter(request)))
+def tpl_list(request: Request, q: str | None = None, dataset_id: int | None = None):
+    acc = _access(request)
+    return J(repo.list_templates(q, owner=_owner_filter(request), dataset_id=dataset_id,
+                                 allowed_datasets=acc.dataset_ids()))
 
 
 @app.post("/api/templates")
 def tpl_create(request: Request, data: dict = Body(...)):
     _require_dataset(request, data.get("dataset_id"))
-    if "spec" in data:
-        spec = report_spec.ReportSpec.model_validate(data["spec"])
-        if type(data.get("dataset_id")) is not int or data["dataset_id"] < 1:
-            raise repo.Invalid("声明式模板须指定 dataset_id")
-        data = {**data, "template_type": "business", "markdown": report_spec.encode_template(spec, data["dataset_id"])}
     return J(repo.save_template({**data, "created_by": _p(request).emp_no}))
-
-
-@app.post("/api/templates/validate")
-def tpl_validate(request: Request, data: dict = Body(...)):
-    _require_dataset(request, data.get("dataset_id"))
-    return J(validate(data.get("markdown", ""), data.get("dataset_id"), bool(data.get("execute", True)),
-                      guard=_guard(request), owner=_p(request).emp_no))
-
-
-@app.post("/api/templates/preview", response_class=HTMLResponse)
-def tpl_preview(request: Request, data: dict = Body(...)):
-    _require_dataset(request, data.get("dataset_id"))
-    try:
-        html, _meta = render(data.get("markdown", ""), data.get("dataset_id"), guard=_guard(request),
-                             owner=data.get("owner") if _is_admin(request) and data.get("owner") else _p(request).emp_no)
-    except (RenderError, TemplateError, ConnectorError, repo.Invalid) as e:
-        raise HTTPException(400, str(e)) from e
-    return HTMLResponse(html)
 
 
 @app.get("/api/templates/{tpl_id}")
 def tpl_get(request: Request, tpl_id: int):
-    t = repo.get_template(tpl_id)
-    _check_owner(request, t.get("created_by"), "报告模板")
-    t["versions"] = repo.template_versions(tpl_id)
-    return J(t)
+    template = repo.get_template(tpl_id)
+    repo.require_template_access(template, _access(request))
+    template["versions"] = repo.template_versions(tpl_id)
+    return J(template)
 
 
 @app.put("/api/templates/{tpl_id}")
 def tpl_update(request: Request, tpl_id: int, data: dict = Body(...)):
     tpl = repo.get_template(tpl_id)
     _check_owner(request, tpl.get("created_by"), "报告模板")
-    dataset_id = data.get("dataset_id", tpl["dataset_id"])
-    _require_dataset(request, dataset_id)
+    _require_dataset(request, data.get("dataset_id", tpl["dataset_id"]))
     expected_version = data.get("expected_version")
     if expected_version is not None and (type(expected_version) is not int or expected_version < 1):
         raise repo.Invalid("expected_version 须为正整数")
-    if "spec" in data:
-        if type(dataset_id) is not int or dataset_id < 1:
-            raise repo.Invalid("声明式模板须指定 dataset_id")
-        data = {**data, "markdown": report_spec.encode_template(report_spec.ReportSpec.model_validate(data["spec"]), dataset_id)}
     return J(repo.save_template(
-        {k: v for k, v in data.items() if k not in ("created_by", "expected_version")},
-        tpl_id,
-        expected_version=expected_version,
+        {key: value for key, value in data.items() if key not in ("created_by", "expected_version")},
+        tpl_id, expected_version=expected_version,
     ))
 
 
@@ -855,37 +807,26 @@ def tpl_delete(request: Request, tpl_id: int):
 
 
 @app.get("/api/templates/{tpl_id}/versions/{version}")
-def tpl_version(request: Request, tpl_id: int, version: int, report_id: int | None = None,
-                report_version: int | None = None):
-    if report_id is not None:
-        tpl = repo.template_from_report(tpl_id, _p(request), report_id, report_version)
-        if tpl["version"] != version:
-            raise permission.PermissionDenied("指定模板版本与报告关联不符")
-        return J(tpl)
-    _check_owner(request, repo.get_template(tpl_id).get("created_by"), "报告模板")
+def tpl_version(request: Request, tpl_id: int, version: int):
+    repo.require_template_access(repo.get_template(tpl_id), _access(request))
     return J(repo.get_template_version(tpl_id, version))
 
 
-@app.post("/api/templates/{tpl_id}/render")
-def tpl_render(request: Request, tpl_id: int, data: dict = Body(default={})):
-    tpl = repo.get_template(tpl_id)
-    _check_owner(request, tpl.get("created_by"), "报告模板")
-    version = data.get("template_version")
-    if version is not None:
-        if type(version) is not int or version < 1:
-            raise repo.Invalid("template_version 须为正整数")
-        tpl = {**tpl, **repo.get_template_version(tpl_id, version)}
-    return J(services.render_template_to_report(tpl, data.get("name"), _p(request), data.get("parameters")))
+@app.get("/api/report-drafts")
+def report_drafts(request: Request):
+    principal = _p(request)
+    return J(report_draft.list_drafts(principal.emp_no, is_admin=principal.is_admin))
+
 
 
 # ------------------------------------------------------------------ 报告（创建人、管理员及被分享的员工）
 class ReportUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     html: str | None = None
-    markdown: str | None = None
-    spec: report_spec.ReportSpec | None = None
+    draft_id: str | None = None
     dataset_id: int | None = Field(default=None, ge=1)
-    parameters: dict | None = None
     preview_id: str | None = None
     base_version: int | None = Field(default=None, ge=1, strict=True)
     expected_version: int | None = Field(default=None, ge=1, strict=True)
@@ -928,9 +869,6 @@ def report_merge(request: Request, data: ReportMerge):
 def report_get(request: Request, report_id: int, include_html: bool = False, include_source: bool = False,
                version: int | None = Query(default=None, ge=1)):
     r = repo.get_report(report_id, _p(request), with_html=include_html, version=version, with_source=include_source)
-    if include_source and r.get("markdown") and (decoded := report_spec.decode_template(r["markdown"])):
-        key = "spec" if isinstance(decoded[0], report_spec.ReportSpec) else "free_report"
-        r[key] = decoded[0].model_dump(mode="json")
     return J({**r, **repo.report_links(r["id"], r["revision"])})
 
 
@@ -940,27 +878,9 @@ def report_update(request: Request, report_id: int, data: ReportUpdate):
     if data.revision is not None and (data.base_version is not None or data.expected_version is not None):
         raise repo.Invalid("请使用 revision，或使用 base_version 和 expected_version")
     base_version, expected = data.base_version or data.revision, data.expected_version or data.revision
-    if sum(item is not None for item in (data.spec, data.preview_id, data.html, data.markdown)) > 1:
-        raise repo.Invalid("正文只接受一种输入")
-    principal = _p(request)
-    preview_id = data.preview_id
-    if data.spec is not None:
-        base = repo.get_report(report_id, principal, version=base_version, with_html=False)
-        if base["access_level"] not in ("manage", "edit"):
-            raise permission.PermissionDenied("无权编辑该报告")
-        dataset_id = data.dataset_id or base["dataset_id"]
-        if not dataset_id:
-            raise repo.Invalid("声明式修订须指定业务场景")
-        _require_dataset(request, dataset_id)
-        staged = report_pipeline.preview(data.spec, dataset_id, principal, parameters=data.parameters,
-                                         base=base, requested_report_id=report_id)
-        preview_id = staged["preview_id"]
-    if preview_id:
-        return J(report_pipeline.persist(data.name, principal, preview_id, report_id=report_id,
-                                         base_version=base_version, expected_version=expected,
-                                         change_note=data.change_note))
-    return J(services.revise_report(report_id, principal, data.name, html=data.html, markdown=data.markdown,
-                                  base_version=base_version, change_note=data.change_note, expected_version=expected))
+    return J(services.revise_report(report_id, _p(request), data.name, html=data.html, draft_id=data.draft_id,
+                                   preview_id=data.preview_id, dataset_id=data.dataset_id, base_version=base_version,
+                                   change_note=data.change_note, expected_version=expected))
 
 
 @app.get("/api/reports/{report_id}/versions")
@@ -1015,14 +935,12 @@ def _report_attachment(content: str, name: str) -> Response:
 def report_preview(request: Request, ref: UUID, download: bool = False):
     # 预览包含完整数据，必须按已认证工号读取，不能仅凭 URL 访问。
     try:
-        _, content = report_pipeline.load_preview(_p(request), str(ref))
+        _, content = report_pipeline.load_preview(_p(request), str(ref), certified=True)
     except report_data.ReportDataError as exc:
         raise repo.NotFound("预览不存在、已过期或无权访问") from exc
     if download:
         return _report_attachment(content, "报告预览")
-    return HTMLResponse(content, headers={**REPORT_HTML_HEADERS,
-        "Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; "
-                                   "style-src 'unsafe-inline'; img-src data:"})
+    return HTMLResponse(content, headers=REPORT_HTML_HEADERS)
 
 
 @app.get("/reports/{report_id}", response_class=HTMLResponse)
@@ -1058,7 +976,7 @@ def report_download(request: Request, report_id: int, standalone_file: bool = Qu
     except permission.PermissionDenied:
         return HTMLResponse(_auth_page("无权下载该报告", "请使用获授权的海尔账号登录，或联系报告创建人。"), status_code=403)
     # 新报告下载与保存正文一致，旧报告才需要把站内图表库转换为内联脚本。
-    html = standalone(r["html"]) if standalone_file and not r["meta"].get("single_file") else r["html"]
+    html = inline_legacy_echarts(r["html"]) if standalone_file and not r["meta"].get("single_file") else r["html"]
     return _report_attachment(html, r["name"])
 
 

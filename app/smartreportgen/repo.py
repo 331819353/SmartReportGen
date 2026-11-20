@@ -574,31 +574,129 @@ TPL_DETAIL = (f"SELECT {TPL_COLS}, t.markdown FROM report_template.report_templa
               "LEFT JOIN dataset.dataset d ON d.id=t.dataset_id WHERE t.id=%s")
 
 
-def list_templates(q: str | None = None, owner: str | None = None) -> list[dict]:
-    """owner 不为 None 时只返回该工号创建的模板。"""
+def _legacy_template(md: str) -> dict | None:
+    try:
+        raw = json.loads(md)
+    except ValueError:
+        return None
+    if isinstance(raw, dict):
+        for key in ("smartreportgen_spec", "smartreportgen_free_html"):
+            if isinstance(raw.get(key), dict):
+                return raw[key]
+    return None
+
+
+def normalize_template_markdown(md: str) -> str:
+    """将历史报告定义转成可阅读的业务指南，历史记录原文保持归档。"""
+    spec = _legacy_template(md)
+    if spec is None:
+        return md
+
+    def one_line(value) -> str:
+        return " ".join(str(value or "").split())
+
+    def describe(value, fields) -> str:
+        if not isinstance(value, dict):
+            return one_line(value)
+        return "；".join(f"{label} {one_line(value[key])}" for key, label in fields if value.get(key))
+
+    lines = [f'# {one_line(spec.get("title")) or "历史报告指南"}']
+    if spec.get("subtitle"):
+        lines += ["", one_line(spec["subtitle"])]
+    for field, label, fields in (
+        ("queries", "取数逻辑", (("table", "来源"), ("fields", "字段"), ("dimensions", "维度"),
+                                ("metrics", "指标"), ("where", "条件"), ("parameters", "参数"),
+                                ("joins", "关联"), ("order_by", "排序"), ("sql", "查询"))),
+        ("metrics", "指标口径", (("label", "名称"), ("description", "说明"), ("block", "数据块"),
+                                ("query", "查询"), ("field", "字段"), ("format", "格式"), ("unit", "单位"),
+                                ("op", "函数"), ("denominator", "分母"))),
+    ):
+        entries = spec.get(field)
+        if isinstance(entries, dict) and entries:
+            lines += ["", f"## {label}", ""]
+            for key, value in entries.items():
+                detail = describe(value, fields)
+                lines.append(f"- {one_line(key)}" + (f" · {detail}" if detail else ""))
+    sections = spec.get("sections") or spec.get("modules") or []
+    entries = sections.items() if isinstance(sections, dict) else enumerate(sections if isinstance(sections, list) else [], 1)
+    for key, part in entries:
+        if not isinstance(part, dict):
+            continue
+        title = one_line(part.get("title") or key)
+        lines += ["", f"## {title}", ""]
+        detail = describe(part, (("summary", "结论"), ("description", "分析要求"), ("purpose", "用途")))
+        if detail:
+            lines.append(detail)
+        for card in part.get("cards") or []:
+            if isinstance(card, dict):
+                detail = describe(card, (("type", "图表类型"), ("query", "查询"), ("block", "数据块"),
+                                         ("fields", "字段"), ("dimension", "维度"), ("metric", "指标")))
+                lines.append(f'- {one_line(card.get("title") or card.get("id") or "图表")} {detail}'.rstrip())
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _template_summary(md: str, name: str) -> dict:
+    title = re.search(r"^#[ \t]+([^\n]+)", md, re.M)
+    sections = [heading.strip() for heading in re.findall(r"^##[ \t]+(.+)$", md, re.M)]
+    return {"title": title[1].strip() if title else name, "sections": sections, "format": "markdown"}
+
+
+def _template_view(row: dict) -> dict:
+    markdown = normalize_template_markdown(row["markdown"])
+    result = {**row, "markdown": markdown}
+    if "template_type" in row:
+        result.update(template_type="business", summary=_template_summary(markdown, row["name"]))
+    return result
+
+
+def require_template_access(template: dict, access) -> None:
+    principal = access.principal
+    dataset_id = template.get("dataset_id")
+    if (access.all or template["created_by"] == principal.emp_no
+            or (dataset_id is not None and access.can_dataset(dataset_id))):
+        return
+    raise PermissionDenied("无权读取该报告模板指南")
+
+
+def list_templates(q: str | None = None, owner: str | None = None, dataset_id: int | None = None,
+                   *, allowed_datasets: list[int] | None = None) -> list[dict]:
+    """管理员看全部，普通员工可读取本人模板和已授权场景的共享模板。"""
     conds, params = [], []
     if q and q.strip():
         conds.append("(t.name ILIKE %s OR t.user_requirement ILIKE %s OR t.business_summary ILIKE %s "
                      "OR t.analysis_goal ILIKE %s OR d.business_scenario ILIKE %s)")
         params += [_contains_pattern(q)] * 5
     if owner is not None:
-        conds.append("t.created_by = %s")
-        params.append(owner)
+        conds.append("(t.created_by = %s OR t.dataset_id = ANY(%s))")
+        params += [owner, allowed_datasets or []]
+    if dataset_id is not None:
+        conds.append("t.dataset_id = %s")
+        params.append(dataset_id)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
-    return db.fetchall(
+    rows = db.fetchall(
         f"SELECT {TPL_COLS} FROM report_template.report_template t LEFT JOIN dataset.dataset d ON d.id=t.dataset_id "
         f"{where} ORDER BY t.updated_at DESC", params)
+    for row in rows:
+        summary = row["summary"]
+        if summary.get("format") != "markdown":
+            row["summary"] = {"title": summary.get("title") or row["name"],
+                              "sections": summary.get("sections") or summary.get("modules") or [],
+                              "format": "markdown"}
+        row["template_type"] = "business"
+    return rows
 
 
 def get_template(tpl_id: int) -> dict:
-    return _one(db.fetchone(TPL_DETAIL, (tpl_id,)), "报告模板")
+    return _template_view(_one(db.fetchone(TPL_DETAIL, (tpl_id,)), "报告模板"))
 
 
 def get_template_version(tpl_id: int, version: int) -> dict:
-    return _one(db.fetchone(
+    row = _one(db.fetchone(
         "SELECT version, markdown, created_at FROM report_template.report_template_version WHERE template_id=%s AND version=%s",
         (tpl_id, version),
     ), "模板版本")
+    return _template_view(row)
+
 
 
 def template_versions(tpl_id: int) -> list[dict]:
@@ -610,67 +708,43 @@ def template_versions(tpl_id: int) -> list[dict]:
 
 
 def save_template(data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
-    from .template_parser import parse_template
-
     md = data.get("markdown")
     if not isinstance(md, str) or not md.strip() or "\x00" in md:
         raise Invalid("请提供有效的 Markdown 正文")
-    if data.get("business_summary") is not None and not isinstance(data["business_summary"], str):
-        raise Invalid("业务说明须为文本")
+    # 历史 JSON 仅在读取时转换，指南写入始终使用 Markdown。
+    if _legacy_template(md) is not None:
+        raise Invalid("请将历史模板转换为 Markdown 指南后保存")
+    for field in ("name", "business_summary", "analysis_goal", "user_requirement"):
+        value = data.get(field)
+        if value is not None and (not isinstance(value, str) or "\x00" in value):
+            raise Invalid(f"模板字段 {field} 须为有效文本")
+    if (dataset_id := data.get("dataset_id")) is not None and (type(dataset_id) is not int or dataset_id < 1):
+        raise Invalid("dataset_id 须为正整数")
     with db.conn() as c, c.transaction():
         cur = _one(c.execute("SELECT * FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone(),
                    "报告模板") if tpl_id is not None else None
         if expected_version is not None and (not cur or cur["version"] != expected_version):
             raise ReportConflict("报告模板已被修改，请读取最新版本后再提交")
-        # 模板类型在创建时确定，所有历史版本沿用同一种读取和使用方式。
-        template_type = data.get("template_type", cur["template_type"] if cur else "structured")
-        if template_type not in ("structured", "business"):
-            raise Invalid("模板类型须为 structured 或 business")
-        if cur and template_type != cur["template_type"]:
-            raise Invalid("模板类型在创建后不可更改")
-        if template_type == "business":
-            from .report_spec import ReportSpec, decode_template
-
-            decoded = decode_template(md)
-            # 声明式模板保存完整可执行定义。历史业务 Markdown 仍按原文归档。
-            title_match = re.search(r"^#[ \t]+([^\n]+)", md, re.M)
-            title = title_match[1].strip() if title_match else ""
-            summary = {"title": title, "sections": [heading.strip() for heading in re.findall(r"^##[ \t]+(.+)$", md, re.M)]}
-            if decoded:
-                spec, dataset_id = decoded
-                if data.get("dataset_id", cur["dataset_id"] if cur else None) != dataset_id:
-                    raise Invalid("声明式模板内容与关联场景必须一致")
-                title = spec.title
-                if isinstance(spec, ReportSpec):
-                    summary = {"title": title, "sections": [part.title for part in spec.sections], "declarative": True}
-                else:
-                    summary = {"title": title, "modules": list(spec.modules),
-                               "declarative": True, "report_mode": "free_html"}
-            # 自由版式使用单独的模板语义，历史 Markdown 和既有结构化模板可以继续独立编辑。
-            is_free = summary.get("report_mode") == "free_html"
-            if cur and is_free != (cur["summary"].get("report_mode") == "free_html"):
-                raise Invalid("自由版式与其他模板须分别保存")
-            default_goal = ""
-        else:
-            tpl, errors, _warn = parse_template(md)
-            if errors:
-                raise Invalid("模板校验失败：\n- " + "\n- ".join(errors))
-            title, summary, default_goal = tpl.title, tpl.summary(), tpl.meta.get("analysis_goal") or ""
-        name = (data.get("name") or title).strip()
+        name = (data.get("name") or _template_summary(md, "")["title"]).strip()
         if not name:
             raise Invalid("模板名称不能为空")
-        summary["title"] = title or name
+        summary = _template_summary(md, name)
         if cur:
-            # 业务说明是管理信息，历史版本只记录 Markdown 正文的变更。
-            version = cur["version"] + (1 if cur["markdown"] != md else 0)
+            # 版本锁覆盖指南和场景关联，历史表保存每个版本的 Markdown。
+            updates = {
+                "name": name, "dataset_id": data.get("dataset_id", cur["dataset_id"]),
+                "user_requirement": data.get("user_requirement", cur["user_requirement"]) or "",
+                "analysis_goal": data.get("analysis_goal", cur["analysis_goal"]) or "",
+                "business_summary": (data.get("business_summary", cur["business_summary"]) or "").strip(),
+                "markdown": md,
+            }
+            version = cur["version"] + int(any(cur[key] != value for key, value in updates.items()))
             c.execute(
                 "UPDATE report_template.report_template SET name=%s, dataset_id=%s, user_requirement=%s, "
-                "analysis_goal=%s, business_summary=%s, markdown=%s, summary=%s, version=%s, updated_at=now() WHERE id=%s",
-                (name, data.get("dataset_id", cur["dataset_id"]),
-                 data.get("user_requirement", cur["user_requirement"]) or "",
-                 data.get("analysis_goal", cur["analysis_goal"]) or default_goal,
-                 (data.get("business_summary", cur["business_summary"]) or "").strip(),
-                 md, db.jsonb(summary), version, tpl_id),
+                "analysis_goal=%s, business_summary=%s, markdown=%s, summary=%s, version=%s, "
+                "template_type='business', updated_at=now() WHERE id=%s",
+                (updates["name"], updates["dataset_id"], updates["user_requirement"], updates["analysis_goal"],
+                 updates["business_summary"], md, db.jsonb(summary), version, tpl_id),
             )
         else:
             version = 1
@@ -678,9 +752,9 @@ def save_template(data: dict, tpl_id: int | None = None, *, expected_version: in
                 "INSERT INTO report_template.report_template(name, dataset_id, user_requirement, analysis_goal, business_summary, "
                 "markdown, summary, created_by, template_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                 (name, data.get("dataset_id"), data.get("user_requirement") or "",
-                 data.get("analysis_goal") or default_goal,
+                 data.get("analysis_goal") or "",
                  (data.get("business_summary") or "").strip(), md, db.jsonb(summary),
-                 data.get("created_by"), template_type),
+                 data.get("created_by"), "business"),
             ).fetchone()["id"]
         c.execute(
             "INSERT INTO report_template.report_template_version(template_id, version, markdown) VALUES (%s,%s,%s) "
@@ -688,7 +762,7 @@ def save_template(data: dict, tpl_id: int | None = None, *, expected_version: in
             (tpl_id, version, md),
         )
         # 在锁释放前读取此次保存的版本，避免 agent 并行更新时拿到其他版本号。
-        return c.execute(TPL_DETAIL, (tpl_id,)).fetchone()
+        return _template_view(c.execute(TPL_DETAIL, (tpl_id,)).fetchone())
 
 
 def delete_template(tpl_id: int) -> None:
@@ -760,22 +834,13 @@ def list_reports(principal: Principal, template_id: int | None = None, q: str | 
 
 
 def _require_report_data(row: dict, principal: Principal) -> None:
-    from .report_spec import validate_scopes
+    from .report_queries import validate_scopes
 
     scopes = row["meta"].get("scopes")
     if scopes:
         validate_scopes(scopes, principal)
     elif not principal.is_admin and row["created_by"] != principal.emp_no:
         raise PermissionDenied("此历史报告缺少数据来源，需按当前权限重新生成后才能共享")
-
-
-def template_from_report(template_id: int, principal: Principal, report_id: int, version: int | None) -> dict:
-    # 只开放与该协作版本绑定的声明式模板；历史 Markdown 可能含业务原始值和未授权 SQL。
-    row = get_report(report_id, principal, with_html=False, version=version, with_source=True)
-    if row["access_level"] not in ("manage", "edit") or row["template_id"] != template_id or row["meta"].get("source") != "compiled_spec":
-        raise PermissionDenied("无权读取该报告关联的模板版本")
-    return {**get_template_version(template_id, row["template_version"]), "id": template_id,
-            "template_type": "business"}
 
 
 def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
@@ -785,14 +850,13 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
         report_id, legacy_version = _report_target(c, report_id)
         row = _one(c.execute(
             f"SELECT {cols}, s.access_level, COALESCE(sel.version,r.revision) AS current_version, "
-            "(sel.version IS NOT NULL) AS version_selected, v.markdown IS NOT NULL AND "
-            "(v.source_owner=%s OR %s) AS source_available, "
+            "(sel.version IS NOT NULL) AS version_selected, v.markdown IS NOT NULL AS has_source, "
             "CASE WHEN %s AND (v.source_owner=%s OR %s) THEN v.markdown END AS markdown, "
             "v.dataset_id, v.source_owner "
             f"FROM report.report r{REPORT_SHARE_JOIN}{REPORT_SELECTION_JOIN} "
             "LEFT JOIN report.report_version v ON v.report_id=r.id AND v.version=COALESCE(%s,sel.version,r.revision) "
             "WHERE r.id=%s",
-            (principal.emp_no, principal.is_admin, with_source, principal.emp_no, principal.is_admin,
+            (with_source, principal.emp_no, principal.is_admin,
              principal.emp_no, principal.emp_no, version if version is not None else legacy_version, report_id)
         ).fetchone(), "报告")
     row["access_level"] = _report_access(principal, row)
@@ -801,17 +865,17 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
     if row["revision"] is None:
         raise NotFound("报告版本不存在")
     _require_report_data(row, principal)
-    if row["access_level"] in ("manage", "edit") and row["meta"].get("source") == "compiled_spec":
-        row["source_available"] = True
+    compatible_source = row["meta"].get("source") in ("assembled_html", "compiled_spec")
+    row["source_available"] = row.pop("has_source") and row["access_level"] in ("manage", "edit") and (
+        compatible_source or principal.is_admin or row["source_owner"] == principal.emp_no)
+    if row["source_available"]:
         if with_source and row["markdown"] is None:
-            # 仅在来源通过当前授权复核后开放该版本的声明式定义。
+            # 通过数据权限复核后，合作编辑者也可取回版本源码。
             stored = db.fetchone("SELECT markdown FROM report.report_version WHERE report_id=%s AND version=%s",
                                  (row["id"], row["revision"]))
             row["markdown"] = stored["markdown"] if stored else None
-    if row["access_level"] == "view":
-        row["source_available"] = False
+    else:
         row["markdown"] = None
-    if not row["source_available"]:
         row["source_owner"] = None
     if not with_source:
         del row["markdown"]
@@ -837,7 +901,7 @@ def list_report_versions(report_id: int, principal: Principal) -> dict:
     return report
 
 
-def report_spec_hash(html: str) -> str:
+def report_html_hash(html: str) -> str:
     from hashlib import sha256
 
     return sha256(html.encode()).hexdigest()
@@ -857,7 +921,7 @@ def _read_report_html(row: dict, connection=None) -> str:
 
     html = report_data.inflate_static(row["html"], load)
     expected = row["meta"].get("verification", {}).get("html_sha256")
-    if expected and report_spec_hash(html) != expected:
+    if expected and report_html_hash(html) != expected:
         raise Invalid("保存的报告正文与原验收证据不一致，无法原样交付")
     return html
 
@@ -950,17 +1014,28 @@ def _insert_report_version(c, report_id: int, version: int, base_version: int | 
     )
 
 
+def _report_template_reference(c, template_id: int | None, template_version: int | None) -> tuple:
+    # 指南仅记录溯源。在发布事务中锁住仍存在的引用，避免并行删除触发外键失败。
+    if template_id is not None and c.execute(
+        "SELECT id FROM report_template.report_template WHERE id=%s FOR KEY SHARE", (template_id,)
+    ).fetchone():
+        return template_id, template_version
+    return None, None
+
+
 def save_report(name: str, html: str, template_id: int | None, template_version: int | None, meta: dict,
                 created_by: str | None = None, *, source: dict | None = None) -> dict:
     # 版本库只接收已验收的精确字节，旧格式可读但不能通过另一个入口发布。
-    if (not source or meta.get("source") != "compiled_spec" or not meta.get("scopes") or
-            meta.get("verification", {}).get("html_sha256") != report_spec_hash(html)):
+    if (not source or meta.get("source") not in ("assembled_html", "compiled_spec") or not meta.get("scopes") or
+            meta.get("verification", {}).get("status") != "passed" or
+            meta.get("verification", {}).get("html_sha256") != report_html_hash(html)):
         raise Invalid("新报告必须提交服务端验收的预览")
-    if error := report_document_error(html):
+    if error := report_document_error(html, require_runtime=False):
         raise Invalid(error)
     name = _report_name(name)
     meta = {**meta, "html_bytes": len(html.encode()), "html_chars": len(html), "single_file": True}
     with db.conn() as c, c.transaction():
+        template_id, template_version = _report_template_reference(c, template_id, template_version)
         stored_html = _store_report_html(c, html)
         row = c.execute(
             "INSERT INTO report.report(name, template_id, template_version, html, meta, created_by) "
@@ -1044,13 +1119,14 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
         meta, source = (base["meta"], base) if rendered is None else rendered
         if rendered is None:
             base_html = _read_report_html(base, c)
-            # 管理台仍可更新名称或说明。业务正文变更须经过新编译和验收。
+            # 管理台仍可更新名称或说明。业务正文变更须经过 Chromium 验收。
             if html is not None and html not in (base_html, report_data.for_edit(base_html)):
-                raise Invalid("正文变更请用声明式模板生成已验收的修订预览")
+                raise Invalid("正文变更请提交已验收的修订预览")
             html = base_html
         else:
-            if (meta.get("source") != "compiled_spec" or not meta.get("scopes") or
-                    meta.get("verification", {}).get("html_sha256") != report_spec_hash(html)):
+            if (meta.get("source") not in ("assembled_html", "compiled_spec") or not meta.get("scopes") or
+                    meta.get("verification", {}).get("status") != "passed" or
+                    meta.get("verification", {}).get("html_sha256") != report_html_hash(html)):
                 raise Invalid("修订内容与验收证据不一致")
             _require_report_data({"meta": meta, "created_by": row["created_by"]}, principal)
             if row["created_by"] != principal.emp_no and row["created_by"]:
@@ -1065,6 +1141,8 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
         stored_html = base["html"] if rendered is None else _store_report_html(c, html)
         version = row["revision"] + 1
         template_id, template_version = source.get("template_id", base["template_id"]), source["template_version"]
+        if rendered is not None:
+            template_id, template_version = _report_template_reference(c, template_id, template_version)
         _insert_report_version(c, report_id, version, base_version, name, stored_html, meta, template_id,
                                template_version, source, principal.emp_no, change_note)
         # 保存后让编辑者跟随最新版本，其他员工原有的选择照常保留。
@@ -1127,7 +1205,7 @@ def set_report_share(report_id: int, principal: Principal, emp_no: str, access_l
         current = c.execute("SELECT meta FROM report.report_version WHERE report_id=%s AND version=%s",
                             (report_id, report["revision"])).fetchone()
         if not current or not current["meta"].get("scopes"):
-            raise Invalid("报告缺少可验证来源，请通过声明式模板重新生成后分享")
+            raise Invalid("报告缺少可验证来源，请重新取数并生成报告后分享")
         _require_report_data({**report, **current},
                              Principal(emp_no, is_admin=employee["is_admin"], roles=employee["roles"]))
         c.execute(
