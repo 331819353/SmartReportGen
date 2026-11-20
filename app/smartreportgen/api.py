@@ -256,7 +256,7 @@ def _api_nav(current: str) -> str:
 @cache
 def _admin_index_html() -> str:
     page = (STATIC / "admin" / "index.html").read_text(encoding="utf-8")
-    for filename in ("app.css", "app.js"):
+    for filename in ("app.css", "app.js", "template-editor.bundle.css", "template-editor.bundle.js"):
         page = page.replace(f'"/static/admin/{filename}"', f'"{_admin_asset_url(filename)}"')
     page = page.replace('"/static/vendor/vue.global.prod.js"',
                         f'"{settings.public_path("/static/vendor/vue.global.prod.js")}"')

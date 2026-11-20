@@ -13,4 +13,5 @@ __pycache__/
 backup/
 *.dump
 scripts/out/
+/scripts/template-editor/node_modules
 /skills/smart-report.zip

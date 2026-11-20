@@ -595,7 +595,7 @@ def list_report_templates(ctx: Context, keyword: str = "", dataset_id: int | Non
 
 @_tool()
 def get_report_template(template_id: int, ctx: Context, version: int | None = None) -> dict:
-    """读取有访问权限的报告模板指南。可指定历史版本获取当时的 Markdown 正文。"""
+    """读取用于编写 HTML 报告的完整指南。可指定历史版本获取当时的 Markdown 正文。"""
     acc = _access(ctx)
     tpl = repo.get_template(template_id)
     repo.require_template_access(tpl, acc)
@@ -609,7 +609,8 @@ def get_report_template(template_id: int, ctx: Context, version: int | None = No
 def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int | None = None,
                          user_requirement: str = "", analysis_goal: str = "", business_summary: str | None = None,
                          template_id: int | None = None, expected_version: int | None = None) -> dict:
-    """新建或更新 Markdown 报告指南。更新时可传 expected_version 检查并行修改。"""
+    """新建或更新 Markdown 报告指南，记录可复用的取数、指标、章节、图表、联动及布局要求。
+    更新时可传 expected_version 检查并行修改。"""
     acc = _access(ctx)
     data = {"name": name, "markdown": markdown, "user_requirement": user_requirement, "analysis_goal": analysis_goal}
     if dataset_id is not None:

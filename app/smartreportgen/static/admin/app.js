@@ -81,7 +81,27 @@ const ICONS = {
   sty: '<circle cx="10" cy="10" r="7"/><circle cx="7" cy="8" r="1.2"/><circle cx="11" cy="6.5" r="1.2"/><circle cx="13.5" cy="10" r="1.2"/><path d="M10 17a2 2 0 0 1 0-4h1.5"/>',
   plus: '<path d="M10 4v12M4 10h12"/>',
   arrow: '<path d="M4 10h12m-5-5 5 5-5 5"/>',
+  back: '<path d="M16 10H4m5 5-5-5 5-5"/>',
+  pencil: '<path d="m4 12.5 8.6-8.6a2 2 0 0 1 2.8 2.8l-8.6 8.6L4 16zM11.5 5l3 3"/>',
   search: '<circle cx="8.5" cy="8.5" r="4.5"/><path d="m12 12 4 4"/>',
+  indent: '<path d="M4 5h12M8 10h8M8 15h8M4 10h.01M4 15h.01"/>',
+  chevron: '<path d="m7 8 3 3 3-3"/>',
+  bold: '<path d="M6.5 10h4.4a2.5 2.5 0 0 0 0-5H6.5v10h5a2.5 2.5 0 0 0 0-5h-.6"/>',
+  italic: '<path d="M9 5h6M5 15h6m1-10-4 10"/>',
+  strike: '<path d="M13.5 6.5c-.5-1-1.8-1.5-3.5-1.5-2 0-3.5.8-3.5 2.5M3.5 10h13m-3.2 2.4c0 1.7-1.4 2.6-3.5 2.6-1.9 0-3.2-.6-3.8-1.7"/>',
+  inlineCode: '<path d="m7.5 6-4 4 4 4m5-8 4 4-4 4"/>',
+  link: '<path d="m8.8 11.2 2.4-2.4M7 13l-1 1a2.8 2.8 0 0 1-4-4l3.2-3.2a2.8 2.8 0 0 1 4 0M13 7l1-1a2.8 2.8 0 0 1 4 4l-3.2 3.2a2.8 2.8 0 0 1-4 0"/>',
+  task: '<rect x="3.5" y="3.5" width="13" height="13" rx="2.5"/><path d="m6.5 10 2.3 2.3 4.7-4.7"/>',
+  outdent: '<path d="M4 5h12M4 15h12M11 10h5m-9-2.5L4.5 10 7 12.5"/>',
+  indentMore: '<path d="M4 5h12M4 15h12M11 10h5m-12-2.5L6.5 10 4 12.5"/>',
+  divider: '<path d="M3.5 10h13"/>',
+  bullets: '<path d="M7.5 5h9m-9 5h9m-9 5h9M3.5 5h.01m-.01 5h.01m-.01 5h.01"/>',
+  ordered: '<path d="M9 6h7m-7 8h7M3.5 4l1-.8V8M3 8h3m-2.8 4.5c.3-1.5 3-1.5 3 0 0 .7-.6 1.4-1.5 2.2L3 16h3.5"/>',
+  quote: '<path d="M8 7c-2.4 1-3.6 2.4-3.6 4.7 0 1.3.7 2.3 1.8 2.3s1.9-.7 1.9-1.8c0-1.2-1-1.9-2.1-1.9H5m10.5-3.3c-2.4 1-3.6 2.4-3.6 4.7 0 1.3.7 2.3 1.8 2.3s1.9-.7 1.9-1.8c0-1.2-1-1.9-2.1-1.9h-1"/>',
+  code: '<path d="m7 6-4 4 4 4m6-8 4 4-4 4M11.5 4.5 8.5 15.5"/>',
+  table: '<rect x="3" y="4" width="14" height="12" rx="1.2"/><path d="M3 8h14M3 12h14M10 4v12"/>',
+  undo: '<path d="m7 4-4 4 4 4M3 8h8a5 5 0 0 1 5 5v2"/>',
+  redo: '<path d="m13 4 4 4-4 4m4-4H9a5 5 0 0 0-5 5v2"/>',
   menu: '<path d="M3 5h14M3 10h14M3 15h14"/>',
   close: '<path d="m5 5 10 10M5 15 15 5"/>',
   check: '<path d="m4 10 4 4 8-8"/>',
@@ -938,11 +958,418 @@ const Datasets = {
 };
 
 // ------------------------------------------------------------ 报告模板
+// 只在查看或编辑模板正文时加载本地 Markdown 编辑器。
+const loadTemplateEditor = () => import(window.__SRG_TEMPLATE_EDITOR_URL__);
+
+const TemplateDocument = {
+  props: { keepOutline: Boolean, trackReading: Boolean },
+  template: `<div ref="documentRoot" class="template-document"
+    :class="{'has-outline': keepOutline || anchors.length, 'is-collapsed': !expanded}"
+    :style="{'--template-sticky-height': stickyHeight + 'px'}">
+    <aside v-if="keepOutline || anchors.length" class="template-outline" aria-label="文档目录">
+      <div class="template-outline-panel">
+        <button type="button" class="btn template-outline-toggle" :aria-expanded="expanded"
+          :aria-controls="expanded ? 'template-outline-links' : null" @click="expanded=!expanded">
+          <span class="ico" v-html="icon('indent')"></span>目录<span class="ico outline-chevron" v-html="icon('chevron')"></span>
+        </button>
+        <nav v-if="expanded" id="template-outline-links" aria-label="章节导航">
+          <ol v-if="anchors.length"><li v-for="(anchor, index) in anchors" :key="index">
+            <button type="button" class="template-outline-link" :style="{'--outline-level': anchor.level}"
+              :aria-current="index === active ? 'location' : null" @click="jump(index)">{{anchor.label}}</button>
+          </li></ol>
+          <p v-else class="template-outline-empty">添加标题后，章节会显示在这里。</p>
+        </nav>
+      </div>
+    </aside>
+    <div class="template-document-main"><div ref="content" class="template-document-content"><slot/></div></div>
+  </div>`,
+  setup(props) {
+    const documentRoot = ref(null), content = ref(null), anchors = ref([]), active = ref(0), stickyHeight = ref(0);
+    const narrow = window.matchMedia('(max-width: 960px)');
+    const expanded = ref(!narrow.matches);
+    let nodes = [], headingsObserver, toolbarObserver, frame = 0, jumpScrollY = null;
+    function refreshOutline() {
+      // 从已排版的正文取标题，编辑与历史版本切换后会自动同步。目录使用位置区分同名章节。
+      const headings = content.value.querySelectorAll(
+        '.template-reading-title, :is(.template-reader-body, .ProseMirror) > :is(h1, h2, h3, h4, h5, h6)'
+      );
+      const previous = nodes[active.value];
+      nodes = [...headings].filter(node => node.textContent.trim());
+      const base = nodes.reduce((level, node) => Math.min(level, Number(node.tagName[1])), 6);
+      const next = nodes.map(node => ({ label: node.textContent.trim(), level: Math.min(3, Number(node.tagName[1]) - base) }));
+      if (next.length !== anchors.value.length || next.some((item, i) => item.label !== anchors.value[i].label || item.level !== anchors.value[i].level)) {
+        anchors.value = next;
+      }
+      active.value = Math.max(0, nodes.indexOf(previous));
+    }
+    async function jump(index) {
+      const target = nodes[index];
+      if (!target) return;
+      active.value = index;
+      if (narrow.matches) {
+        expanded.value = false;
+        await nextTick();
+        documentRoot.value?.querySelector('.template-outline-toggle')?.focus({ preventScroll: true });
+      }
+      // 滚动到固定工具栏下缘，保持标题完整露出。
+      window.scrollBy({ top: target.getBoundingClientRect().top - stickyHeight.value - 20 });
+      jumpScrollY = window.scrollY;
+    }
+    function trackSection() {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        // 短文末尾可能滚不到视口顶部，点击过的章节保留高亮，直到用户继续滚动。
+        if (jumpScrollY === window.scrollY) return;
+        jumpScrollY = null;
+        const marker = stickyHeight.value + Math.min(140, window.innerHeight * 0.18);
+        let index = 0;
+        for (const [i, node] of nodes.entries()) {
+          if (node.getBoundingClientRect().top > marker) break;
+          index = i;
+        }
+        active.value = index;
+      });
+    }
+    function onWidthChange(event) { expanded.value = !event.matches; }
+    onMounted(() => {
+      refreshOutline();
+      headingsObserver = new MutationObserver(refreshOutline);
+      headingsObserver.observe(content.value, { childList: true, characterData: true, subtree: true });
+      const toolbar = documentRoot.value.closest('[data-template-workspace]')?.querySelector('[data-template-toolbar]');
+      if (toolbar) {
+        toolbarObserver = new ResizeObserver(() => { stickyHeight.value = toolbar.offsetHeight; });
+        toolbarObserver.observe(toolbar);
+      }
+      narrow.addEventListener('change', onWidthChange);
+      if (props.trackReading) window.addEventListener('scroll', trackSection, { passive: true });
+    });
+    onBeforeUnmount(() => {
+      headingsObserver?.disconnect();
+      toolbarObserver?.disconnect();
+      narrow.removeEventListener('change', onWidthChange);
+      window.removeEventListener('scroll', trackSection);
+      cancelAnimationFrame(frame);
+    });
+    return { documentRoot, content, anchors, active, expanded, stickyHeight, jump, icon };
+  }
+};
+
+const TemplateGuidePreview = {
+  props: { markdown: String, name: String, loadingVersion: Number },
+  template: `<article class="template-prose template-reader" aria-label="模板正文" @click="followFootnote">
+    <h1 v-if="preview?.title" class="template-reading-title" v-html="preview.title"></h1>
+    <h1 v-else class="template-reading-title">{{name}}</h1>
+    <slot/>
+    <p v-if="loadingVersion" class="template-reading-status muted" role="status">正在读取 v{{loadingVersion}} 正文…</p>
+    <div v-else-if="preview" class="template-reader-body" v-html="preview.body"></div>
+    <template v-else-if="failed">
+      <p class="msg warn" role="status">正文排版加载失败，刷新后可重试。</p><pre class="template-fallback">{{markdown}}</pre>
+    </template>
+    <p v-else class="muted" role="status">正在加载正文…</p>
+  </article>`,
+  setup(props) {
+    const render = ref(null), failed = ref(false);
+    const preview = computed(() => {
+      if (!render.value || props.loadingVersion) return null;
+      // 先整篇渲染，确保链接和脚注仍能互相引用。再从已清理的 HTML 中取出正文首个一级标题。
+      const fragment = document.createElement('template');
+      fragment.innerHTML = render.value(props.markdown);
+      const first = fragment.content.firstElementChild;
+      const title = first?.tagName === 'H1' && first.textContent.trim() ? first.innerHTML : '';
+      if (title) first.remove();
+      return { title, body: fragment.innerHTML };
+    });
+    onMounted(async () => {
+      try { render.value = (await loadTemplateEditor()).renderGuide; }
+      catch { failed.value = true; }
+    });
+    function followFootnote(event) {
+      const link = event.target.closest('a[href^="#"]');
+      if (!link) return;
+      // 正文的锚点只在文章内跳转，避免覆盖管理台路由所用的 URL 哈希。
+      event.preventDefault();
+      const fragment = link.getAttribute('href').slice(1);
+      const target = event.currentTarget.querySelector('#' + CSS.escape('user-content-' + fragment));
+      target?.focus({ preventScroll: true });
+      target?.scrollIntoView({ block: 'nearest' });
+    }
+    return { preview, failed, followFootnote };
+  }
+};
+
+const TemplateGuideEditor = {
+  components: { TemplateDocument },
+  props: { modelValue: String, disabled: Boolean },
+  emits: ['update:modelValue'],
+  template: `<div class="template-editor" data-template-workspace @keydown.capture="handleEditorKeys">
+    <div class="template-editor-chrome" data-template-toolbar>
+      <div class="template-guide-head">
+        <h2>模板正文</h2>
+        <div class="template-editor-modes" role="group" aria-label="正文编辑模式">
+          <button type="button" class="btn" :disabled="disabled" :aria-pressed="!sourceMode" @click="sourceMode=false">可视化编辑</button>
+          <button type="button" class="btn" :disabled="disabled" :aria-pressed="sourceMode" @click="sourceMode=true">Markdown</button>
+        </div>
+      </div>
+      <template v-if="!sourceMode">
+        <div class="template-toolbar" role="group" aria-label="正文格式">
+          <div class="template-history-tools">
+            <button type="button" class="btn" title="撤销" aria-label="撤销" :disabled="disabled || !selection.undo" @mousedown.prevent @click="command('undo')"><span class="ico" v-html="icon('undo')"></span></button>
+            <button type="button" class="btn" title="重做" aria-label="重做" :disabled="disabled || !selection.redo" @mousedown.prevent @click="command('redo')"><span class="ico" v-html="icon('redo')"></span></button>
+          </div>
+          <select class="in" aria-label="段落样式" :value="selection.heading || 0" :disabled="disabled || !ready || selection.code || selection.table"
+            @change="command('heading', Number($event.target.value))">
+            <option :value="0">正文</option>
+            <option v-for="level in 6" :key="level" :value="level">标题 {{level}}</option>
+          </select>
+          <div v-for="(group, index) in formatGroups" :key="index" class="template-format-group">
+            <button v-for="item in group" :key="item.key" type="button" class="btn" :title="item.label" :aria-label="item.label"
+              :disabled="disabled || !ready || formatDisabled(item)"
+              :aria-pressed="item.action ? null : !!selection[item.key]" @mousedown.prevent @click="item.key === 'link' ? openLink() : command(item.key)">
+              <span class="ico" v-html="icon(item.icon || item.key)"></span>
+            </button>
+          </div>
+        </div>
+        <form v-if="linkOpen" class="template-toolbar template-context-tools" aria-label="编辑链接" @submit.prevent="applyLink"
+          @keydown.esc.prevent="closeLink">
+          <label for="template-link-url">链接地址</label>
+          <input ref="linkInput" id="template-link-url" class="in" v-model="linkUrl" placeholder="https://…" autocomplete="off"
+            :aria-invalid="!!linkError" @input="linkError=''">
+          <button type="submit" class="btn" :disabled="disabled">应用</button>
+          <button v-if="selection.link" type="button" class="btn" :disabled="disabled" @click="removeLink">移除链接</button>
+          <button type="button" class="btn link" @click="closeLink">取消</button>
+          <span v-if="linkError" class="template-tool-error" role="alert">{{linkError}}</span>
+        </form>
+        <div v-if="selection.table" class="template-toolbar template-table-tools" role="group" aria-label="表格操作">
+          <div v-for="(group, index) in tableActions" :key="index" class="template-format-group">
+            <button v-for="item in group" :key="item.key" type="button" class="btn" :disabled="disabled || selection[item.blocked]"
+              :title="item.hint" @mousedown.prevent @click="command(item.key)">{{item.label}}</button>
+          </div>
+          <label class="template-context-field">列对齐
+            <select class="in" :value="selection.tableAlign" :disabled="disabled" @change="command('tableAlign', $event.target.value)">
+              <option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option>
+            </select>
+          </label>
+          <button type="button" class="btn link danger" :disabled="disabled" @mousedown.prevent @click="command('deleteTable')">删除表格</button>
+          <button type="button" class="btn link" :disabled="disabled" @mousedown.prevent @click="command('exitTable')">退出表格</button>
+        </div>
+        <div v-if="selection.code" class="template-toolbar template-context-tools" role="group" aria-label="代码块操作">
+          <label class="template-context-field">代码语言
+            <select class="in" :value="selection.codeLanguage" :disabled="disabled" @change="command('codeLanguage', $event.target.value)">
+              <option value="">纯文本</option>
+              <option v-for="language in codeLanguages" :key="language" :value="language">{{language}}</option>
+              <option v-if="selection.codeLanguage && !codeLanguages.includes(selection.codeLanguage)" :value="selection.codeLanguage">{{selection.codeLanguage}}</option>
+            </select>
+          </label>
+          <button type="button" class="btn" @mousedown.prevent @click="copyCode">复制代码</button>
+          <button type="button" class="btn link" :disabled="disabled" @mousedown.prevent @click="command('exitCode')">退出代码块</button>
+        </div>
+      </template>
+    </div>
+    <TemplateDocument :keep-outline="!sourceMode">
+      <slot name="properties"/>
+      <p v-if="notice" class="msg warn template-editor-notice" role="status">{{notice}}</p>
+      <textarea v-if="sourceMode" class="in mono template-source" :value="modelValue" :disabled="disabled" rows="14" aria-label="Markdown 正文"
+        @input="$emit('update:modelValue', $event.target.value)"></textarea>
+      <template v-else>
+        <p v-if="!ready" class="template-reader muted" role="status">正在打开可视化编辑器…</p>
+        <div ref="visualRoot" class="template-prose template-sheet" :class="{'template-sheet-empty': ready && !modelValue.trim()}"
+          :aria-busy="!ready" v-show="ready" @focusout="dismissSlash"></div>
+      </template>
+    </TemplateDocument>
+    <Teleport to="body">
+      <div v-if="slashItems.length && slashPosition && !disabled" ref="slashMenu" class="template-slash-menu" :style="slashPosition"
+        role="group" aria-label="快速插入">
+        <button v-for="(item, index) in slashItems" :key="item.key" type="button" class="template-slash-option"
+          :class="{active: index === slashIndex}" @pointerenter="slashIndex=index" @mousedown.prevent @click="chooseSlash(item)">
+          <span class="ico" v-html="icon(item.icon)"></span>{{item.label}}
+        </button>
+      </div>
+    </Teleport>
+  </div>`,
+  setup(props, { emit }) {
+    const sourceMode = ref(false), visualRoot = ref(null), ready = ref(false), notice = ref(''), selection = ref({});
+    const linkOpen = ref(false), linkInput = ref(null), linkUrl = ref(''), linkError = ref('');
+    const slashPosition = ref(null), slashIndex = ref(0), slashMenu = ref(null), slashDismissed = ref(false);
+    const codeLanguages = ['sql', 'python', 'javascript', 'typescript', 'json', 'html', 'css', 'bash', 'yaml', 'markdown'];
+    const formatGroups = [
+      [{ key: 'bold', label: '加粗' }, { key: 'italic', label: '斜体' }, { key: 'strike', label: '删除线' },
+        { key: 'inlineCode', label: '行内代码' }, { key: 'link', label: '链接' }],
+      [{ key: 'bullet', icon: 'bullets', label: '项目列表', block: true }, { key: 'ordered', label: '编号列表', block: true },
+        { key: 'task', label: '任务列表', block: true }, { key: 'outdent', label: '减少缩进', action: true },
+        { key: 'indent', icon: 'indentMore', label: '增加缩进', action: true }],
+      [{ key: 'quote', label: '引用', block: true }, { key: 'code', label: '代码块', block: true },
+        { key: 'divider', label: '分隔线', action: true, block: true },
+        { key: 'table', label: '插入表格', action: true, block: true }],
+    ];
+    const tableActions = [
+      [{ key: 'addRowBefore', label: '添加上方行', blocked: 'aboveHeader', hint: '在当前行上方插入；表头保持首行' },
+        { key: 'addRow', label: '添加下方行' }, { key: 'deleteRow', label: '删除行', blocked: 'cannotDeleteRow', hint: '删除表头后，下一行成为表头' }],
+      [{ key: 'addColBefore', label: '添加左侧列' }, { key: 'addCol', label: '添加右侧列' },
+        { key: 'deleteCol', label: '删除列', blocked: 'minCols', hint: '保留至少一列' }],
+    ];
+    const slashCommands = [
+      { key: 'h1', command: 'heading', value: 1, icon: 'tpl', label: '标题 1', terms: 'heading h1 biaoti' },
+      { key: 'h2', command: 'heading', value: 2, icon: 'tpl', label: '标题 2', terms: 'heading h2 biaoti' },
+      { key: 'h3', command: 'heading', value: 3, icon: 'tpl', label: '标题 3', terms: 'heading h3 biaoti' },
+      { key: 'bullet', icon: 'bullets', label: '项目列表', terms: '无序列表 bullet list wxlb' },
+      { key: 'ordered', icon: 'ordered', label: '编号列表', terms: '有序列表 numbered list yxlb' },
+      { key: 'task', icon: 'task', label: '任务列表', terms: 'todo task rw' },
+      { key: 'quote', icon: 'quote', label: '引用', terms: 'quote yy' },
+      { key: 'code', icon: 'code', label: '代码块', terms: 'code dmk' },
+      { key: 'table', icon: 'table', label: '表格', terms: 'table bg' },
+      { key: 'divider', icon: 'divider', label: '分隔线', terms: 'divider fgx' },
+    ];
+    const slashItems = computed(() => {
+      if (!selection.value.slash || slashDismissed.value || !ready.value) return [];
+      const query = selection.value.slash.query.trim().toLowerCase();
+      return slashCommands.filter(item => (item.label + ' ' + item.terms).includes(query));
+    });
+    let editor, generation = 0, editorMarkdown;
+    function formatDisabled(item) {
+      if (item.key === 'indent' || item.key === 'outdent') return !selection.value[item.key];
+      return (selection.value.code && item.key !== 'code') || (selection.value.table && item.block);
+    }
+    function command(name, value, fromSlash) {
+      linkOpen.value = false;
+      const applied = editor?.command(name, value, fromSlash);
+      if (applied === false && !['undo', 'redo'].includes(name)) toast('当前选区无法应用此格式。', 'warn');
+      return applied;
+    }
+    async function openLink() {
+      linkUrl.value = selection.value.link || '';
+      linkError.value = '';
+      linkOpen.value = true;
+      await nextTick();
+      linkInput.value?.select();
+    }
+    function closeLink() { linkOpen.value = false; editor?.focus(); }
+    function removeLink() { command('link', ''); }
+    function applyLink() {
+      const url = linkUrl.value.trim();
+      try {
+        if (!url || !['https:', 'http:', 'mailto:', 'tel:'].includes(new URL(url, document.baseURI).protocol)) throw new Error();
+      } catch { linkError.value = '请输入有效的链接地址。'; return; }
+      command('link', url);
+    }
+    async function copyCode() {
+      try { await navigator.clipboard.writeText(editor.codeText()); toast('已复制代码', 'ok'); }
+      catch { toast('无法访问剪贴板，请选中代码后复制。', 'warn'); }
+    }
+    function placeSlash() {
+      if (!slashItems.value.length || !editor) { slashPosition.value = null; return; }
+      const rect = editor.slashRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight) { slashPosition.value = null; return; }
+      const roomBelow = window.innerHeight - rect.bottom - 12;
+      const roomAbove = rect.top - 12;
+      const below = roomBelow >= 245 || roomBelow >= roomAbove;
+      slashPosition.value = {
+        left: Math.max(8, Math.min(rect.left, window.innerWidth - 228)) + 'px',
+        [below ? 'top' : 'bottom']: (below ? rect.bottom + 6 : window.innerHeight - rect.top + 6) + 'px',
+        maxHeight: Math.min(292, below ? roomBelow : roomAbove) + 'px',
+      };
+    }
+    function dismissSlash() { slashDismissed.value = true; slashPosition.value = null; }
+    function chooseSlash(item) {
+      command(item.command || item.key, item.value, true);
+      dismissSlash();
+    }
+    function handleEditorKeys(event) {
+      if (props.disabled || event.isComposing || !event.target.closest('.ProseMirror')) return;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !selection.value.code) {
+        event.preventDefault();
+        event.stopPropagation();
+        openLink();
+        return;
+      }
+      if (!slashItems.value.length || !slashPosition.value || !['ArrowDown', 'ArrowUp', 'Enter', 'Escape'].includes(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === 'Escape') dismissSlash();
+      else if (event.key === 'Enter') chooseSlash(slashItems.value[slashIndex.value]);
+      else {
+        slashIndex.value = (slashIndex.value + (event.key === 'ArrowDown' ? 1 : -1) + slashItems.value.length) % slashItems.value.length;
+        nextTick(() => slashMenu.value?.querySelector('.active')?.scrollIntoView({ block: 'nearest' }));
+      }
+    }
+    function dispose() {
+      generation++;
+      editor?.destroy();
+      editor = null;
+      linkOpen.value = false;
+      dismissSlash();
+    }
+    async function mountVisual() {
+      dispose();
+      const current = generation;
+      ready.value = false;
+      selection.value = {};
+      notice.value = '';
+      await nextTick();
+      if (!visualRoot.value || current !== generation) return;
+      const root = document.createElement('div');
+      visualRoot.value.replaceChildren(root);
+      editorMarkdown = props.modelValue;
+      try {
+        const { createGuideEditor } = await loadTemplateEditor();
+        if (current !== generation) return;
+        const instance = await createGuideEditor(root, editorMarkdown, markdown => {
+          if (current !== generation) return;
+          editorMarkdown = markdown;
+          emit('update:modelValue', markdown);
+        }, selected => {
+          if (current !== generation) return;
+          const previous = selection.value.slash;
+          selection.value = selected;
+          if (!selected.slash || previous?.to !== selected.slash.to || previous?.query !== selected.slash.query) {
+            slashDismissed.value = false;
+            slashIndex.value = 0;
+          }
+          nextTick(placeSlash);
+        });
+        // 切换模式、加载历史或离开页面后，迟到的编辑器不能覆盖当前正文。
+        if (current !== generation) { instance?.destroy(); return; }
+        if (!instance) {
+          notice.value = '此正文含有引用式链接，请在 Markdown 模式编辑以保留链接定义。';
+          sourceMode.value = true;
+          return;
+        }
+        editor = instance;
+        editor.setDisabled(props.disabled);
+        ready.value = true;
+      } catch {
+        if (current !== generation) return;
+        notice.value = '可视化编辑器无法打开此正文，可以继续使用 Markdown 编辑。';
+        sourceMode.value = true;
+      }
+    }
+    watch(sourceMode, source => { if (source) dispose(); else mountVisual(); });
+    watch(() => props.modelValue, markdown => {
+      // 富文本输入刚同步回来的值无需重载，历史正文和外部替换需要新编辑会话。
+      if (!sourceMode.value && markdown !== editorMarkdown) mountVisual();
+    });
+    watch(() => props.disabled, disabled => editor?.setDisabled(disabled));
+    onMounted(() => {
+      mountVisual();
+      window.addEventListener('resize', placeSlash);
+      window.addEventListener('scroll', placeSlash, true);
+    });
+    onBeforeUnmount(() => {
+      dispose();
+      window.removeEventListener('resize', placeSlash);
+      window.removeEventListener('scroll', placeSlash, true);
+    });
+    return { sourceMode, visualRoot, ready, notice, selection, formatGroups, tableActions, icon,
+      command, codeLanguages, formatDisabled, linkOpen, linkInput, linkUrl, linkError, openLink, closeLink, removeLink, applyLink,
+      copyCode, slashItems, slashPosition, slashIndex, slashMenu, chooseSlash, dismissSlash, handleEditorKeys };
+  }
+};
+
 const Templates = {
-  components: { Drawer },
+  components: { TemplateDocument, TemplateGuidePreview, TemplateGuideEditor },
   template: `<div>
     <template v-if="!form">
-      <div class="page-head"><h1>报告模板</h1>
+      <div class="page-head"><h1 ref="templateHeading" tabindex="-1">报告模板</h1>
         <button type="button" class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button></div>
       <section class="card list-panel" aria-label="模板列表" :aria-busy="loading">
         <div class="list-tools">
@@ -970,49 +1397,75 @@ const Templates = {
       </section>
     </template>
     <template v-else-if="!editing">
-      <div class="page-head">
-        <div><h1 ref="templateHeading" tabindex="-1">{{form.name}}</h1><p>{{form.business_scenario || '未关联业务场景'}} · v{{form.version}}</p></div>
-        <div class="actions"><button type="button" class="btn ghost" @click="form=null">返回模板列表</button>
-          <button type="button" v-if="canEdit(form)" class="btn" @click="edit(form)">编辑模板</button></div>
-      </div>
-      <div class="card card-pad template-brief">
-        <h2>模板用途</h2>
-        <p class="business-copy">{{form.business_summary || form.analysis_goal || form.user_requirement || '暂未填写用途说明。'}}</p>
-        <template v-if="form.business_summary && form.analysis_goal && form.analysis_goal !== form.business_summary">
-          <h2>分析目标</h2><p class="business-copy">{{form.analysis_goal}}</p>
-        </template>
-        <div v-if="form.versions?.length > 1" class="field">
-          <label for="template-view-version">正文版本</label>
-          <select id="template-view-version" class="in" v-model="viewVersion" @change="readVersion">
-            <option v-for="v in form.versions" :key="v.version" :value="v.version">v{{v.version}} · {{fmtTime(v.created_at)}}</option>
-          </select>
-        </div>
-        <h2>Markdown 指南</h2>
-        <p class="business-copy">{{viewMarkdown}}</p>
-      </div>
+      <section class="template-reading-page" :class="{'template-reading-wide': wideReading}" aria-label="模板阅读" data-template-workspace>
+        <header class="template-reading-bar" data-template-toolbar>
+          <div class="template-reading-path">
+            <button type="button" class="btn ghost" aria-label="返回模板列表" @click="closeDetail">
+              <span class="ico" v-html="icon('back')"></span>报告模板
+            </button>
+            <span class="muted" aria-hidden="true">/</span>
+            <b ref="templateHeading" tabindex="-1" :title="form.name">{{form.name}}</b>
+          </div>
+          <div class="template-reading-actions">
+            <select v-if="form.versions?.length > 1" class="in" aria-label="正文版本" v-model="viewVersion" @change="readVersion">
+              <option v-for="v in form.versions" :key="v.version" :value="v.version">v{{v.version}} · {{fmtTime(v.created_at)}}</option>
+            </select>
+            <span v-else class="template-reading-version">v{{viewVersion}}</span>
+            <button type="button" class="btn template-reading-width" :aria-pressed="wideReading" @click="wideReading=!wideReading">宽页</button>
+            <button type="button" v-if="canEdit(form)" class="btn primary" @click="edit(form)">
+              <span class="ico" v-html="icon('pencil')"></span>编辑模板
+            </button>
+          </div>
+        </header>
+        <TemplateDocument track-reading :aria-busy="versionLoading">
+          <TemplateGuidePreview :name="form.name" :markdown="viewMarkdown" :loading-version="versionLoading ? viewVersion : null">
+            <div class="template-reading-meta">
+              <span v-if="form.business_scenario">{{form.business_scenario}}</span>
+              <time v-if="viewDate" :datetime="viewDate">{{fmtTime(viewDate)}}</time>
+            </div>
+            <dl v-if="form.business_summary || form.analysis_goal || form.user_requirement" class="template-brief" aria-label="模板信息">
+              <div><dt>模板用途</dt><dd class="business-copy">{{form.business_summary || form.analysis_goal || form.user_requirement}}</dd></div>
+              <div v-if="form.business_summary && form.analysis_goal && form.analysis_goal !== form.business_summary">
+                <dt>分析目标</dt><dd class="business-copy">{{form.analysis_goal}}</dd>
+              </div>
+            </dl>
+          </TemplateGuidePreview>
+        </TemplateDocument>
+      </section>
     </template>
     <template v-else>
-      <div class="page-head"><h1 ref="templateHeading" tabindex="-1">{{form.id ? '编辑模板' : '新建模板'}}</h1>
+      <div class="page-head template-workhead"><h1 ref="templateHeading" tabindex="-1">{{form.id ? '编辑模板' : '新建模板'}}</h1>
         <div class="actions"><button type="button" class="btn ghost" :disabled="busy" @click="cancelEdit">取消</button>
-          <button type="button" class="btn primary" @click="save" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
-      <div class="card card-pad meta-bar">
-        <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
-        <div class="field"><label for="template-scenario">业务场景</label>
-          <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">不关联业务场景</option>
-            <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
-            <option v-for="d in datasets" :key="d.id" :value="d.id">{{d.business_scenario}}</option></select></div>
-        <div class="field"><label for="template-requirement">原始分析需求 <small>选填</small></label><input id="template-requirement" class="in" v-model="form.user_requirement" placeholder="填写需要回答的业务问题"></div>
-        <div class="field"><label for="template-goal">分析目标 <small>选填</small></label>
-          <input id="template-goal" class="in" v-model="form.analysis_goal"></div>
-        <div class="field template-summary-field"><label for="template-business-summary">业务说明 <small>选填</small></label>
-          <textarea id="template-business-summary" class="in" v-model="form.business_summary" rows="4" placeholder="例如：用于月度销售复盘，比较各渠道的销售额和毛利率，找出变化最大的区域和品类。"></textarea></div>
-      </div>
-      <div class="card card-pad template-brief">
-        <div class="field"><label for="business-markdown">Markdown 指南</label>
-          <textarea id="business-markdown" class="in" v-model="form.markdown" rows="14" :disabled="busy"></textarea></div>
-        <div v-for="v in form.versions" :key="v.version" class="hit"><span>v{{v.version}} · {{fmtTime(v.created_at)}}</span>
-          <button type="button" class="btn link" @click="loadVer(v.version)" :disabled="busy">载入正文</button></div>
-      </div>
+          <button type="button" class="btn primary" @click="save" :disabled="busy || versionLoading || !form.markdown.trim()">保存模板</button></div></div>
+      <section class="card template-guide" aria-label="编辑模板正文" :aria-busy="busy || versionLoading">
+        <TemplateGuideEditor v-model="form.markdown" :disabled="busy || versionLoading">
+          <template #properties>
+            <fieldset class="template-meta" aria-label="模板信息" :disabled="busy">
+              <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
+              <div class="field"><label for="template-scenario">业务场景</label>
+                <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">不关联业务场景</option>
+                  <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
+                  <option v-for="d in datasets" :key="d.id" :value="d.id">{{d.business_scenario}}</option></select></div>
+              <details class="template-extra">
+                <summary>业务说明与分析目标 <span class="muted">选填</span></summary>
+                <div class="field"><label for="template-requirement">原始分析需求</label><input id="template-requirement" class="in" v-model="form.user_requirement" placeholder="填写需要回答的业务问题"></div>
+                <div class="field"><label for="template-goal">分析目标</label><input id="template-goal" class="in" v-model="form.analysis_goal"></div>
+                <div class="field"><label for="template-business-summary">业务说明</label>
+                  <textarea id="template-business-summary" class="in" v-model="form.business_summary" rows="3"></textarea></div>
+              </details>
+            </fieldset>
+          </template>
+        </TemplateGuideEditor>
+        <div v-if="form.versions?.length" class="template-guide-foot">
+          <div class="template-version-picker">
+            <label for="template-load-version">历史正文</label>
+            <select id="template-load-version" class="in" v-model="historyVersion" :disabled="busy || versionLoading">
+              <option v-for="v in form.versions" :key="v.version" :value="v.version">v{{v.version}} · {{fmtTime(v.created_at)}}</option>
+            </select>
+          </div>
+          <button type="button" class="btn" @click="loadVer" :disabled="busy || versionLoading">{{versionLoading ? '正在载入…' : '载入正文'}}</button>
+        </div>
+      </section>
     </template>
   </div>`,
   setup() {
@@ -1020,46 +1473,72 @@ const Templates = {
     const { load } = templates;
     const form = ref(null), datasets = ref([]), busy = ref(false), kw = ref('');
     const editing = ref(false), templateHeading = ref(null), viewVersion = ref(null), viewMarkdown = ref('');
-    let savedTemplate = null;
+    const versionLoading = ref(false), historyVersion = ref(null), wideReading = ref(false);
+    const viewDate = computed(() => form.value?.versions?.find(v => v.version === viewVersion.value)?.created_at
+      || form.value?.updated_at);
+    let savedTemplate = null, loadedMarkdown = '', versionRequest = null;
     const shown = computed(() => templates.list.value.filter(t => matches(kw.value, t.name, t.business_scenario, t.business_summary, t.analysis_goal, t.user_requirement)));
     onMounted(async () => { datasets.value = await run(() => api('/api/datasets')); });
     async function view(t) {
-      form.value = await run(() => api(`/api/templates/${t.id}`));
-      viewVersion.value = form.value.version;
-      viewMarkdown.value = form.value.markdown;
+      try { await showDetail(await run(() => api(`/api/templates/${t.id}`))); }
+      catch { /* 请求错误由通知显示，列表可继续使用。 */ }
+    }
+    async function showDetail(t) {
+      form.value = t;
+      viewVersion.value = t.version;
+      viewMarkdown.value = t.markdown;
       editing.value = false;
       await nextTick();
-      templateHeading.value?.focus();
+      window.scrollTo(0, 0);
+      templateHeading.value?.focus({ preventScroll: true });
+    }
+    function stopVersionRequest() {
+      versionRequest?.abort();
+      versionRequest = null;
+      versionLoading.value = false;
+    }
+    async function closeDetail() {
+      stopVersionRequest();
+      form.value = null;
+      await nextTick();
+      window.scrollTo(0, 0);
+      templateHeading.value?.focus({ preventScroll: true });
     }
     async function readVersion() {
-      const id = form.value.id, version = viewVersion.value;
-      const stillSelected = () => form.value?.id === id && viewVersion.value === version;
-      viewMarkdown.value = '';
+      stopVersionRequest();
+      const t = form.value, version = viewVersion.value;
+      if (version === t.version) { viewMarkdown.value = t.markdown; return; }
+      const request = versionRequest = new AbortController();
+      versionLoading.value = true;
       try {
-        const result = await run(() => api('/api/templates/' + id + '/versions/' + version));
-        if (stillSelected()) viewMarkdown.value = result.markdown;
-      } catch {
-        // 请求失败时恢复最新正文与对应版本，避免把旧内容显示为所选版本。
-        if (stillSelected()) {
-          viewVersion.value = form.value.version;
-          viewMarkdown.value = form.value.markdown;
-        }
+        const result = await api(`/api/templates/${t.id}/versions/${version}`, { signal: request.signal });
+        if (versionRequest === request) viewMarkdown.value = result.markdown;
+      } catch (e) {
+        if (versionRequest !== request) return;
+        // 失败时恢复最新正文与对应版本，避免把旧内容显示为所选版本。
+        viewVersion.value = t.version;
+        viewMarkdown.value = t.markdown;
+        toast(e.message, 'err');
+      } finally {
+        if (versionRequest === request) stopVersionRequest();
       }
     }
     const canEdit = t => isAdmin() || t.created_by === state.me?.emp_no;
     async function edit(t) {
-      // 编辑使用副本，取消时还原已保存的业务说明与源码。
+      // 从最新版建立编辑副本。需要恢复历史内容时，可在编辑器内载入所选正文。
+      stopVersionRequest();
       savedTemplate = t ? { ...t } : null;
       editing.value = true;
       form.value = t ? { ...t } : { id: null, name: '', dataset_id: null, user_requirement: '', analysis_goal: '', business_summary: '', markdown: '', version: 1 };
+      historyVersion.value = form.value.version;
+      loadedMarkdown = form.value.markdown;
       await nextTick();
       templateHeading.value?.focus();
     }
     async function cancelEdit() {
-      form.value = savedTemplate;
-      editing.value = false;
-      await nextTick();
-      templateHeading.value?.focus();
+      stopVersionRequest();
+      if (savedTemplate) await showDetail(savedTemplate);
+      else { form.value = null; editing.value = false; }
     }
     async function save() {
       busy.value = true;
@@ -1071,18 +1550,43 @@ const Templates = {
         const t = await run(() => f.id
           ? api('/api/templates/' + f.id, { method: 'PUT', body })
           : api('/api/templates', { method: 'POST', body }), '模板已保存');
-        await view(t);
+        // 保存响应已含刚提交的正文。沿用已知历史，避免后续读取失败时留在过期的编辑版本。
+        const versions = f.versions || [];
+        t.versions = versions.some(v => v.version === t.version)
+          ? versions
+          : [{ version: t.version, created_at: t.updated_at }, ...versions];
+        await showDetail(t);
         load();
-      } finally { busy.value = false; }
+      } catch { /* 保留用户输入，提交错误由通知显示。 */ }
+      finally { busy.value = false; }
     }
     async function del(t) {
       if (!await askConfirm({ title: '删除报告模板', message: `确认删除模板「${t.name}」？已生成的报告会保留。`, confirmText: '删除' })) return;
       await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load();
     }
-    async function loadVer(v) { const r = await run(() => api(`/api/templates/${form.value.id}/versions/${v}`)); form.value.markdown = r.markdown; toast(`已载入 v${v}，保存后成为新版本`); }
+    async function loadVer() {
+      const f = form.value, version = historyVersion.value;
+      if (f.markdown !== loadedMarkdown && !await askConfirm({
+        title: '载入历史正文', message: '载入后会替换当前未保存的正文。', confirmText: '载入正文',
+      })) return;
+      const request = versionRequest = new AbortController();
+      versionLoading.value = true;
+      try {
+        const result = await api(`/api/templates/${f.id}/versions/${version}`, { signal: request.signal });
+        if (versionRequest !== request) return;
+        loadedMarkdown = f.markdown = result.markdown;
+        toast(`已载入 v${version} 正文`, 'ok');
+      } catch (e) {
+        if (versionRequest === request) toast(e.message, 'err');
+      } finally {
+        if (versionRequest === request) stopVersionRequest();
+      }
+    }
+    onBeforeUnmount(stopVersionRequest);
     const admin = computed(isAdmin);
     return { ...templates, admin, creator, shown, form, datasets, busy, kw, editing, templateHeading,
-      viewVersion, viewMarkdown, readVersion, canEdit, view, edit, cancelEdit, save, del, loadVer, fmtTime, icon };
+      viewVersion, viewDate, viewMarkdown, versionLoading, historyVersion, wideReading, readVersion, canEdit, view, closeDetail,
+      edit, cancelEdit, save, del, loadVer, fmtTime, icon };
   }
 };
 

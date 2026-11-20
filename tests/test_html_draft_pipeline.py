@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from markdown_it import MarkdownIt
 
 from smartreportgen import db, mcp_server as mcp, repo, report_browser, report_data, report_document, report_draft
 from smartreportgen import report_pipeline, report_queries, services
@@ -314,6 +315,36 @@ def postgres(monkeypatch):
     db._pool = None
 
 
+def test_legacy_free_template_preserves_layout_and_bindings_as_literal_code():
+    # 源码含围栏和看似章节的行时，仍完整显示在代码块中。
+    layout = '<main class="layout">\n<srg-module m="bridge"></srg-module>\n</main>'
+    module = '<article>\n~~~~\n## 源码里的井号\n<srg-output m="bridge_chart"></srg-output>\n</article>'
+    css = ".layout { display:grid; }"
+    raw = json.dumps({"dataset_id": 12, "smartreportgen_free_html": {
+        "title": "历史自由版式", "layout": layout, "css": css,
+        "modules": {"bridge": {
+            "title": "变动桥接", "html": module, "css": ".bridge { padding: 16px; }",
+            "outputs": {"bridge_chart": {
+                "title": "收入变动瀑布图", "type": "waterfall",
+                "columns": [{"field": "amount", "label": "金额", "format": {"unit": "万元"}}],
+                "waterfall": {"role_field": "stage", "opening": "期初", "closing": "期末"},
+            }},
+        }},
+        "theme": {"filter_sticky": False},
+    }}, ensure_ascii=False)
+    guide = repo.normalize_template_markdown(raw)
+    parser = MarkdownIt("commonmark")
+    fences = [token.content for token in parser.parse(guide) if token.type == "fence"]
+    assert layout + "\n" in fences and module + "\n" in fences and css + "\n" in fences
+    assert ".bridge { padding: 16px; }\n" in fences
+    assert any(json.loads(content) == {"role_field": "stage", "opening": "期初", "closing": "期末"}
+               for content in fences if content.startswith("{"))
+    assert all(text in guide for text in ("收入变动瀑布图", "bridge_chart", "万元", '"filter_sticky": false'))
+    assert repo._template_summary(guide, "")["sections"] == ["页面布局", "变动桥接", "展示规范", "历史定义信息"]
+    rendered = parser.render(guide)
+    assert "&lt;srg-output" in rendered and "<srg-output" not in rendered
+
+
 @pytest.mark.usefixtures("chromium")
 def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     login, owner, editor, viewer, outsider, dataset = postgres
@@ -334,9 +365,17 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     assert mcp.get_report_template(tpl_id, None)["error_type"] == "permission_denied"
     login[0] = owner
 
-    legacy_schema = json.dumps({"smartreportgen_spec": {
-        "title": "历史模板", "queries": {"sales": {"table": "facts", "fields": ["amount"]}},
-        "metrics": {"sales_total": {"field": "amount"}}, "sections": [{"title": "历史概览"}],
+    legacy_schema = json.dumps({"dataset_id": dataset, "smartreportgen_spec": {
+        "title": "历史模板",
+        "queries": {"sales": {"table": "facts", "fields": ["amount"], "parameters": {"month": "period"}}},
+        "filters": [{"id": "region", "label": "区域", "query": "sales", "field": "region", "default": None}],
+        "metrics": {"sales_total": {
+            "sources": [{"query": "sales", "field": "amount", "by": {"region": "region"}}],
+            "format": {"scale": "number", "unit": "元"},
+        }},
+        "sections": [{"title": "历史概览", "narrative": "本期销售额为 {{sales_total}}。", "cards": [
+            {"title": "销售额卡片", "type": "kpi", "metric": "sales_total", "height": 240},
+        ]}],
     }}, ensure_ascii=False)
     row = db.fetchone("INSERT INTO report_template.report_template(name,markdown,created_by,template_type,dataset_id) "
                       "VALUES (%s,%s,%s,'structured',%s) RETURNING id", ("历史", legacy_schema, owner.emp_no, dataset))
@@ -344,7 +383,19 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
                (row["id"], legacy_schema))
     legacy_template = mcp.get_report_template(row["id"], None, version=1)
     assert legacy_template["markdown"].startswith("# 历史模板")
-    assert {"取数逻辑", "指标口径", "历史概览"} <= set(legacy_template["summary"]["sections"])
+    guide = legacy_template["markdown"]
+    assert {"取数逻辑", "筛选与联动", "指标口径", "历史概览"} <= set(legacy_template["summary"]["sections"])
+    assert all(text in guide for text in ('"month": "period"', "默认值** ` null `", '"region": "region"',
+                                          "{{sales_total}}", "销售额卡片", "` 240 `"))
+    assert db.fetchone(
+        "SELECT markdown FROM report_template.report_template_version WHERE template_id=%s AND version=1",
+        (row["id"],),
+    )["markdown"] == legacy_schema
+    # HTTP 查看页与 MCP 读取统一从授权模板版本得到同一份完整指南。
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer test"}
+    assert client.get(f'/api/templates/{row["id"]}', headers=headers).json()["markdown"] == guide
+    assert client.get(f'/api/templates/{row["id"]}/versions/1', headers=headers).json()["markdown"] == guide
     legacy_free = repo.normalize_template_markdown(json.dumps({"smartreportgen_free_html": {
         "title": "历史自由版式", "modules": {"overview": {"title": "概览"}, "detail": {"title": "明细"}},
     }}))
@@ -421,8 +472,6 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     assert result["ok"] and result["version"] == 2, json.dumps(result, ensure_ascii=False)
     assert repo.get_report(legacy_id, owner, version=1)["html"] == legacy_page
 
-    client = TestClient(app)
-    headers = {"Authorization": "Bearer test"}
     for report_id, version in ((rid, 2), (legacy_id, 1), (legacy_id, 2)):
         download = client.get(f"/reports/{report_id}/download?version={version}", headers=headers)
         assert download.status_code == 200

@@ -1,0 +1,22 @@
+{
+  "name": "smartreportgen-template-editor",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@milkdown/core": "7.23.0",
+    "@milkdown/plugin-history": "7.23.0",
+    "@milkdown/preset-commonmark": "7.23.0",
+    "@milkdown/preset-gfm": "7.23.0",
+    "@milkdown/prose": "7.23.0",
+    "@milkdown/utils": "7.23.0",
+    "esbuild": "0.28.2",
+    "rehype-sanitize": "6.0.0",
+    "rehype-stringify": "10.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "remark-rehype": "11.1.2",
+    "unified": "11.0.5"
+  }
+}

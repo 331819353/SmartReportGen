@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from html import escape
 from typing import Any
+
+from markdown_it import MarkdownIt
 
 from . import crypto, db, report_data
 from .auth import Principal
@@ -574,7 +577,7 @@ TPL_DETAIL = (f"SELECT {TPL_COLS}, t.markdown FROM report_template.report_templa
               "LEFT JOIN dataset.dataset d ON d.id=t.dataset_id WHERE t.id=%s")
 
 
-def _legacy_template(md: str) -> dict | None:
+def _legacy_template(md: str) -> tuple[str, dict, dict] | None:
     try:
         raw = json.loads(md)
     except ValueError:
@@ -582,63 +585,134 @@ def _legacy_template(md: str) -> dict | None:
     if isinstance(raw, dict):
         for key in ("smartreportgen_spec", "smartreportgen_free_html"):
             if isinstance(raw.get(key), dict):
-                return raw[key]
+                return key, raw[key], {field: value for field, value in raw.items() if field != key}
     return None
 
 
+# 历史定义的字段名仍保留在代码块和绑定里。正文按生成报告所需的信息组织。
+_GUIDE_LABELS = {
+    "id": "标识", "version": "定义版本", "dataset_id": "原业务场景 ID", "title": "标题", "subtitle": "副标题",
+    "description": "说明", "purpose": "用途", "analysis_goal": "分析目标", "summary": "结论", "narrative": "分析文案",
+    "label": "名称", "table": "来源表", "query": "查询", "block": "数据块", "fields": "字段", "field": "字段",
+    "dimensions": "分组维度", "dimension": "维度", "metrics": "官方指标", "metric": "指标", "where": "取值条件",
+    "parameters": "参数绑定", "joins": "关联", "order_by": "排序", "sources": "来源与绑定", "by": "筛选映射",
+    "sql": "原查询", "type": "类型", "default": "默认值", "columns": "展示列", "format": "格式与口径",
+    "unit": "单位", "op": "计算函数", "denominator": "分母", "limit": "展示行数上限", "span": "布局栅格",
+    "height": "高度", "chart": "图表设置", "waterfall": "瀑布图设置", "option": "图表选项",
+    "layout": "页面 HTML", "html": "模块 HTML", "css": "样式 CSS", "theme": "主题", "colors": "状态配色",
+    "rule_sources": "展示规则来源", "rate_symbols": "比率符号",
+}
+_GUIDE_PROSE = {"description", "purpose", "analysis_goal", "summary", "narrative"}
+_GUIDE_LANGUAGES = {"layout": "html", "html": "html", "css": "css", "sql": "sql"}
+_GUIDE_MARKDOWN = MarkdownIt("commonmark")
+
+
 def normalize_template_markdown(md: str) -> str:
-    """将历史报告定义转成可阅读的业务指南，历史记录原文保持归档。"""
-    spec = _legacy_template(md)
-    if spec is None:
+    """把历史取数、分析和版式定义转成 Markdown，历史版本继续归档原文。"""
+    legacy = _legacy_template(md)
+    if legacy is None:
         return md
+    kind, spec, original_meta = legacy
 
-    def one_line(value) -> str:
-        return " ".join(str(value or "").split())
+    def heading(value) -> str:
+        text = " ".join(str(value).split())
+        return re.sub(r"([\\`*_~\[\]<>#&])", r"\\\1", text)
 
-    def describe(value, fields) -> str:
-        if not isinstance(value, dict):
-            return one_line(value)
-        return "；".join(f"{label} {one_line(value[key])}" for key, label in fields if value.get(key))
+    def code_span(text: str) -> str:
+        fence = "`" * (1 + max(map(len, re.findall(r"`+", text)), default=0))
+        return f"{fence} {text} {fence}"
 
-    lines = [f'# {one_line(spec.get("title")) or "历史报告指南"}']
-    if spec.get("subtitle"):
-        lines += ["", one_line(spec["subtitle"])]
-    for field, label, fields in (
-        ("queries", "取数逻辑", (("table", "来源"), ("fields", "字段"), ("dimensions", "维度"),
-                                ("metrics", "指标"), ("where", "条件"), ("parameters", "参数"),
-                                ("joins", "关联"), ("order_by", "排序"), ("sql", "查询"))),
-        ("metrics", "指标口径", (("label", "名称"), ("description", "说明"), ("block", "数据块"),
-                                ("query", "查询"), ("field", "字段"), ("format", "格式"), ("unit", "单位"),
-                                ("op", "函数"), ("denominator", "分母"))),
-    ):
-        entries = spec.get(field)
-        if isinstance(entries, dict) and entries:
-            lines += ["", f"## {label}", ""]
-            for key, value in entries.items():
-                detail = describe(value, fields)
-                lines.append(f"- {one_line(key)}" + (f" · {detail}" if detail else ""))
-    sections = spec.get("sections") or spec.get("modules") or []
-    entries = sections.items() if isinstance(sections, dict) else enumerate(sections if isinstance(sections, list) else [], 1)
-    for key, part in entries:
-        if not isinstance(part, dict):
-            continue
-        title = one_line(part.get("title") or key)
-        lines += ["", f"## {title}", ""]
-        detail = describe(part, (("summary", "结论"), ("description", "分析要求"), ("purpose", "用途")))
-        if detail:
-            lines.append(detail)
-        for card in part.get("cards") or []:
-            if isinstance(card, dict):
-                detail = describe(card, (("type", "图表类型"), ("query", "查询"), ("block", "数据块"),
-                                         ("fields", "字段"), ("dimension", "维度"), ("metric", "指标")))
-                lines.append(f'- {one_line(card.get("title") or card.get("id") or "图表")} {detail}'.rstrip())
+    lines = [f'# {heading(spec.get("title") or "历史报告指南")}']
+    if subtitle := spec.get("subtitle"):
+        lines.extend(["", heading(subtitle)])
+
+    def add_heading(title: str, depth: int) -> None:
+        lines.extend(["", f'{"#" * depth} {heading(title)}', ""])
+
+    def add_properties(values: dict) -> None:
+        for field, value in values.items():
+            label = _GUIDE_LABELS.get(field) or code_span(heading(field))
+            if field in _GUIDE_PROSE and isinstance(value, str):
+                if value.strip():
+                    lines.extend(["", f"**{label}**", ""])
+                    lines.extend(f"> {escape(line, quote=False)}" for line in value.splitlines())
+                    lines.append("")
+                continue
+            language = _GUIDE_LANGUAGES.get(field) if isinstance(value, str) else None
+            nested = isinstance(value, dict) or (isinstance(value, list) and any(isinstance(v, (dict, list)) for v in value))
+            if language or nested or (isinstance(value, str) and "\n" in value):
+                if value in ("", [], {}):
+                    continue
+                content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+                # 保留可复用的 SQL、HTML、CSS 和绑定配置，用围栏展示且避免代码中的分隔符提前闭合。
+                fence = "~" * max(3, 1 + max(map(len, re.findall(r"~+", content)), default=0))
+                language = language or ("text" if isinstance(value, str) else "json")
+                lines.extend([f"- **{label}**", "", f"  {fence}{language}"])
+                lines.extend(f"  {line}" if line else "" for line in content.removesuffix("\n").split("\n"))
+                lines.extend([f"  {fence}", ""])
+            else:
+                text = value if isinstance(value, str) and value else json.dumps(value, ensure_ascii=False)
+                lines.append(f"- **{label}** {code_span(text)}")
+
+    def add_entries(values, depth: int) -> None:
+        if isinstance(values, dict):
+            entries = values.items()
+        else:
+            entries = enumerate(values if isinstance(values, list) else [values], 1)
+        for key, item in entries:
+            properties = item if isinstance(item, dict) else {"值": item}
+            title = properties.get("title") or properties.get("label") or properties.get("id") or key
+            add_heading(title, depth)
+            if isinstance(key, str) and key != title:
+                add_properties({"id": key})
+            if depth != 2:
+                add_properties(properties)
+                continue
+
+            # 章节和自由版式模块下的卡片各自形成子标题，方便用目录直接定位。
+            add_properties({k: v for k, v in properties.items() if k not in {"cards", "outputs"}})
+            for field, label in (("cards", "图表与明细"), ("outputs", "输出槽位")):
+                if children := properties.get(field):
+                    add_heading(label, depth + 1)
+                    add_entries(children, depth + 2)
+
+    for field, label in (("queries", "取数逻辑"), ("filters", "筛选与联动"), ("metrics", "指标口径")):
+        if entries := spec.get(field):
+            add_heading(label, 2)
+            add_entries(entries, 3)
+    if layout := {key: spec[key] for key in ("layout", "css") if spec.get(key)}:
+        add_heading("页面布局", 2)
+        add_properties(layout)
+    for field in ("sections", "modules"):
+        if entries := spec.get(field):
+            add_entries(entries, 2)
+    if display := {key: spec[key] for key in ("rule_sources", "rate_symbols", "colors", "theme") if key in spec}:
+        add_heading("展示规范", 2)
+        add_properties(display)
+    handled = {"title", "subtitle", "queries", "filters", "metrics", "layout", "css", "sections", "modules",
+               "rule_sources", "rate_symbols", "colors", "theme"}
+    extra = {key: value for key, value in spec.items() if key not in handled}
+    if extra or original_meta:
+        add_heading("历史定义信息", 2)
+        lines.append("自由版式" if kind == "smartreportgen_free_html" else "声明式模板")
+        lines.append("")
+        add_properties(extra)
+        add_properties(original_meta)
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _template_summary(md: str, name: str) -> dict:
-    title = re.search(r"^#[ \t]+([^\n]+)", md, re.M)
-    sections = [heading.strip() for heading in re.findall(r"^##[ \t]+(.+)$", md, re.M)]
-    return {"title": title[1].strip() if title else name, "sections": sections, "format": "markdown"}
+    # 只统计正文的顶层标题。历史代码块中以井号开头的行属于源码。
+    tokens = _GUIDE_MARKDOWN.parse(md)
+    headings = []
+    for i, token in enumerate(tokens):
+        if token.type == "heading_open" and token.level == 0:
+            text = "".join(part.content for part in tokens[i + 1].children
+                           if part.type in {"text", "code_inline", "image"}).strip()
+            if text:
+                headings.append((token.tag, text))
+    title = next((text for tag, text in headings if tag == "h1"), name)
+    return {"title": title, "sections": [text for tag, text in headings if tag == "h2"], "format": "markdown"}
 
 
 def _template_view(row: dict) -> dict:
@@ -725,10 +799,12 @@ def save_template(data: dict, tpl_id: int | None = None, *, expected_version: in
                    "报告模板") if tpl_id is not None else None
         if expected_version is not None and (not cur or cur["version"] != expected_version):
             raise ReportConflict("报告模板已被修改，请读取最新版本后再提交")
-        name = (data.get("name") or _template_summary(md, "")["title"]).strip()
+        summary = _template_summary(md, "")
+        name = (data.get("name") or summary["title"]).strip()
         if not name:
             raise Invalid("模板名称不能为空")
-        summary = _template_summary(md, name)
+        if not summary["title"]:
+            summary["title"] = name
         if cur:
             # 版本锁覆盖指南和场景关联，历史表保存每个版本的 Markdown。
             updates = {

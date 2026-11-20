@@ -15,13 +15,15 @@ description: 按业务场景新建、重跑或修订经营与分析报告。通�
 
 ## 2. 查阅指南并取数
 
-从上下文的 `templates` 或 `list_report_templates(keyword, dataset_id)` 找匹配指南。用 `get_report_template(template_id, version)` 读取章节、指标、取数和展示要求。用户要求沉淀分析方法时，通过 `save_report_template` 保存 Markdown 指南，更新时可传 `expected_version`。复杂场景可并行读取指南样式与翻页探查多张大表（`describe_tables` / `describe_table(mode="full")`）。
+从上下文的 `templates` 或 `list_report_templates(keyword, dataset_id)` 找匹配指南。选用模板时，先用 `get_report_template(template_id, version)` 读取该版完整正文，并用它确定取数、指标、章节、筛选联动和展示。旧版定义转换出的查询、绑定、HTML/CSS 可作为实现参考，取数和报告实现仍遵循当前授权、展示契约和离线验收。
+
+用户要求沉淀分析方法时，通过 `save_report_template` 保存能据此复做的 Markdown 指南。按场景写清适用范围与账期参数、取数来源和粒度、指标公式与单位、章节各自回答的问题、图表及明细绑定、筛选联动和验收标准。有明确复用价值的 SQL 或版式片段可用代码块保留。更新时可传 `expected_version`。复杂场景可并行读取指南样式与翻页探查多张大表（`describe_tables` / `describe_table(mode="full")`）。
 
 用 `run_query(dataset_id, sql, snapshot=true, sample_rows=50)` 获取汇总与明细快照，确认粒度、范围、比较基准、单位和缺失。优先读取正式汇总值，按确认口径在源端派生。无交叉核对关系的独立模块可并发取数；需要相互勾稽的数据须用单条 SQL 或 `query_report_data` 同批取数。纯展示修订沿用基准快照，换账期或口径时重取相关数据。[事实取数契约](references/fact-contract.md)
 
 ## 3. 初始化 HTML 草稿骨架
 
-调用 `create_html_draft`，传标题、`dataset_id`、`snapshots`（数据块 ID 到 `snapshot_id` 的映射）及可选 `style_id`、指南版本、`sections`（预置有序章节槽位）。全局 CSS、含 `<!--SRG_SECTIONS-->` 的骨架和筛选脚本放到 `head_css`、`shell_html`、`shared_js`。修订时传 `report_id` 和 `base_version` 恢复章节和基准数据。多章节并行编写前，须在此步锁定数据块字段、筛选订阅结构、章节槽位及各章独占的元素 `id` 前缀。
+调用 `create_html_draft`，传标题、`dataset_id`、`snapshots`（数据块 ID 到 `snapshot_id` 的映射）及可选 `style_id`、`sections`（预置有序章节槽位）。采用模板时传实际采用的 `template_id` 和 `template_version`，使交付报告可追溯到编写 HTML 时使用的指南。全局 CSS、含 `<!--SRG_SECTIONS-->` 的骨架和筛选脚本放到 `head_css`、`shell_html`、`shared_js`。修订时传 `report_id` 和 `base_version` 恢复章节和基准数据。多章节并行编写前，须在此步锁定数据块字段、筛选订阅结构、章节槽位及各章独占的元素 `id` 前缀。
 
 ## 4. 分轮或并行拼装章节
 
