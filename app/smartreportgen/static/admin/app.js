@@ -6,7 +6,9 @@ const BASE_PATH = (window.__SRG_BASE_PATH__ || '').replace(/\/$/, '');
 const appPath = path => BASE_PATH && path.startsWith('/') ? BASE_PATH + path : path;
 const toasts = reactive([]);
 function toast(msg, kind = '') {
-  const t = { id: Math.random(), msg, kind };
+  // 顶层弹窗只展示自身操作触发的通知，避免前一个任务的消息混入新弹窗。
+  const dialog = document.activeElement?.closest('dialog[open]') || [...document.querySelectorAll('dialog[open]')].at(-1) || null;
+  const t = { id: Math.random(), msg, kind, dialog };
   toasts.push(t);
   setTimeout(() => { const i = toasts.indexOf(t); if (i >= 0) toasts.splice(i, 1); }, kind === 'err' ? 7000 : 3000);
 }
@@ -82,22 +84,25 @@ const ICONS = {
   search: '<circle cx="8.5" cy="8.5" r="4.5"/><path d="m12 12 4 4"/>',
   menu: '<path d="M3 5h14M3 10h14M3 15h14"/>',
   close: '<path d="m5 5 10 10M5 15 15 5"/>',
-  check: '<path d="m4 10 4 4 8-8"/>'
+  check: '<path d="m4 10 4 4 8-8"/>',
+  alert: '<path d="M9.1 3.7 2.7 15a1 1 0 0 0 .9 1.5h12.8a1 1 0 0 0 .9-1.5L10.9 3.7a1 1 0 0 0-1.8 0Z"/><path d="M10 8v3.5m0 2.2h.01"/>'
 };
 const icon = k => `<svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICONS[k]}</svg>`;
 
 // ------------------------------------------------------------ 通用组件
 const Drawer = {
-  props: { title: String, wide: Boolean, compact: Boolean, busy: Boolean, backdropClose: { type: Boolean, default: true } },
+  props: { title: String, wide: Boolean, compact: Boolean, busy: Boolean, confirm: Boolean, backdropClose: { type: Boolean, default: true } },
   emits: ['close'],
-  template: `<dialog ref="dialog" class="drawer" :class="{wide, compact}" :aria-label="title"
+  template: `<dialog ref="dialog" class="drawer" :class="{wide, compact, 'confirm-drawer': confirm}" :aria-label="title"
+    :role="confirm ? 'alertdialog' : null" :aria-describedby="confirm ? 'confirm-dialog-message' : null" :aria-busy="busy"
     @cancel.prevent="close" @pointerdown="onPointerDown" @pointercancel="clearBackdropPress" @click.self="backdrop" @close="onDialogClose">
-    <div class="drawer-head"><h2>{{title}}</h2><button class="x" type="button" aria-label="关闭" :disabled="busy" @click="close" v-html="icon('close')"></button></div>
-    <div v-if="toasts.length" class="msgs dialog-feedback" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="msg" :class="t.kind">{{t.msg}}</div></div>
+    <div class="drawer-head"><h2>{{title}}</h2><button class="btn x" type="button" aria-label="关闭" :disabled="busy" @click="close" v-html="icon('close')"></button></div>
+    <div class="msgs dialog-feedback" aria-live="polite"><div v-for="t in feedback" :key="t.id" class="msg" :class="t.kind">{{t.msg}}</div></div>
     <div class="drawer-body"><slot/></div>
     <div class="drawer-foot" v-if="$slots.foot"><slot name="foot"/></div></dialog>`,
   setup(props, { emit }) {
     const dialog = ref(null);
+    const feedback = computed(() => toasts.filter(t => t.dialog === dialog.value));
     let backdropPress = false, unmounting = false;
     // 原生弹窗管理焦点与背景交互，关闭后焦点回到触发按钮。
     onMounted(() => dialog.value.showModal());
@@ -119,12 +124,54 @@ const Drawer = {
     function onDialogClose() {
       if (!unmounting && dialog.value?.isConnected && !dialog.value.open) dialog.value.showModal();
     }
-    return { dialog, close, onPointerDown, clearBackdropPress, backdrop, onDialogClose, icon, toasts };
+    return { dialog, close, onPointerDown, clearBackdropPress, backdrop, onDialogClose, icon, feedback };
+  }
+};
+const confirmState = reactive({
+  open: false,
+  title: '请确认',
+  message: '',
+  confirmText: '确认',
+  cancelText: '取消',
+  danger: true,
+});
+let confirmResolve = null;
+function askConfirm({ title = '请确认', message = '', confirmText = '确认', cancelText = '取消', danger = true } = {}) {
+  if (confirmResolve) {
+    const prev = confirmResolve;
+    confirmResolve = null;
+    prev(false);
+  }
+  Object.assign(confirmState, { open: true, title, message, confirmText, cancelText, danger });
+  return new Promise(resolve => { confirmResolve = resolve; });
+}
+function settleConfirm(ok) {
+  confirmState.open = false;
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (resolve) resolve(!!ok);
+}
+const ConfirmDialog = {
+  components: { Drawer },
+  template: `<Drawer v-if="confirmState.open" :title="confirmState.title" compact confirm @close="settleConfirm(false)">
+    <div class="confirm-content">
+      <span class="confirm-icon" :class="{danger: confirmState.danger}" v-html="icon(confirmState.danger ? 'alert' : 'check')"></span>
+      <p id="confirm-dialog-message" class="confirm-dialog-msg">{{confirmState.message}}</p>
+    </div>
+    <template #foot>
+      <button type="button" class="btn" autofocus @click="settleConfirm(false)">{{confirmState.cancelText}}</button>
+      <button type="button" class="btn" :class="confirmState.danger ? 'danger-solid' : 'primary'" @click="settleConfirm(true)">{{confirmState.confirmText}}</button>
+    </template>
+  </Drawer>`,
+  setup() {
+    // 危险操作弹窗默认聚焦取消，键盘确认需要主动切换到确认按钮。
+    onBeforeUnmount(() => { if (confirmState.open) settleConfirm(false); });
+    return { confirmState, settleConfirm, icon };
   }
 };
 const DataTable = {
   props: ['columns', 'rows', 'max'],
-  template: `<div class="scroll-x" :style="{maxHeight: (max||360)+'px'}"><table class="mini"><thead><tr><th v-for="c in columns">{{c}}</th></tr></thead>
+  template: `<div class="scroll-x table-well" tabindex="0" aria-label="查询结果" :style="{maxHeight: (max||360)+'px'}"><table class="mini"><thead><tr><th v-for="c in columns">{{c}}</th></tr></thead>
     <tbody><tr v-for="r in rows"><td v-for="v in r">{{v === null ? 'NULL' : v}}</td></tr></tbody></table></div>`
 };
 
@@ -136,7 +183,7 @@ const Home = {
       <section class="card work-panel" aria-labelledby="resources-title">
         <header class="panel-head"><h2 id="resources-title">管理入口</h2></header>
         <div class="resource-list">
-          <a v-for="entry in entries" :key="entry.page" :href="'#'+entry.page">
+          <a class="btn entry" v-for="entry in entries" :key="entry.page" :href="'#'+entry.page">
             <span class="resource-icon" v-html="icon(entry.icon)"></span>
             <span><b>{{entry.label}}</b><small>{{entry.description}}</small></span>
             <span class="ico" v-html="icon('arrow')"></span>
@@ -146,14 +193,14 @@ const Home = {
       <section class="card work-panel" aria-labelledby="recent-title" :aria-busy="loading">
         <header class="panel-head"><div><h2 id="recent-title">最近报告</h2><p>{{admin ? '所有用户最近生成的报告' : '你最近生成的报告'}}</p></div></header>
         <div v-if="loading && !list.length" class="collection-state" role="status">正在加载报告…</div>
-        <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button class="link" @click="load">重试</button></div>
+        <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
         <div v-else-if="!list.length" class="recent-empty">
           <span class="empty-icon" v-html="icon('tpl')"></span>
           <div><b>还没有报告</b><p>生成的报告会出现在这里，可随时查看或下载。</p></div>
         </div>
         <ul v-else class="recent-list">
           <li v-for="r in list.slice(0,5)" :key="r.id">
-            <a :href="reportPath(r)" target="_blank" rel="noopener">
+            <a class="btn entry" :href="reportPath(r)" target="_blank" rel="noopener">
               <span class="resource-icon" v-html="icon('rep')"></span>
               <span class="recent-info"><b>{{r.name}}</b><small v-if="r.template_name && r.template_name !== r.name">{{r.template_name}}</small></span>
               <time :datetime="r.created_at">{{fmtTime(r.created_at)}}</time>
@@ -230,139 +277,174 @@ function formToDs(f) {
 const DsBrowser = {
   components: { Drawer, DataTable }, props: ['ds'], emits: ['close'],
   template: `<Drawer :title="'浏览：' + ds.name" wide @close="$emit('close')">
-    <div class="subtabs"><button :class="{on:tab==='tables'}" @click="tab='tables'">表和视图</button><button :class="{on:tab==='sql'}" @click="tab='sql'">SQL 查询</button></div>
+    <div class="subtabs" role="group" aria-label="数据源浏览方式"><button type="button" class="btn toggle" :aria-pressed="tab==='tables'" @click="tab='tables'">表和视图</button><button type="button" class="btn toggle" :aria-pressed="tab==='sql'" @click="tab='sql'">SQL 查询</button></div>
     <div v-if="tab==='tables'" class="source-browser">
       <div><input class="in" v-model="kw" type="search" aria-label="搜索表或视图" placeholder="搜索表或视图">
-        <div class="source-object-list" :aria-busy="loading">
-          <button v-for="t in shown" :key="t.name" type="button" class="hit source-object" :aria-pressed="cur===t.name" @click="open(t.name)">
+        <div class="source-object-list" :aria-busy="loadingTables">
+          <button v-for="t in shown" :key="t.name" type="button" class="btn source-object" :aria-pressed="cur===t.name" @click="open(t.name)">
             <span class="source-object-name"><span class="mono">{{t.name}}</span><span class="badge">{{OBJECT_LABEL[t.kind] || '表'}}</span></span>
             <span class="small muted" v-if="t.comment">{{t.comment}}</span>
           </button>
-          <div v-if="!shown.length" class="muted small" role="status">{{loading ? '正在加载…' : kw ? '没有匹配的表或视图' : '无可浏览的表或视图'}}</div></div></div>
+          <div v-if="tableError" class="msg err" role="alert">{{tableError}} <button type="button" class="btn link" @click="loadTables">重试</button></div>
+          <div v-else-if="!shown.length" class="muted small" role="status">{{loadingTables ? '正在加载…' : kw ? '没有匹配的表或视图' : '无可浏览的表或视图'}}</div></div></div>
       <div v-if="desc">
         <div class="actions" style="margin-bottom:10px"><b class="mono">{{desc.table}}</b><span class="badge">行数 {{desc.row_count ?? '未知'}}</span><span class="small muted">{{desc.profile_basis}}</span></div>
         <h4 style="margin:6px 0">字段画像</h4>
-        <div class="scroll-x" style="max-height:300px"><table class="mini"><thead><tr><th>字段</th><th>类型</th><th>注释</th><th>推断</th><th>空值率</th><th>去重</th><th>范围 / 高频值</th></tr></thead>
+        <div class="scroll-x table-well" tabindex="0" aria-label="字段画像" style="max-height:300px"><table class="mini"><thead><tr><th>字段</th><th>类型</th><th>注释</th><th>推断</th><th>空值率</th><th>去重</th><th>范围 / 高频值</th></tr></thead>
           <tbody><tr v-for="p in profileRows"><td class="mono">{{p.column}}</td><td class="small">{{p.type}}</td><td>{{p.comment}}</td><td><span class="badge">{{p.kind}}</span></td>
           <td>{{p.null_ratio==null?'':(p.null_ratio*100).toFixed(1)+'%'}}</td><td>{{p.distinct}}</td>
           <td class="small">{{p.min!=null ? p.min+' ~ '+p.max : ''}}{{p.top_values ? p.top_values.slice(0,5).map(x=>x.value).join('、') : ''}}</td></tr></tbody></table></div>
         <h4 style="margin:14px 0 6px">样本数据</h4><DataTable :columns="desc.sample_columns" :rows="desc.sample_rows" :max="260"/>
       </div>
-      <div v-else class="empty">选择表或视图，查看字段和数据画像</div>
+      <div v-else-if="profileError" class="msg err" role="alert">{{profileError}} <button type="button" class="btn link" @click="open(cur)">重试</button></div>
+      <div v-else class="empty" role="status">{{profileLoading ? '正在读取字段画像…' : '选择表或视图，查看字段和数据画像'}}</div>
     </div>
     <div v-else>
-      <textarea class="in code" v-model="sql" rows="8" placeholder="SELECT ..."></textarea>
-      <div class="actions" style="margin:10px 0"><button class="btn primary" @click="query" :disabled="loading">执行（只读）</button>
+      <label class="field"><span>只读 SQL</span><textarea class="in code" v-model="sql" rows="8" placeholder="SELECT ..."></textarea></label>
+      <div class="actions" style="margin:10px 0"><button type="button" class="btn primary" @click="query" :disabled="querying">{{querying ? '正在执行…' : '执行（只读）'}}</button>
         <span class="small muted" v-if="res">返回 {{res.row_count}} 行{{res.truncated?'（已截断）':''}} · 方言 {{res.dialect}}</span></div>
+      <div v-if="queryError" class="msg err" role="alert">{{queryError}}</div>
       <DataTable v-if="res" :columns="res.columns" :rows="res.rows" :max="480"/>
     </div>
   </Drawer>`,
   setup(props) {
-    const tab = ref('tables'), tables = ref([]), kw = ref(''), desc = ref(null), cur = ref(''), loading = ref(false);
-    const sql = ref(''), res = ref(null);
+    const tab = ref('tables'), kw = ref(''), desc = ref(null), cur = ref('');
+    const profileLoading = ref(false), profileError = ref('');
+    const sql = ref(''), res = ref(null), querying = ref(false), queryError = ref('');
+    const path = `/api/datasources/${props.ds.id}`;
+    const { list: tables, loading: loadingTables, loadError: tableError, load: loadTables } = useCollection(path + '/tables');
     const shown = computed(() => tables.value.filter(t => matches(kw.value, t.name, t.comment, OBJECT_LABEL[t.kind])));
     const profileRows = computed(() => {
       if (!desc.value) return [];
       const types = Object.fromEntries((desc.value.columns || []).map(c => [c.name, c]));
       return desc.value.profile.map(p => ({ ...p, type: (types[p.column] || {}).type || '', comment: p.comment || (types[p.column] || {}).comment || '' }));
     });
-    onMounted(async () => { loading.value = true; try { tables.value = await run(() => api(`/api/datasources/${props.ds.id}/tables`)); } finally { loading.value = false; } });
+    let profileRequest = 0;
     async function open(name) {
+      const request = ++profileRequest;
       cur.value = name; desc.value = null;
-      const data = await run(() => api(`/api/datasources/${props.ds.id}/describe?table=${encodeURIComponent(name)}&sample_rows=8`));
-      // 快速切换时，较晚返回的旧画像不能覆盖当前选择。
-      if (cur.value === name) { desc.value = data; if (!sql.value) sql.value = `SELECT * FROM ${name}`; }
+      profileError.value = ''; profileLoading.value = true;
+      try {
+        const data = await api(path + `/describe?table=${encodeURIComponent(name)}&sample_rows=8`);
+        // 即使切回同一对象，也只接受最后一次请求返回的画像和错误。
+        if (request !== profileRequest) return;
+        desc.value = data;
+        if (!sql.value) sql.value = `SELECT * FROM ${name}`;
+      } catch (e) { if (request === profileRequest) profileError.value = e.message; }
+      finally { if (request === profileRequest) profileLoading.value = false; }
     }
-    async function query() { loading.value = true; try { res.value = await run(() => api(`/api/datasources/${props.ds.id}/query`, { method: 'POST', body: { sql: sql.value, limit: 500 } })); } finally { loading.value = false; } }
-    return { tab, kw, shown, desc, cur, open, loading, sql, res, query, profileRows, OBJECT_LABEL };
+    async function query() {
+      querying.value = true; queryError.value = ''; res.value = null;
+      try { res.value = await api(path + '/query', { method: 'POST', body: { sql: sql.value, limit: 500 } }); }
+      catch (e) { queryError.value = e.message; }
+      finally { querying.value = false; }
+    }
+    return { tab, kw, shown, desc, cur, open, loadingTables, tableError, loadTables, profileLoading, profileError,
+      sql, res, query, querying, queryError, profileRows, OBJECT_LABEL };
   }
 };
 const Datasources = {
   components: { Drawer, DsBrowser },
   template: `<div>
     <div class="page-head"><div><h1>数据源</h1><p>{{admin ? '管理业务场景使用的数据连接，检查连接是否可用。' : '查看已授权业务场景使用的数据连接。'}}</p></div>
-      <div class="actions"><button v-if="admin" class="btn primary" @click="edit()">新建数据源</button><span v-else class="badge">只读 · 仅显示你有权限的数据源</span></div></div>
-    <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>名称</th><th>类型</th><th v-if="admin">连接</th><th>描述</th><th>状态</th><th v-if="admin">操作</th></tr></thead>
-      <tbody><tr v-for="d in list"><td><b>{{d.name}}</b></td><td><span class="badge blue">{{DS_LABEL[d.type]}}</span></td>
-        <td v-if="admin" class="mono small">{{addr(d)}}</td><td><div class="clip">{{d.description}}</div></td>
-        <td><span class="dot" :class="{on:d.enabled}"></span>{{d.enabled?'启用':'停用'}}</td>
-        <td v-if="admin"><div class="links"><button class="link" @click="test(d)">测试</button><button class="link" @click="browse=d">浏览</button>
-          <button class="link" @click="edit(d)">编辑</button><button class="link danger" @click="del(d)">删除</button></div></td></tr>
+      <div class="actions"><button type="button" v-if="admin" class="btn primary" @click="edit()">新建数据源</button><span v-else class="badge">只读 · 仅显示你有权限的数据源</span></div></div>
+    <div v-if="loading" class="card collection-state" role="status">正在加载数据源…</div>
+    <div v-else-if="loadError" class="card collection-state" role="alert">数据源加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
+    <div v-else class="card scroll-x" tabindex="0" aria-label="数据源表格"><table class="tbl record-table" role="table"><thead><tr><th scope="col">名称</th><th scope="col">类型</th><th scope="col" v-if="admin">连接</th><th scope="col">描述</th><th scope="col">状态</th><th scope="col" v-if="admin">操作</th></tr></thead>
+      <tbody><tr v-for="d in list"><td><b>{{d.name}}</b></td><td data-label="类型"><span class="badge blue">{{DS_LABEL[d.type]}}</span></td>
+        <td v-if="admin" class="mono small record-wide" data-label="连接">{{addr(d)}}</td><td class="record-wide" data-label="描述"><div class="clip">{{d.description}}</div></td>
+        <td data-label="状态"><span class="dot" :class="{on:d.enabled}"></span>{{d.enabled?'启用':'停用'}}</td>
+        <td v-if="admin" class="record-actions"><div class="links"><button type="button" class="btn link" @click="test(d)" :disabled="testing.has(d.id)">{{testing.has(d.id) ? '测试中…' : '测试'}}</button><button type="button" class="btn link" @click="browse=d">浏览</button>
+          <button type="button" class="btn link" @click="edit(d)">编辑</button><button type="button" class="btn link danger" @click="del(d)">删除</button></div></td></tr>
         <tr v-if="!list.length"><td colspan="6" class="empty">{{admin ? '暂无数据源' : '暂无你有权限的数据源，如需开通请联系管理员'}}</td></tr></tbody></table></div>
-    <Drawer v-if="form" :title="form.id ? '编辑数据源' : '新建数据源'" @close="form=null">
-      <div class="row2"><div class="field"><label>名称</label><input class="in" v-model="form.name"></div>
-        <div class="field"><label>类型</label><select class="in" v-model="form.type"><option v-for="(l,k) in DS_LABEL" :value="k">{{l}}</option></select></div></div>
+    <Drawer v-if="form" :title="form.id ? '编辑数据源' : '新建数据源'" :busy="!!busy" @close="form=null">
+      <fieldset class="plain-fs" :disabled="busy">
+      <div class="row2"><div class="field"><label for="ds-name">名称</label><input id="ds-name" class="in" v-model="form.name"></div>
+        <div class="field"><label for="ds-type">类型</label><select id="ds-type" class="in" v-model="form.type"><option v-for="(l,k) in DS_LABEL" :value="k">{{l}}</option></select></div></div>
       <template v-if="form.type!=='api'">
-        <div class="row3"><div class="field"><label>主机</label><input class="in" v-model="form.host" placeholder="10.0.0.12"></div>
-          <div class="field"><label>端口</label><input class="in" v-model="form.port" :placeholder="String(DEFAULT_PORT[form.type])"></div>
-          <div class="field" v-if="form.type!=='oracle'"><label>数据库</label><input class="in" v-model="form.database"></div>
-          <div class="field" v-else><label>服务名 <small>或 SID</small></label><input class="in" v-model="form.service_name" placeholder="ORCLPDB1"></div></div>
+        <div class="row3"><div class="field"><label for="ds-host">主机</label><input id="ds-host" class="in" v-model="form.host" placeholder="10.0.0.12"></div>
+          <div class="field"><label for="ds-port">端口</label><input id="ds-port" class="in" v-model="form.port" :placeholder="String(DEFAULT_PORT[form.type])"></div>
+          <div class="field" v-if="form.type!=='oracle'"><label for="ds-db">数据库</label><input id="ds-db" class="in" v-model="form.database"></div>
+          <div class="field" v-else><label for="ds-service">服务名 <small>或 SID</small></label><input id="ds-service" class="in" v-model="form.service_name" placeholder="ORCLPDB1"></div></div>
         <div class="row2" v-if="form.type==='oracle'">
-          <div class="field"><label>SID <small>未填服务名时使用</small></label><input class="in" v-model="form.sid"></div>
+          <div class="field"><label for="ds-sid">SID <small>未填服务名时使用</small></label><input id="ds-sid" class="in" v-model="form.sid"></div>
           <div class="field"><label for="oracle-schema">Schema <small>选填</small></label>
             <input id="oracle-schema" class="in" v-model.trim="form.schema" aria-describedby="oracle-schema-hint">
             <div id="oracle-schema-hint" class="hint">留空时使用登录用户的默认 Schema。</div></div>
         </div>
-        <div class="row2"><div class="field"><label>用户名</label><input class="in" v-model="form.username"></div>
-          <div class="field"><label>密码</label><input class="in" type="password" v-model="form.secret" :placeholder="form.has_secret?'已设置，留空则不修改':''" autocomplete="new-password"></div></div>
+        <div class="row2"><div class="field"><label for="ds-user">用户名</label><input id="ds-user" class="in" v-model="form.username"></div>
+          <div class="field"><label for="ds-password">密码</label><input id="ds-password" class="in" type="password" v-model="form.secret" :placeholder="form.has_secret?'已设置，留空则不修改':''" autocomplete="new-password"></div></div>
         <div class="field"><label for="datasource-extra">高级配置 <small>选填，JSON</small></label>
           <textarea id="datasource-extra" class="in code" v-model="form.extraTxt" rows="3"></textarea></div>
       </template>
       <template v-else>
-        <div class="field"><label>Base URL</label><input class="in" v-model="form.base_url" placeholder="https://api.example.com/v1"></div>
-        <div class="row3"><div class="field"><label>记录路径 <small>如 data.items</small></label><input class="in" v-model="form.records_path"></div>
-          <div class="field"><label>鉴权请求头</label><input class="in" v-model="form.auth_header"></div>
-          <div class="field"><label>前缀</label><input class="in" v-model="form.auth_scheme" placeholder="Bearer"></div></div>
-        <div class="field"><label>令牌 / API Key</label><input class="in" type="password" v-model="form.secret" :placeholder="form.has_secret?'已设置，留空则不修改':'可选'" autocomplete="new-password"></div>
-        <div class="field"><label>接口定义 endpoints <small>逻辑表名 → {path, method, params, body, records_path, description}</small></label>
-          <textarea class="in code" v-model="form.endpointsTxt" rows="7"></textarea>
+        <div class="field"><label for="ds-base-url">Base URL</label><input id="ds-base-url" class="in" v-model="form.base_url" placeholder="https://api.example.com/v1"></div>
+        <div class="row3"><div class="field"><label for="ds-record-path">记录路径 <small>如 data.items</small></label><input id="ds-record-path" class="in" v-model="form.records_path"></div>
+          <div class="field"><label for="ds-auth-header">鉴权请求头</label><input id="ds-auth-header" class="in" v-model="form.auth_header"></div>
+          <div class="field"><label for="ds-auth-scheme">前缀</label><input id="ds-auth-scheme" class="in" v-model="form.auth_scheme" placeholder="Bearer"></div></div>
+        <div class="field"><label for="ds-api-key">令牌 / API Key</label><input id="ds-api-key" class="in" type="password" v-model="form.secret" :placeholder="form.has_secret?'已设置，留空则不修改':'可选'" autocomplete="new-password"></div>
+        <div class="field"><label for="ds-endpoints">接口定义 endpoints <small>逻辑表名 → {path, method, params, body, records_path, description}</small></label>
+          <textarea id="ds-endpoints" class="in code" v-model="form.endpointsTxt" rows="7"></textarea>
           <div class="hint">数据集中的“数据表名”填写逻辑表名；查询时接口数据载入 DuckDB，以 DuckDB SQL 方言查询。</div></div>
-        <div class="row2"><div class="field"><label>公共请求头 <small>JSON</small></label><textarea class="in code" v-model="form.headersTxt" rows="3"></textarea></div>
-          <div class="field"><label>其他配置 <small>timeout / cache_seconds / method</small></label><textarea class="in code" v-model="form.extraTxt" rows="3"></textarea></div></div>
+        <div class="row2"><div class="field"><label for="ds-headers">公共请求头 <small>JSON</small></label><textarea id="ds-headers" class="in code" v-model="form.headersTxt" rows="3"></textarea></div>
+          <div class="field"><label for="ds-other">其他配置 <small>timeout / cache_seconds / method</small></label><textarea id="ds-other" class="in code" v-model="form.extraTxt" rows="3"></textarea></div></div>
       </template>
       <details class="field">
-        <summary>开放给员工构建业务场景</summary>
+        <summary class="btn disclosure">开放给员工构建业务场景</summary>
         <label for="datasource-scene-tables">可引用的表和授权范围</label>
         <p class="field-help" id="datasource-scene-tables-help">为表或视图指定可引用的工号或角色。固定行范围会应用到员工基于此表创建的场景。</p>
         <textarea id="datasource-scene-tables" class="in code" v-model="form.scenarioTablesTxt" rows="5" spellcheck="false"
           aria-describedby="datasource-scene-tables-help" placeholder='[{"table_name":"public.sales","roles":["user"],"row_filters":[]}]'></textarea>
       </details>
-      <div class="field"><label>描述</label><textarea class="in" v-model="form.description" rows="2"></textarea></div>
+      <div class="field"><label for="ds-description">描述</label><textarea id="ds-description" class="in" v-model="form.description" rows="2"></textarea></div>
       <label class="check"><input type="checkbox" v-model="form.enabled"> 启用</label>
+      </fieldset>
       <div class="msg" :class="testRes.ok?'ok':'err'" :role="testRes.ok?'status':'alert'" v-if="testRes" style="margin-top:12px">{{testRes.text}}</div>
-      <template #foot><button class="btn" @click="testForm" :disabled="busy">测试连接</button><span class="spacer"></span>
-        <button class="btn" @click="form=null">取消</button><button class="btn primary" @click="save" :disabled="busy">保存</button></template>
+      <template #foot><button type="button" class="btn" @click="testForm" :disabled="busy">{{busy==='test' ? '正在测试…' : '测试连接'}}</button><span class="spacer"></span>
+        <button type="button" class="btn" @click="form=null" :disabled="busy">取消</button><button type="button" class="btn primary" @click="save" :disabled="busy">{{busy==='save' ? '正在保存…' : '保存'}}</button></template>
     </Drawer>
     <DsBrowser v-if="browse" :ds="browse" @close="browse=null"/>
   </div>`,
   setup() {
-    const list = ref([]), form = ref(null), browse = ref(null), busy = ref(false), testRes = ref(null);
-    const load = async () => { list.value = await api('/api/datasources'); };
-    onMounted(load);
+    const sources = useCollection('/api/datasources');
+    const { load } = sources;
+    // 保存和测试复用表单锁，空闲用 null，确保原生 disabled 布尔属性会被移除。
+    const form = ref(null), browse = ref(null), busy = ref(null), testRes = ref(null), testing = reactive(new Set());
     const admin = computed(isAdmin);
     const addr = d => !d.config ? '' : d.type === 'api' ? (d.config.base_url || '') : `${d.config.host || ''}:${d.config.port || DEFAULT_PORT[d.type]}/${d.config.database || d.config.service_name || d.config.sid || ''}`;
     function edit(d) { testRes.value = null; form.value = d ? dsToForm(d) : emptyDs(); }
     async function save() {
-      busy.value = true; testRes.value = null;
+      busy.value = 'save'; testRes.value = null;
       try {
         const body = formToDs(form.value);
         const id = form.value.id;
         await api(id ? `/api/datasources/${id}` : '/api/datasources', { method: id ? 'PUT' : 'POST', body });
         toast('已保存', 'ok');
         form.value = null; load();
-      } catch (e) { testRes.value = { ok: false, text: e.message }; } finally { busy.value = false; }
+      } catch (e) { testRes.value = { ok: false, text: e.message }; } finally { busy.value = null; }
     }
     async function testForm() {
-      busy.value = true; testRes.value = null;
+      busy.value = 'test'; testRes.value = null;
       try {
         const b = formToDs(form.value); b.id = form.value.id;
         const r = await api('/api/datasources/test', { method: 'POST', body: b });
         testRes.value = { ok: true, text: `连接成功 · ${r.version} · ${r.latency_ms} ms` };
-      } catch (e) { testRes.value = { ok: false, text: e.message }; } finally { busy.value = false; }
+      } catch (e) { testRes.value = { ok: false, text: e.message }; } finally { busy.value = null; }
     }
-    async function test(d) { const r = await run(() => api(`/api/datasources/${d.id}/test`, { method: 'POST' })); toast(`「${d.name}」连接成功：${r.version}（${r.latency_ms} ms）`, 'ok'); }
-    async function del(d) { if (!confirm(`删除数据源「${d.name}」？`)) return; await run(() => api(`/api/datasources/${d.id}`, { method: 'DELETE' }), '已删除'); load(); }
-    return { admin, list, form, browse, busy, testRes, addr, edit, save, testForm, test, del, DS_LABEL, DEFAULT_PORT };
+    async function test(d) {
+      // 各行独立反馈，测试期间锁住同一个数据源的重复点击。
+      testing.add(d.id);
+      try {
+        const r = await api(`/api/datasources/${d.id}/test`, { method: 'POST' });
+        toast(`「${d.name}」连接成功：${r.version}（${r.latency_ms} ms）`, 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+      finally { testing.delete(d.id); }
+    }
+    async function del(d) {
+      if (!await askConfirm({ title: '删除数据源', message: `确认删除数据源「${d.name}」？`, confirmText: '删除' })) return;
+      await run(() => api(`/api/datasources/${d.id}`, { method: 'DELETE' }), '已删除'); load();
+    }
+    return { ...sources, admin, form, browse, busy, testRes, testing, addr, edit, save, testForm, test, del, DS_LABEL, DEFAULT_PORT };
   }
 };
 
@@ -496,8 +578,8 @@ const SceneFilterValues = {
       </div>
       <p v-if="modelValue.length >= 100" class="field-help" role="status">每个字段最多保留 100 个值。</p>
       <p v-if="loading" class="field-help" role="status">正在读取候选值…</p>
-      <div v-else-if="error" class="msg err" role="alert">{{error}} <button type="button" class="link scene-values-action" @click="load(failedOffset)">重试</button></div>
-      <button v-else-if="nextOffset !== null" type="button" class="link scene-values-action" @click="load(nextOffset)">加载更多候选值</button>
+      <div v-else-if="error" class="msg err" role="alert">{{error}} <button type="button" class="btn link scene-values-action" @click="load(failedOffset)">重试</button></div>
+      <button v-else-if="nextOffset !== null" type="button" class="btn link scene-values-action" @click="load(nextOffset)">加载更多候选值</button>
       <p v-else-if="!options.length" class="field-help" role="status">{{search.trim() ? '没有匹配的候选值。' : '当前字段没有可选值。'}}</p>
     </template>
   </div>`,
@@ -543,33 +625,33 @@ const Datasets = {
   components: { Drawer, SceneFilterValues },
   template: `<div>
     <div class="page-head"><div><h1>业务场景</h1><p>按业务主题找数据，查看每个场景可用于分析的数据表。</p></div>
-      <div class="actions"><button v-if="admin" class="btn" @click="reindex">重建检索索引</button><button class="btn primary" @click="edit()">新建业务场景</button></div></div>
+      <div class="actions"><button type="button" v-if="admin" class="btn" @click="reindex">重建检索索引</button><button type="button" class="btn primary" @click="edit()">新建业务场景</button></div></div>
     <section class="card list-panel" aria-label="业务场景列表" :aria-busy="loading">
       <div class="list-tools">
         <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索业务场景、描述或标签" aria-label="搜索业务场景"></label>
         <span class="list-count" v-if="!loading && !loadError" aria-live="polite">{{shown.length}} 个场景</span>
       </div>
       <div v-if="loading" class="collection-state" role="status">正在加载业务场景…</div>
-      <div v-else-if="loadError" class="collection-state" role="alert">业务场景加载失败。<button class="link" @click="load">重试</button></div>
+      <div v-else-if="loadError" class="collection-state" role="alert">业务场景加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
       <div v-else-if="!shown.length" class="collection-state">
         <span class="empty-icon" v-html="icon('set')"></span><h2>{{kw.trim() ? '未找到匹配的场景' : '暂无可用的业务场景'}}</h2>
         <p>{{kw.trim() ? '可以改用业务主题或常见指标搜索。' : '可新建业务场景，选择授权的数据源并填写分析思路。'}}</p>
-        <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
-        <button v-else class="btn" @click="edit()">新建业务场景</button>
+        <button type="button" v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
+        <button type="button" v-else class="btn" @click="edit()">新建业务场景</button>
       </div>
       <div v-else class="scroll-x" tabindex="0" aria-label="业务场景表格">
-        <table class="tbl scene-table" role="table"><thead><tr><th scope="col">业务场景</th><th scope="col">分析范围</th><th scope="col">数据表</th><th v-if="admin" scope="col">状态</th><th scope="col">操作</th></tr></thead>
+        <table class="tbl record-table scene-table" role="table"><thead><tr><th scope="col">业务场景</th><th scope="col">分析范围</th><th scope="col">数据表</th><th v-if="admin" scope="col">状态</th><th scope="col">操作</th></tr></thead>
           <tbody><tr v-for="d in shown" :key="d.id">
             <td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div></td>
             <td class="scene-description"><div class="clip">{{d.business_description || '—'}}</div></td><td data-label="数据表">{{d.table_count}} 张</td>
             <td v-if="admin" data-label="状态"><span class="badge" :class="!d.enabled ? '' : d.vectorized ? 'green' : 'amber'">{{!d.enabled ? '停用' : d.vectorized ? '可用' : '索引待更新'}}</span></td>
-            <td><div class="links"><button class="link" @click="view(d)">查看场景</button><template v-if="admin || d.read_only === false"><button class="link" @click="edit(d)">编辑</button><button class="link danger" @click="del(d)">删除</button></template></div></td>
+            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(d)">查看场景</button><template v-if="admin || d.read_only === false"><button type="button" class="btn link" @click="edit(d)">编辑</button><button type="button" class="btn link danger" @click="del(d)">删除</button></template></div></td>
           </tr></tbody>
         </table>
       </div>
     </section>
     <details class="card card-pad discovery">
-      <summary>按分析需求匹配业务场景</summary>
+      <summary class="btn disclosure">按分析需求匹配业务场景</summary>
       <p class="muted">描述要回答的业务问题，查找可能用到的数据。</p>
       <form class="query-form" @submit.prevent="search">
         <input class="in" v-model="q" aria-label="分析需求" placeholder="例如：分析各渠道的销售增长与毛利变化">
@@ -579,22 +661,22 @@ const Datasets = {
       <div v-if="sr" class="match-results" aria-live="polite">
         <div class="msg warn" v-for="w in sr.warnings">{{w}}</div>
         <div v-for="h in sr.hits" :key="h.dataset.id" class="hit"><h4>{{h.dataset.business_scenario}}</h4>
-          <p>{{h.dataset.business_description}}</p><button class="link" @click="view(h.dataset)">查看场景</button>
-          <details v-if="admin"><summary class="small muted">查看匹配依据</summary>
+          <p>{{h.dataset.business_description}}</p><button type="button" class="btn link" @click="view(h.dataset)">查看场景</button>
+          <details v-if="admin"><summary class="btn disclosure small muted">查看匹配依据</summary>
             <p class="score">关键词 {{(h.matched_terms||[]).join('、') || '—'}} · 综合分 {{h.rrf}} · 向量 {{h.vector_score ?? '—'}} · 关键词分 {{h.keyword_score ?? '—'}}</p>
           </details>
         </div>
         <p v-if="!sr.hits.length" class="muted">暂无匹配的场景。试试换一个业务主题或缩短描述。</p>
       </div>
     </details>
-    <p class="small muted legacy-link" v-if="!admin"><a href="#datasources">查看这些场景使用的数据源</a></p>
+    <p class="small muted legacy-link" v-if="!admin"><a class="btn link" href="#datasources">查看这些场景使用的数据源</a></p>
     <Drawer v-if="detail" :title="detail.business_scenario" @close="detail=null">
       <dl class="kv"><dt>业务描述</dt><dd class="business-copy">{{detail.business_description}}</dd>
         <dt>分析思路</dt><dd class="business-copy">{{detail.analysis_approach || '暂未填写'}}</dd>
         <dt>标签</dt><dd>{{(detail.tags||[]).join('、') || '-'}}</dd>
         <dt>数据源</dt><dd>{{detail.datasource_name}}（{{DS_LABEL[detail.datasource_type]}}）</dd></dl>
       <h4 style="margin:16px 0 8px">表和视图 <small class="muted" v-if="!admin">（仅显示你有权限的对象）</small></h4>
-      <div class="scroll-x"><table class="tbl card"><thead><tr><th scope="col">名称</th><th scope="col">描述</th><th scope="col">取值范围</th></tr></thead>
+      <div class="scroll-x table-well" tabindex="0" aria-label="场景表和视图"><table class="tbl"><thead><tr><th scope="col">名称</th><th scope="col">描述</th><th scope="col">取值范围</th></tr></thead>
         <tbody><tr v-for="t in detail.tables" :key="t.id"><td class="mono">{{t.table_name}}</td><td>{{t.table_description}}</td><td>
           <div v-for="r in t.row_filters" :key="r.column" class="scene-filter-summary"><b>{{r.column}}</b>：{{r.values.map(filterValueLabel).join('、')}}</div>
           <div v-for="r in t.source_row_filters" :key="'source-' + r.column" class="scene-filter-summary"><b>数据源 · {{r.column}}</b>：{{r.values.map(filterValueLabel).join('、')}}</div>
@@ -602,7 +684,7 @@ const Datasets = {
         <tr v-if="!detail.tables.length"><td colspan="3" class="empty">无</td></tr></tbody></table></div>
     </Drawer>
     <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide :busy="busy" :backdrop-close="false" @close="closeForm">
-      <div class="row2"><div class="field"><label>业务场景</label><input class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
+      <div class="row2"><div class="field"><label for="scene-name">业务场景</label><input id="scene-name" class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
         <div class="field"><label for="scene-source">数据源</label>
           <select id="scene-source" class="in" v-model="form.datasource_id" @change="changeSource">
             <option :value="null" disabled>请选择</option>
@@ -614,13 +696,13 @@ const Datasets = {
       <div class="field"><label for="scene-approach">分析思路 <small>选填</small></label>
         <p class="field-help" id="scene-approach-help">说明先看什么、怎么比较、需要验证哪些假设。也可补充报告应回答的问题、适合的图表和需要切换的筛选条件。</p>
         <textarea id="scene-approach" class="in" v-model="form.analysis_approach" rows="4" aria-describedby="scene-approach-help" placeholder="例如：先比较各渠道的销售增速，再找出毛利下降的主要品类，核对促销前后的变化。"></textarea></div>
-      <div class="field"><label>标签 <small>用逗号分隔，帮助同事查找场景</small></label><input class="in" v-model="form.tagsTxt"></div>
+      <div class="field"><label for="scene-tags">标签 <small>用逗号分隔，帮助同事查找场景</small></label><input id="scene-tags" class="in" v-model="form.tagsTxt"></div>
       <div class="field">
         <div class="scene-metrics-head">
           <label>官方指标 <small>登记聚合公式和允许分组维度（选填）</small></label>
           <div class="seg" role="group" aria-label="官方指标编辑模式">
-            <button type="button" :class="{on: form.metricsMode === 'visual'}" @click="switchMetricsMode('visual')">可视化编辑</button>
-            <button type="button" :class="{on: form.metricsMode === 'json'}" @click="switchMetricsMode('json')">JSON 源码</button>
+            <button type="button" class="btn toggle" :aria-pressed="form.metricsMode === 'visual'" @click="switchMetricsMode('visual')">可视化编辑</button>
+            <button type="button" class="btn toggle" :aria-pressed="form.metricsMode === 'json'" @click="switchMetricsMode('json')">JSON 源码</button>
           </div>
         </div>
         <div v-if="form.metricsError" class="msg err" role="alert">{{form.metricsError}}</div>
@@ -655,14 +737,14 @@ const Datasets = {
             </div>
             <div class="scene-metric-foot">
               <span v-if="m.extra?.when || m.extra?.denominator_when" class="badge blue">含条件聚合（when）</span>
-              <button class="link danger" type="button" @click="form.metricDrafts.splice(idx, 1)">移除指标</button>
+              <button class="btn link danger" type="button" @click="form.metricDrafts.splice(idx, 1)">移除指标</button>
             </div>
           </div>
           <div class="actions"><button class="btn sm" type="button" @click="addMetric" :disabled="form.metricDrafts.length >= 100">添加官方指标</button></div>
         </div>
         <div v-else>
-          <textarea id="scene-metrics" class="in mono" v-model="form.metricsTxt" rows="6" spellcheck="false"></textarea>
-          <a :href="appPath('/api-guide')" target="_blank" rel="noopener">查看配置字段</a>
+          <textarea id="scene-metrics" class="in mono" aria-label="官方指标 JSON 源码" v-model="form.metricsTxt" rows="6" spellcheck="false"></textarea>
+          <div style="margin-top:8px"><a class="btn link" :href="appPath('/api-guide')" target="_blank" rel="noopener">查看配置字段</a></div>
         </div>
       </div>
       <section class="field" aria-labelledby="scene-tables-label"><h3 id="scene-tables-label" class="scene-tables-label">表和视图 <small class="muted">{{form.tables.length}} 项</small></h3>
@@ -671,17 +753,17 @@ const Datasets = {
           <div class="scene-table-fields">
             <label>名称 <input class="in mono" v-model.trim="t.table_name" :readonly="!admin" placeholder="schema.table" @change="changeTable(t)"></label>
             <label>描述 <input class="in" v-model="t.table_description"></label>
-            <button class="link danger" type="button" @click="form.tables.splice(i,1)" :aria-label="'移除 ' + (t.table_name || '第 ' + (i+1) + ' 项')">移除</button>
+            <button class="btn link danger" type="button" @click="form.tables.splice(i,1)" :aria-label="'移除 ' + (t.table_name || '第 ' + (i+1) + ' 项')">移除</button>
           </div>
           <p v-if="t.source_row_filters?.length" class="field-help">
             数据源固定范围 · {{t.source_row_filters.map(r => r.column + '：' + r.values.map(filterValueLabel).join('、')).join('；')}}
           </p>
-          <button class="link scene-filter-toggle" type="button" :aria-expanded="t.expanded" :aria-controls="'scene-filters-' + t.key"
+          <button class="btn link scene-filter-toggle" type="button" :aria-expanded="t.expanded" :aria-controls="'scene-filters-' + t.key"
             :disabled="!form.datasource_id || !t.table_name" @click="toggleFilters(t)">数据过滤 · {{t.row_filters.length ? t.row_filters.length + ' 个字段' : '无附加筛选'}}</button>
           <div v-show="t.expanded" :id="'scene-filters-' + t.key" class="scene-filter-editor">
             <p class="field-help">选择字段后，从表中的实际取值里勾选。不同字段的条件须同时满足。</p>
             <p v-if="t.loadingColumns" class="small muted" role="status">正在读取字段…</p>
-            <div v-if="t.columnError" class="msg err" role="alert">{{t.columnError}} <button class="link" type="button" @click="loadColumns(t)">重试</button></div>
+            <div v-if="t.columnError" class="msg err" role="alert">{{t.columnError}} <button class="btn link" type="button" @click="loadColumns(t)">重试</button></div>
             <div v-for="(rule,j) in t.row_filters" :key="rule" class="scene-filter-rule">
               <div><label :for="'scene-column-' + t.key + '-' + j">字段</label>
                 <select :id="'scene-column-' + t.key + '-' + j" class="in" :value="rule.column" @change="changeRuleColumn(rule, $event.target.value)" :disabled="!t.columns?.length">
@@ -692,7 +774,7 @@ const Datasets = {
               </div>
               <SceneFilterValues v-if="t.expanded" :key="JSON.stringify([form.datasource_id, t.table_name, rule.column])"
                 :source="form.datasource_id" :table="t.table_name" :column="rule.column" v-model="rule.values" />
-              <button class="link danger" type="button" @click="t.row_filters.splice(j,1)" :aria-label="'移除筛选条件 ' + (rule.column || (j+1))">移除</button>
+              <button class="btn link danger" type="button" @click="t.row_filters.splice(j,1)" :aria-label="'移除筛选条件 ' + (rule.column || (j+1))">移除</button>
             </div>
             <button class="btn sm" type="button" @click="addRule(t)" :disabled="!t.columns?.some(c => !t.row_filters.some(r => r.column === (c.source_name || c.name))) || t.row_filters.length >= 20">添加字段条件</button>
           </div>
@@ -703,7 +785,7 @@ const Datasets = {
           <input class="in" v-model="pickKw" type="search" aria-label="搜索数据源中的表或视图" placeholder="搜索表名、视图名或描述">
           <label v-for="t in pickShown" :key="t.name" class="check scene-pick-item"><input type="checkbox" :checked="has(t.name)" @change="togglePick(t)">
             <span class="mono">{{t.name}}</span><span class="badge">{{OBJECT_LABEL[t.kind] || '表'}}</span><span class="muted small">{{t.comment}}</span></label>
-          <div v-if="pickError" class="msg err" role="alert">{{pickError}} <button class="link" type="button" @click="pick">重试</button></div>
+          <div v-if="pickError" class="msg err" role="alert">{{pickError}} <button class="btn link" type="button" @click="pick">重试</button></div>
           <div v-else-if="!pickShown.length" class="small muted" role="status">{{pickLoading ? '正在加载…' : pickKw ? '没有匹配的表或视图' : '数据源没有可选的表或视图'}}</div>
         </div>
       </section>
@@ -762,9 +844,9 @@ const Datasets = {
       const firstTable = form.value?.tables?.[0]?.table_name || '';
       form.value.metricDrafts.push(metricDraftFromEntry('', { table: firstTable, op: 'sum', scale: 'number' }));
     }
-    function closeForm() {
+    async function closeForm() {
       if (busy.value) return;
-      if (!formDirty.value || confirm('放弃未保存的业务场景修改？')) form.value = null;
+      if (!formDirty.value || await askConfirm({ title: '放弃修改', message: '放弃未保存的业务场景修改？', confirmText: '放弃修改', cancelText: '继续编辑', danger: true })) form.value = null;
     }
     async function save() {
       busy.value = true; saveError.value = '';
@@ -786,7 +868,10 @@ const Datasets = {
       } catch (e) { saveError.value = e.message; }
       finally { busy.value = false; }
     }
-    async function del(d) { if (!confirm(`删除数据集「${d.business_scenario}」？`)) return; await run(() => api(`/api/datasets/${d.id}`, { method: 'DELETE' }), '已删除'); load(); }
+    async function del(d) {
+      if (!await askConfirm({ title: '删除业务场景', message: `确认删除业务场景「${d.business_scenario}」？`, confirmText: '删除' })) return;
+      await run(() => api(`/api/datasets/${d.id}`, { method: 'DELETE' }), '已删除'); load();
+    }
     async function search() {
       const query = q.value.trim();
       if (!query || searching.value) return;
@@ -858,28 +943,28 @@ const Templates = {
   template: `<div>
     <template v-if="!form">
       <div class="page-head"><h1>报告模板</h1>
-        <button class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button></div>
+        <button type="button" class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button></div>
       <section class="card list-panel" aria-label="模板列表" :aria-busy="loading">
         <div class="list-tools">
           <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索模板名称、场景或用途" aria-label="搜索模板"></label>
           <span v-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 个模板</span>
         </div>
         <div v-if="loading" class="collection-state" role="status">正在加载模板…</div>
-        <div v-else-if="loadError" class="collection-state" role="alert">模板加载失败。<button class="link" @click="load">重试</button></div>
+        <div v-else-if="loadError" class="collection-state" role="alert">模板加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
         <div v-else-if="!shown.length" class="collection-state">
           <span class="empty-icon" v-html="icon(kw.trim() ? 'search' : 'tpl')"></span>
           <h2>{{kw.trim() ? '未找到匹配的模板' : '还没有报告模板'}}</h2>
           <p>{{kw.trim() ? '试试其他关键词。' : '可以新建模板，也可以在已接入的 AI 助手中提交分析需求，由助手保存模板。'}}</p>
-          <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
-          <button v-else class="btn" @click="edit()">新建模板</button>
+          <button type="button" v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
+          <button type="button" v-else class="btn" @click="edit()">新建模板</button>
         </div>
-        <div v-else class="scroll-x" tabindex="0" aria-label="模板表格"><table class="tbl report-table" role="table">
+        <div v-else class="scroll-x" tabindex="0" aria-label="模板表格"><table class="tbl record-table report-table" role="table">
           <thead><tr><th scope="col">模板名称</th><th scope="col">业务场景</th><th scope="col" v-if="admin">创建人</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead>
           <tbody><tr v-for="t in shown" :key="t.id">
             <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.business_summary || t.analysis_goal || t.user_requirement}}</div></td>
             <td data-label="业务场景">{{t.business_scenario || '—'}}</td><td v-if="admin" data-label="创建人">{{creator(t)}}</td><td data-label="更新时间"><time :datetime="t.updated_at">{{fmtTime(t.updated_at)}}</time></td>
-            <td><div class="links"><button class="link" @click="view(t)">查看</button>
-              <button v-if="canEdit(t)" class="link danger" @click="del(t)">删除</button></div></td>
+            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(t)">查看</button>
+              <button type="button" v-if="canEdit(t)" class="btn link danger" @click="del(t)">删除</button></div></td>
           </tr></tbody>
         </table></div>
       </section>
@@ -887,8 +972,8 @@ const Templates = {
     <template v-else-if="!editing">
       <div class="page-head">
         <div><h1 ref="templateHeading" tabindex="-1">{{form.name}}</h1><p>{{form.business_scenario || '未关联业务场景'}} · v{{form.version}}</p></div>
-        <div class="actions"><button class="btn ghost" @click="form=null">返回模板列表</button>
-          <button v-if="canEdit(form)" class="btn" @click="edit(form)">编辑模板</button></div>
+        <div class="actions"><button type="button" class="btn ghost" @click="form=null">返回模板列表</button>
+          <button type="button" v-if="canEdit(form)" class="btn" @click="edit(form)">编辑模板</button></div>
       </div>
       <div class="card card-pad template-brief">
         <h2>模板用途</h2>
@@ -908,8 +993,8 @@ const Templates = {
     </template>
     <template v-else>
       <div class="page-head"><h1 ref="templateHeading" tabindex="-1">{{form.id ? '编辑模板' : '新建模板'}}</h1>
-        <div class="actions"><button class="btn ghost" :disabled="busy" @click="cancelEdit">取消</button>
-          <button class="btn primary" @click="save" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
+        <div class="actions"><button type="button" class="btn ghost" :disabled="busy" @click="cancelEdit">取消</button>
+          <button type="button" class="btn primary" @click="save" :disabled="busy || !form.markdown.trim()">保存模板</button></div></div>
       <div class="card card-pad meta-bar">
         <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
         <div class="field"><label for="template-scenario">业务场景</label>
@@ -926,7 +1011,7 @@ const Templates = {
         <div class="field"><label for="business-markdown">Markdown 指南</label>
           <textarea id="business-markdown" class="in" v-model="form.markdown" rows="14" :disabled="busy"></textarea></div>
         <div v-for="v in form.versions" :key="v.version" class="hit"><span>v{{v.version}} · {{fmtTime(v.created_at)}}</span>
-          <button class="link" @click="loadVer(v.version)" :disabled="busy">载入正文</button></div>
+          <button type="button" class="btn link" @click="loadVer(v.version)" :disabled="busy">载入正文</button></div>
       </div>
     </template>
   </div>`,
@@ -990,7 +1075,10 @@ const Templates = {
         load();
       } finally { busy.value = false; }
     }
-    async function del(t) { if (!confirm(`删除模板「${t.name}」？已生成的报告会保留。`)) return; await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load(); }
+    async function del(t) {
+      if (!await askConfirm({ title: '删除报告模板', message: `确认删除模板「${t.name}」？已生成的报告会保留。`, confirmText: '删除' })) return;
+      await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load();
+    }
     async function loadVer(v) { const r = await run(() => api(`/api/templates/${form.value.id}/versions/${v}`)); form.value.markdown = r.markdown; toast(`已载入 v${v}，保存后成为新版本`); }
     const admin = computed(isAdmin);
     return { ...templates, admin, creator, shown, form, datasets, busy, kw, editing, templateHeading,
@@ -1011,24 +1099,24 @@ const ReportSharing = {
       </div>
       <div id="share-recipient-results" :aria-busy="searching">
         <p v-if="searching" class="field-help" role="status">正在查找用户…</p>
-        <p v-else-if="searchError" class="field-help" role="alert">用户列表加载失败。<button type="button" class="link" @click="search(query)">重试</button></p>
+        <p v-else-if="searchError" class="field-help" role="alert">用户列表加载失败。<button type="button" class="btn link" @click="search(query)">重试</button></p>
         <p v-else-if="!candidates.length" class="field-help" role="status">未找到可选用户。</p>
         <ul v-else class="report-recipient-results" aria-label="可选用户">
           <li v-for="person in candidates" :key="person.emp_no">
-            <button type="button" :disabled="busy" @click="choose(person)">
+            <button type="button" class="btn recipient-option" :disabled="busy" @click="choose(person)">
               <b>{{person.name || person.emp_no}}</b><span v-if="person.name" class="small muted">{{person.emp_no}}</span>
             </button>
           </li>
         </ul>
       </div>
-      <button type="button" class="link report-recipient-switch" @click="useManual">手动输入工号</button>
+      <button type="button" class="btn link report-recipient-switch" @click="useManual">手动输入工号</button>
     </div>
     <form class="report-share-form" @submit.prevent="save">
       <div v-if="manual || selectedRecipient" class="field report-recipient-field">
         <label for="share-emp-no">接收人工号</label>
         <div class="report-recipient-input">
           <input id="share-emp-no" class="in" ref="recipient" v-model.trim="empNo" maxlength="256" :disabled="busy" :readonly="!manual" required>
-          <button type="button" class="link report-recipient-switch" :disabled="busy" @click="useDirectory">{{manual ? '选择已有用户' : '更换'}}</button>
+          <button type="button" class="btn link report-recipient-switch" :disabled="busy" @click="useDirectory">{{manual ? '选择已有用户' : '更换'}}</button>
         </div>
         <p v-if="manual" class="field-help">请输入已登记并具备报告数据权限的工号。</p>
         <p v-else-if="selectedRecipient.name" class="field-help">{{selectedRecipient.name}}</p>
@@ -1044,22 +1132,22 @@ const ReportSharing = {
     <section class="report-share-people" aria-labelledby="share-people-title" :aria-busy="loading || busy">
       <h3 id="share-people-title">已分享的用户</h3>
       <p v-if="loading" class="muted" role="status">正在加载…</p>
-      <button v-else-if="loadFailed" type="button" class="link" @click="load">重试加载</button>
+      <button v-else-if="loadFailed" type="button" class="btn link" @click="load">重试加载</button>
       <p v-else-if="!shares.length" class="muted">尚未分享给其他用户。</p>
       <ul v-else>
         <li v-for="s in shares" :key="s.emp_no">
           <div><b>{{s.name ? s.name + '（' + s.emp_no + '）' : s.emp_no}}</b>
             <div class="small muted">{{s.access_level === 'edit' ? '可编辑' : '可查看'}}{{!s.registered ? ' · 待登记' : s.enabled ? '' : ' · 已停用'}}</div></div>
-          <div class="links"><button class="link" :aria-label="'修改 ' + s.emp_no + ' 的权限'" :disabled="busy || (s.registered && !s.enabled)" @click="choose(s)">修改</button>
-            <button class="link danger" :aria-label="'撤销 ' + s.emp_no + ' 的权限'" :disabled="busy" @click="revoke(s)">撤销</button></div>
+          <div class="links"><button type="button" class="btn link" :aria-label="'修改 ' + s.emp_no + ' 的权限'" :disabled="busy || (s.registered && !s.enabled)" @click="choose(s)">修改</button>
+            <button type="button" class="btn link danger" :aria-label="'撤销 ' + s.emp_no + ' 的权限'" :disabled="busy" @click="revoke(s)">撤销</button></div>
         </li>
       </ul>
     </section>
     <div v-if="url" class="field"><label for="share-url">报告链接</label>
       <input id="share-url" class="in" ref="link" :value="url" readonly @focus="$event.target.select()"></div>
     <template #foot>
-      <button class="btn" :disabled="busy" @click="$emit('close')">关闭</button>
-      <button class="btn" :disabled="!url || busy" @click="copyLink">复制链接</button>
+      <button type="button" class="btn" :disabled="busy" @click="$emit('close')">关闭</button>
+      <button type="button" class="btn" :disabled="!url || busy" @click="copyLink">复制链接</button>
     </template>
   </Drawer>`,
   setup(props) {
@@ -1137,7 +1225,7 @@ const ReportSharing = {
       finally { busy.value = false; }
     }
     async function revoke(share) {
-      if (busy.value || !confirm('撤销 ' + share.emp_no + ' 的报告权限？')) return;
+      if (busy.value || !await askConfirm({ title: '撤销报告权限', message: '确认撤销 ' + share.emp_no + ' 的报告权限？', confirmText: '撤销' })) return;
       busy.value = true;
       error.value = '';
       try {
@@ -1162,7 +1250,7 @@ const ReportEditor = {
   template: `<Drawer title="编辑报告" wide :busy="busy" @close="close">
     <p v-if="error" class="msg err" role="alert">{{error}}</p>
     <p v-if="loading" class="muted" role="status">正在加载报告…</p>
-    <button v-else-if="!form" class="link" @click="load">重试加载</button>
+    <button type="button" v-else-if="!form" class="btn link" @click="load">重试加载</button>
     <form v-else id="report-edit-form" @submit.prevent="save">
       <p class="form-intro">基于版本 {{form.base_version}} 编辑。保存后生成新版本。</p>
       <div class="field"><label for="report-edit-name">报告名称</label>
@@ -1170,10 +1258,10 @@ const ReportEditor = {
       <div class="field"><label for="report-edit-note">修改说明 <small>选填</small></label>
         <input id="report-edit-note" class="in" v-model.trim="form.change_note" maxlength="500" :disabled="busy"></div>
       <p class="field-help">正文修订可通过已接入的 AI 助手完成。</p>
-      <a :href="preview" target="_blank" rel="noopener">打开基准版本</a>
+      <a class="btn link" :href="preview" target="_blank" rel="noopener">打开基准版本</a>
     </form>
     <template #foot>
-      <button class="btn" :disabled="busy" @click="close">取消</button>
+      <button type="button" class="btn" :disabled="busy" @click="close">取消</button>
       <button type="submit" class="btn primary" form="report-edit-form" :disabled="busy || !form || !dirty">{{busy ? '保存中…' : '保存为新版本'}}</button>
     </template>
   </Drawer>`,
@@ -1196,8 +1284,9 @@ const ReportEditor = {
       finally { loading.value = false; }
     }
     onMounted(load);
-    function close() {
-      if (!dirty.value || confirm('放弃未保存的报告修改？')) emit('close');
+    async function close() {
+      if (busy.value) return;
+      if (!dirty.value || await askConfirm({ title: '放弃修改', message: '放弃未保存的报告修改？', confirmText: '放弃修改', cancelText: '继续编辑', danger: true })) emit('close');
     }
     async function save() {
       if (!dirty.value || busy.value) return;
@@ -1220,7 +1309,7 @@ const ReportVersions = {
     <p class="report-dialog-name">{{report.name}}</p>
     <p v-if="error" class="msg err" role="alert">{{error}}</p>
     <p v-if="loading" class="muted" role="status">正在加载版本…</p>
-    <button v-else-if="!history" type="button" class="link" @click="load">重试加载</button>
+    <button v-else-if="!history" type="button" class="btn link" @click="load">重试加载</button>
     <template v-else>
       <p class="form-intro">切换后，查看和编辑默认使用所选版本。</p>
       <ul class="report-versions-list" aria-label="版本历史">
@@ -1234,7 +1323,7 @@ const ReportVersions = {
             <div v-if="v.name !== report.name || v.change_note" class="report-version-note">
               <span v-if="v.name !== report.name">{{v.name}}</span><span v-if="v.name !== report.name && v.change_note"> · </span>{{v.change_note}}</div>
           </div>
-          <button v-if="v.version !== history.current_version || v.version !== report.revision" type="button" class="link"
+          <button v-if="v.version !== history.current_version || v.version !== report.revision" type="button" class="btn link"
             :aria-label="'切换到版本 ' + v.version" :disabled="busy" @click="select(v.version)">切换</button>
         </li>
       </ul>
@@ -1336,7 +1425,7 @@ const Reports = {
   template: `<div>
     <div class="page-head"><div><h1>报告库</h1><p>{{admin ? '查看所有用户已生成的报告。' : '查看自己生成的报告和他人分享给你的报告。'}}</p></div>
       <div class="actions">
-        <button type="button" class="btn" ref="mergeButton" :disabled="!selecting && (loading || !!loadError || list.length < 2)"
+        <button type="button" class="btn" :class="{'is-active': selecting}" :aria-pressed="selecting" ref="mergeButton" :disabled="!selecting && (loading || !!loadError || list.length < 2)"
           @click="toggleMerge">{{selecting ? '取消选择' : '合并报告'}}</button>
       </div></div>
     <section class="card list-panel" aria-label="报告列表" :aria-busy="loading">
@@ -1349,15 +1438,15 @@ const Reports = {
         <span v-else-if="!loading && !loadError" class="list-count" aria-live="polite">{{shown.length}} 份报告</span>
       </div>
       <div v-if="loading" class="collection-state" role="status">正在加载报告…</div>
-      <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button class="link" @click="load">重试</button></div>
+      <div v-else-if="loadError" class="collection-state" role="alert">报告加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
       <div v-else-if="!shown.length" class="collection-state">
         <span class="empty-icon" v-html="icon(kw.trim() ? 'search' : 'rep')"></span>
         <h2>{{kw.trim() ? '未找到匹配的报告' : '还没有报告'}}</h2>
         <p>{{kw.trim() ? '可以修改关键词，或查看全部报告。' : '在已接入的 AI 助手中提交分析需求即可生成报告。'}}</p>
-        <button v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
+        <button type="button" v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
         <a v-else class="btn" href="#templates">查看报告模板</a>
       </div>
-      <div v-else class="scroll-x" tabindex="0" aria-label="报告表格"><table class="tbl report-table" role="table">
+      <div v-else class="scroll-x" tabindex="0" aria-label="报告表格"><table class="tbl record-table report-table" role="table">
         <thead><tr><th scope="col">报告名称</th><th scope="col">版本</th><th scope="col">来源模板</th><th scope="col" v-if="admin">创建人</th><th scope="col">版本时间</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="r in shown" :key="r.id" :class="{'report-picked': selecting && pickedIds.has(r.id)}">
           <td><div class="report-record">
@@ -1366,15 +1455,15 @@ const Reports = {
             <div><a class="record-name" :href="reportVersionPath(r)" target="_blank" rel="noopener">{{r.name}}</a>
             <div v-if="r.access_level !== 'manage'" class="small muted">{{creator(r)}}分享 · {{r.access_level === 'edit' ? '可编辑' : '可查看'}}</div>
             <div class="small muted">{{fmtSize(r.size)}}<span v-if="r.meta?.queries"> · 查询结果 {{queryRows(r)}} 行</span></div>
-            <details v-if="r.meta?.warnings?.length" class="small report-warnings"><summary>{{r.meta.warnings.length}} 条生成提示</summary>
+            <details v-if="r.meta?.warnings?.length" class="small report-warnings"><summary class="btn disclosure">{{r.meta.warnings.length}} 条生成提示</summary>
               <ul><li v-for="(w,i) in r.meta.warnings" :key="i">{{w}}</li></ul></details></div></div></td>
           <td><button type="button" class="btn report-version-button" :aria-label="r.name + '，当前版本 ' + r.revision + '，切换版本'" @click="versions=r">版本 {{r.revision}}</button></td>
           <td data-label="来源模板">{{r.template_name || '—'}} <span class="badge" v-if="r.template_version">v{{r.template_version}}</span></td>
           <td v-if="admin" data-label="创建人">{{creator(r)}}</td><td data-label="版本时间"><time :datetime="r.version_created_at">{{fmtTime(r.version_created_at)}}</time></td>
-          <td><div class="links"><a :href="reportVersionPath(r)" target="_blank" rel="noopener">查看</a><a :href="reportVersionPath(r, '/download')">下载 HTML</a>
-            <button v-if="r.access_level !== 'view'" class="link" @click="editing=r">编辑</button>
-            <button v-if="r.access_level === 'manage'" class="link" @click="sharing=r">分享</button>
-            <button v-if="r.access_level === 'manage'" class="link danger" @click="del(r)">删除</button></div></td>
+          <td class="record-actions"><div class="links"><a class="btn link" :href="reportVersionPath(r)" target="_blank" rel="noopener">查看</a><a class="btn link" :href="reportVersionPath(r, '/download')">下载 HTML</a>
+            <button type="button" v-if="r.access_level !== 'view'" class="btn link" @click="editing=r">编辑</button>
+            <button type="button" v-if="r.access_level === 'manage'" class="btn link" @click="sharing=r">分享</button>
+            <button type="button" v-if="r.access_level === 'manage'" class="btn link danger" @click="del(r)">删除</button></div></td>
         </tr></tbody>
       </table></div>
     </section>
@@ -1392,7 +1481,7 @@ const Reports = {
     const queryRows = r => Object.values(r.meta.queries).reduce((total, q) => total + (q.rows || 0), 0);
     watch(reportRevision, reports.load);
     async function del(r) {
-      if (!confirm('删除报告「' + r.name + '」及其所有版本？')) return;
+      if (!await askConfirm({ title: '删除报告', message: '确认删除报告「' + r.name + '」及其所有版本？', confirmText: '删除' })) return;
       await run(() => api('/api/reports/' + r.id, { method: 'DELETE' }), '已删除');
       reports.load();
     }
@@ -1423,10 +1512,10 @@ const Reports = {
 };
 
 const ReportViewer = {
-  components: { ReportEditor, ReportVersions }, props: ['reportId', 'initialVersion'],
+  components: { ReportEditor, ReportVersions, ConfirmDialog }, props: ['reportId', 'initialVersion'],
   template: `<main class="report-viewer" :aria-busy="loading">
     <header class="report-viewer-bar">
-      <div class="report-viewer-heading"><a class="link" :href="appPath('/#reports')">报告库</a><h1>{{report?.name || '报告'}}</h1></div>
+      <div class="report-viewer-heading"><a class="btn link" :href="appPath('/#reports')">报告库</a><h1>{{report?.name || '报告'}}</h1></div>
       <div v-if="report" class="links">
         <button type="button" class="btn report-version-button" :aria-label="'当前版本 ' + report.revision + '，切换版本'" @click="versions=true">版本 {{report.revision}}</button>
         <a class="btn" :href="reportVersionPath(report, '/download')">下载 HTML</a>
@@ -1434,13 +1523,14 @@ const ReportViewer = {
       </div>
     </header>
     <p v-if="loading" class="collection-state" role="status">正在加载报告…</p>
-    <div v-else-if="error" class="collection-state" role="alert">{{error}} <button class="link" @click="load">重试</button></div>
+    <div v-else-if="error" class="collection-state" role="alert">{{error}} <button type="button" class="btn link" @click="load">重试</button></div>
     <iframe v-else-if="report" :key="report.revision" class="report-viewer-frame" :title="report.name + ' · 版本 ' + report.revision"
       :src="reportVersionPath(report, '/content')" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
     <ReportVersions v-if="versions" :report="report" @close="versions=false" @selected="selected"/>
     <ReportEditor v-if="editing" :report="report" @close="editing=false" @saved="saved"/>
   </main>
-  <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>`,
+  <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>
+  <ConfirmDialog/>`,
   setup(props) {
     const path = '/api/reports/' + props.reportId;
     const report = ref(null), loading = ref(true), error = ref(''), versions = ref(false), editing = ref(false);
@@ -1496,29 +1586,34 @@ function showVal(t, v) {
 const TokenControl = {
   props: ['t', 'value', 'readonly'], emits: ['set'],
   template: `<div class="tok-ctl">
-    <template v-if="t.type==='color'"><input type="color" :value="hex(value)" :disabled="readonly" @input="$emit('set', $event.target.value.toUpperCase())">
-      <input class="in mono sm" :value="value" :disabled="readonly" @change="onText($event.target.value)"></template>
+    <template v-if="t.type==='color'"><input type="color" :aria-label="t.label" :value="hex(value)" :disabled="readonly" @input="$emit('set', $event.target.value.toUpperCase())">
+      <input class="in mono sm" :aria-label="t.label + '（十六进制）'" :value="value" :disabled="readonly" @change="onText($event.target.value)"></template>
     <template v-else-if="t.type==='color_auto'">
       <label class="check small"><input type="checkbox" :checked="!value" :disabled="readonly" @change="$emit('set', $event.target.checked ? '' : '#2168F3')"> 自动</label>
-      <template v-if="value"><input type="color" :value="hex(value)" :disabled="readonly" @input="$emit('set', $event.target.value.toUpperCase())">
-        <input class="in mono sm" :value="value" :disabled="readonly" @change="onText($event.target.value)"></template>
+      <template v-if="value"><input type="color" :aria-label="t.label" :value="hex(value)" :disabled="readonly" @input="$emit('set', $event.target.value.toUpperCase())">
+        <input class="in mono sm" :aria-label="t.label + '（十六进制）'" :value="value" :disabled="readonly" @change="onText($event.target.value)"></template>
       <span v-else class="muted small">{{t.desc}}</span></template>
-    <template v-else-if="t.type==='number'"><input class="in sm" type="number" :step="t.step || 0.1" :min="t.min" :max="t.max" :value="value" :disabled="readonly" @change="$emit('set', +$event.target.value)"><span class="muted small">{{t.min}} ~ {{t.max}}</span></template>
-    <template v-else-if="t.type==='percent'"><input type="range" min="0" max="40" :value="value" :disabled="readonly" @input="$emit('set', +$event.target.value)"><span class="small mono">{{value}}%</span></template>
-    <template v-else-if="t.type==='palette'"><div class="pal">
-      <span v-for="(c,i) in value" class="pal-chip"><input type="color" :value="hex(c)" :disabled="readonly" @input="setPal(i,$event.target.value.toUpperCase())">
-        <button v-if="!readonly && value.length>2" class="pal-x" title="移除" @click="delPal(i)">×</button></span>
-      <button v-if="!readonly && value.length<12" class="pal-add" title="添加颜色" @click="addPal">+</button></div></template>
+    <template v-else-if="t.type==='number'"><input class="in sm" :aria-label="t.label" type="number" :step="t.step || 0.1" :min="t.min" :max="t.max" :value="value" :disabled="readonly" @change="$emit('set', +$event.target.value)"><span class="muted small">{{t.min}} ~ {{t.max}}</span></template>
+    <template v-else-if="t.type==='percent'"><input type="range" :aria-label="t.label" min="0" max="40" :value="value" :disabled="readonly" @input="$emit('set', +$event.target.value)"><span class="small mono">{{value}}%</span></template>
+    <template v-else-if="t.type==='palette'">
+      <div class="palette-editor">
+        <div class="pal">
+          <span v-for="(c,i) in value" class="pal-chip"><input type="color" :aria-label="t.label + ' · 颜色 ' + (i + 1)" :value="hex(c)" :disabled="readonly" @input="setPal(i,$event.target.value.toUpperCase())">
+            <button type="button" v-if="!readonly && value.length>2" class="btn x danger" :aria-label="'移除颜色 ' + (i + 1)" @click="delPal(i)" v-html="icon('close')"></button></span>
+        </div>
+        <button type="button" v-if="!readonly && value.length<12" class="btn sm" @click="addPal"><span class="ico" v-html="icon('plus')"></span>添加颜色</button>
+      </div>
+    </template>
     <template v-else-if="t.type==='font'">
-      <select class="in sm" :value="value.size" :disabled="readonly" @change="$emit('set', {size:+$event.target.value, weight:value.weight})"><option v-for="n in sizes" :value="n">{{n}}px</option></select>
-      <select class="in sm" :value="value.weight" :disabled="readonly" @change="$emit('set', {size:value.size, weight:+$event.target.value})"><option v-for="w in weights" :value="w[0]">{{w[1]}}</option></select>
+      <select class="in sm" :aria-label="t.label + ' · 字号'" :value="value.size" :disabled="readonly" @change="$emit('set', {size:+$event.target.value, weight:value.weight})"><option v-for="n in sizes" :value="n">{{n}}px</option></select>
+      <select class="in sm" :aria-label="t.label + ' · 字重'" :value="value.weight" :disabled="readonly" @change="$emit('set', {size:value.size, weight:+$event.target.value})"><option v-for="w in weights" :value="w[0]">{{w[1]}}</option></select>
       <span class="font-sample" :style="{fontSize:value.size+'px', fontWeight:value.weight}">{{t.sample}}</span></template>
-    <template v-else-if="t.type==='px'"><input class="in sm" type="number" min="0" :value="value" :disabled="readonly" @change="$emit('set', +$event.target.value)"><span class="muted small">px</span>
+    <template v-else-if="t.type==='px'"><input class="in sm" :aria-label="t.label" type="number" min="0" :value="value" :disabled="readonly" @change="$emit('set', +$event.target.value)"><span class="muted small">px</span>
       <i class="px-bar" :style="{width: Math.min(160, value) + 'px'}" v-if="value < 999"></i><span class="muted small" v-else>全圆</span></template>
-    <template v-else-if="t.type==='choice'"><div class="seg"><button v-for="o in t.options" :class="{on:value===o.value}" :disabled="readonly" @click="$emit('set', o.value)">{{o.label}}</button></div></template>
+    <template v-else-if="t.type==='choice'"><div class="seg" role="group" :aria-label="t.label"><button v-for="o in t.options" type="button" class="btn toggle" :aria-pressed="value===o.value" :disabled="readonly" @click="$emit('set', o.value)">{{o.label}}</button></div></template>
     <template v-else-if="t.type==='bool'"><label class="check"><input type="checkbox" :checked="value" :disabled="readonly" @change="$emit('set', $event.target.checked)"> 显示</label></template>
-    <template v-else-if="t.type==='code'"><textarea class="in code" rows="3" :value="value" :disabled="readonly" @change="$emit('set', $event.target.value)"></textarea></template>
-    <template v-else><input class="in sm" :value="value" :disabled="readonly" @change="$emit('set', $event.target.value)" style="flex:1"></template>
+    <template v-else-if="t.type==='code'"><textarea class="in code" :aria-label="t.label" rows="3" :value="value" :disabled="readonly" @change="$emit('set', $event.target.value)"></textarea></template>
+    <template v-else><input class="in sm" :aria-label="t.label" :value="value" :disabled="readonly" @change="$emit('set', $event.target.value)" style="flex:1"></template>
   </div>`,
   setup(props, { emit }) {
     const sizes = [12, 13, 14, 15, 16, 18, 20, 22, 24, 26, 28, 32, 36, 40, 44, 48, 56, 64, 72];
@@ -1528,27 +1623,34 @@ const TokenControl = {
     function setPal(i, c) { const a = props.value.slice(); a[i] = c; emit('set', a); }
     function delPal(i) { const a = props.value.slice(); a.splice(i, 1); emit('set', a); }
     function addPal() { emit('set', props.value.concat([props.value[props.value.length - 1] || '#2168F3'])); }
-    return { sizes, weights, hex, onText, setPal, delPal, addPal };
+    return { sizes, weights, hex, onText, setPal, delPal, addPal, icon };
   }
 };
 const TokenGroups = {
   components: { TokenControl },
   props: ['meta', 'effective', 'sources', 'own', 'readonly', 'showAdvanced'], emits: ['set', 'reset'],
   template: `<div>
-    <div class="type-nav" role="tablist" aria-label="样式类型">
-      <button v-for="g in groups" type="button" role="tab" :aria-selected="cur===g.key" :class="{on: cur===g.key}" @click="cur=g.key">{{g.label}}<b v-if="ownCount(g)">{{ownCount(g)}}</b></button>
+    <div class="type-nav" role="group" aria-label="样式类型">
+      <button v-for="g in groups" :key="g.key" type="button" class="btn toggle" :aria-pressed="cur===g.key"
+        :aria-label="ownCount(g) ? g.label + '，已调整 ' + ownCount(g) + ' 项' : g.label" @click="cur=g.key">{{g.label}}<b v-if="ownCount(g)" aria-hidden="true">{{ownCount(g)}}</b></button>
     </div>
-    <div v-for="g in groups" v-show="cur===g.key" class="tok-group" role="tabpanel">
+    <div v-for="g in groups" :key="g.key" v-show="cur===g.key" class="tok-group">
       <div class="tok-group-head"><b>{{g.label}}</b><span class="muted small">{{g.desc}}</span>
         <span class="spacer"></span><span class="badge blue" v-if="ownCount(g)">本规则调整 {{ownCount(g)}} 项</span></div>
       <div v-for="t in g.tokens" class="tok-row" :class="{own: own && t.key in own}">
         <div class="tok-label"><b>{{t.label}} <span v-if="t.builtin" class="badge tiny">内置</span></b><span v-if="t.desc && t.type!=='color_auto'">{{t.desc}}</span></div>
         <TokenControl v-if="effective[t.key] !== undefined && effective[t.key] !== null" :t="t" :value="effective[t.key]" :readonly="readonly" @set="v => $emit('set', t.key, v)"/>
-        <div v-else class="tok-ctl tok-unset"><span class="muted small">未设置 · 由智能体在生成报告时决定</span>
-          <button v-if="!readonly" type="button" class="btn sm" @click="$emit('set', t.key, initial(t))">设置此项</button></div>
-        <div class="tok-src">
-          <template v-if="own && t.key in own"><span class="badge blue">本规则设置</span><button v-if="!readonly" class="link small" @click="$emit('reset', t.key)">{{t.builtin || inheritedSet(t.key) ? '恢复继承' : '取消设置'}}</button></template>
-          <span v-else class="src" :class="sources[t.key] && sources[t.key].level">{{srcText(t.key)}}</span>
+        <div v-else class="tok-ctl"><span class="muted small">未设置 · 由智能体在生成报告时决定</span></div>
+        <!-- 设置与恢复使用同一列，状态文字和可点击操作保持清楚的间隔。 -->
+        <div v-if="own && t.key in own" class="tok-src">
+          <span class="tok-own-label">本规则设置</span>
+          <button type="button" v-if="!readonly" class="btn link" @click="$emit('reset', t.key)">{{t.builtin || inheritedSet(t.key) ? '恢复继承' : '取消设置'}}</button>
+        </div>
+        <div v-else-if="effective[t.key] !== undefined && effective[t.key] !== null" class="tok-src">
+          <span class="src" :class="sources[t.key] && sources[t.key].level">{{srcText(t.key)}}</span>
+        </div>
+        <div v-else-if="!readonly" class="tok-src">
+          <button type="button" class="btn link" @click="$emit('set', t.key, initial(t))">设置此项</button>
         </div>
       </div>
     </div>
@@ -1556,7 +1658,9 @@ const TokenGroups = {
   setup(props) {
     // 按报告页面的组成部分分类；“高级”只在勾选显示高级选项时出现
     const groups = computed(() => props.meta.groups.filter(g => props.showAdvanced || g.key !== 'advanced'));
-    const cur = ref(props.meta.groups[0].key);
+    const cur = ref(groups.value[0]?.key);
+    // 关闭高级选项时回到首个可见类别，避免编辑区留在已隐藏的选项卡。
+    watch(groups, visible => { if (!visible.some(g => g.key === cur.value)) cur.value = visible[0]?.key; });
     const ownCount = g => props.own ? g.tokens.filter(t => t.key in props.own).length : 0;
     const srcText = k => {
       const s = props.sources && props.sources[k];
@@ -1580,15 +1684,15 @@ const Styles = {
   template: `<div>
     <template v-if="!form && viewSc === null">
       <div class="page-head"><div><h1>报告样式</h1><p>设置报告外观、状态标记和数字格式，并预览效果。</p></div>
-        <div class="actions"><button class="btn primary" :disabled="!meta || (!admin && !scenarios.length)" @click="edit()">{{admin ? '新建样式' : '新建我的场景样式'}}</button></div></div>
+        <div class="actions"><button type="button" class="btn primary" :disabled="!meta || (!admin && !scenarios.length)" @click="edit()">{{admin ? '新建样式' : '新建我的场景样式'}}</button></div></div>
       <section class="card card-pad style-overview" aria-labelledby="style-preview-title">
         <div><h2 id="style-preview-title">预览当前样式</h2>
           <p>同一项设置优先采用个人场景样式，其次是通用样式和系统默认。</p></div>
         <div class="style-preview-actions"><label class="field"><span>预览范围</span>
           <select class="in" v-model="viewChoice"><option value="">通用样式</option><option v-for="sc in scenarios" :key="sc" :value="sc">{{sc}}</option></select></label>
-          <button class="btn" :disabled="!meta" @click="openView(viewChoice)">查看生效效果</button></div>
+          <button type="button" class="btn" :disabled="!meta" @click="openView(viewChoice)">查看生效效果</button></div>
       </section>
-      <div class="msg err" v-if="styleError" role="alert">{{styleError}} <button class="link" @click="loadStyles">重试</button></div>
+      <div class="msg err" v-if="styleError" role="alert">{{styleError}} <button type="button" class="btn link" @click="loadStyles">重试</button></div>
       <div class="collection-state" v-else-if="styleLoading" role="status">正在加载报告样式…</div>
       <div v-else>
       <div v-for="grp in grouped" :key="grp.title" class="style-section">
@@ -1605,8 +1709,8 @@ const Styles = {
               <li v-if="r.retiredItems.length" class="muted small">{{r.retiredItems.length}} 条旧分析要求已停用</li></ul>
             <div class="rule-foot"><div class="swatches"><span v-for="c in colors(r.theme)" class="swatch" :style="{background:c}"></span></div>
               <span class="small muted">{{typeSummary(r.theme)}}</span>
-              <span class="spacer"></span><template v-if="canEdit(r)"><button class="link" @click="edit(r)">编辑</button><button class="link danger" @click="del(r)">删除</button></template>
-              <button v-else class="link" @click="edit(r, true)">查看</button></div>
+              <span class="spacer"></span><template v-if="canEdit(r)"><button type="button" class="btn link" @click="edit(r)">编辑</button><button type="button" class="btn link danger" @click="del(r)">删除</button></template>
+              <button type="button" v-else class="btn link" @click="edit(r, true)">查看</button></div>
           </div>
           <div v-if="!grp.rules.length" class="empty card">{{grp.empty}}</div>
         </div>
@@ -1615,8 +1719,8 @@ const Styles = {
 
     <template v-else-if="viewSc !== null && !form">
       <div class="page-head"><div><h1>最终效果 · {{viewSc || '通用'}}</h1><p>查看此范围内实际采用的设置及其来源。</p></div>
-        <div class="actions"><button class="btn ghost" @click="closeView">返回样式列表</button></div></div>
-      <div v-if="viewError" class="msg err" role="alert">{{viewError}} <button class="link" @click="openView(viewSc)">重试</button></div>
+        <div class="actions"><button type="button" class="btn ghost" @click="closeView">返回样式列表</button></div></div>
+      <div v-if="viewError" class="msg err" role="alert">{{viewError}} <button type="button" class="btn link" @click="openView(viewSc)">重试</button></div>
       <div v-else-if="viewLoading" class="collection-state" role="status">正在加载生效样式…</div>
       <div v-else class="style-editor"><div class="pane-left">
         <div class="card card-pad"><h3>展示要求（合并后）</h3>
@@ -1631,23 +1735,23 @@ const Styles = {
     <template v-else-if="form">
       <div class="page-head"><div><h1>{{form.readonly ? '查看样式规则' : form.id ? '编辑样式规则' : '新建样式规则'}}</h1>
           <p>{{form.readonly ? '通用规则由管理员配置，你可以查看；如需个人调整，请新建“我的场景样式”' : '先确定适用范围，再填写展示要求或调整视觉样式。'}}</p></div>
-        <div class="actions"><button class="btn ghost" :disabled="saving" @click="close">返回样式列表</button>
-          <button class="btn style-preview-jump" @click="jumpToPreview">查看示例预览</button>
-          <button v-if="!form.readonly" class="btn primary" :disabled="saving" @click="save">{{saving ? '正在保存…' : '保存样式'}}</button></div></div>
+        <div class="actions"><button type="button" class="btn ghost" :disabled="saving" @click="close">返回样式列表</button>
+          <button type="button" class="btn style-preview-jump" @click="jumpToPreview">查看示例预览</button>
+          <button type="button" v-if="!form.readonly" class="btn primary" :disabled="saving" @click="save">{{saving ? '正在保存…' : '保存样式'}}</button></div></div>
       <fieldset class="plain-fs" :disabled="form.readonly">
       <div class="card card-pad meta-row">
         <div class="field"><label for="style-name">样式名称</label><input id="style-name" class="in" v-model="form.name" placeholder="如：零售销售报告风格"></div>
-        <div class="field" v-if="admin"><label>适用范围</label><div class="seg"><button :class="{on:form.scope==='general'}" @click="form.scope='general'">通用规则（所有报告）</button><button :class="{on:form.scope==='scenario'}" :disabled="!personalStyle" @click="form.scope='scenario'">个人场景样式</button></div></div>
-        <div class="field" v-else><label>适用范围</label><div class="small" style="line-height:34px">{{form.scope==='general' ? '通用规则（管理员配置）' : '我的业务场景样式（只对我的报告生效）'}}</div></div>
+        <div class="field" v-if="admin"><label>适用范围</label><div class="seg" role="group" aria-label="适用范围"><button type="button" class="btn toggle" :aria-pressed="form.scope==='general'" @click="form.scope='general'">通用规则（所有报告）</button><button type="button" class="btn toggle" :aria-pressed="form.scope==='scenario'" :disabled="!personalStyle" @click="form.scope='scenario'">个人场景样式</button></div></div>
+        <div class="field" v-else><label>适用范围</label><div class="small" style="line-height:40px">{{form.scope==='general' ? '通用规则（管理员配置）' : '我的业务场景样式（只对我的报告生效）'}}</div></div>
         <div class="field" v-if="form.scope==='scenario'"><label for="style-scenario">业务场景</label><select id="style-scenario" class="in" v-model="form.business_scenario"><option value="" disabled>选择场景</option><option v-if="form.business_scenario && !scenarios.includes(form.business_scenario)" :value="form.business_scenario">{{form.business_scenario}}</option><option v-for="s in scenarios" :value="s">{{s}}</option></select></div>
         <div class="field" v-else><label for="preview-scenario">预览场景</label><select id="preview-scenario" class="in" v-model="previewSc"><option value="">不区分场景</option><option v-for="s in scenarios" :value="s">{{s}}</option></select></div>
-        <div class="field"><label>状态</label><label class="check" style="height:34px"><input type="checkbox" v-model="form.enabled"> 启用</label></div>
+        <div class="field"><label>状态</label><label class="check" style="height:40px"><input type="checkbox" v-model="form.enabled"> 启用</label></div>
       </div>
       </fieldset>
       <div class="msg err" v-if="saveError" role="alert">{{saveError}}</div>
       <div class="style-editor">
         <div class="pane-left">
-          <div class="subtabs"><button :class="{on:tab==='items'}" @click="tab='items'">展示要求（{{form.items.length}}）</button><button :class="{on:tab==='theme'}" @click="tab='theme'">视觉样式（调整 {{Object.keys(form.theme).length}} 项）</button></div>
+          <div class="subtabs style-mode" role="group" aria-label="样式编辑类别"><button type="button" class="btn toggle" :aria-pressed="tab==='items'" @click="tab='items'">展示要求（{{form.items.length}}）</button><button type="button" class="btn toggle" :aria-pressed="tab==='theme'" @click="tab='theme'">视觉样式（调整 {{Object.keys(form.theme).length}} 项）</button></div>
           <fieldset class="plain-fs" :disabled="form.readonly" v-show="tab==='items'">
             <p class="small muted" style="margin:0 0 10px">章节安排、选图建议和筛选条件可写在「业务场景」的分析思路中。</p>
             <div v-for="c in meta.categories" class="cat-block">
@@ -1655,18 +1759,20 @@ const Styles = {
               <div v-for="(it,i) in form.items" v-show="it.category===c.key" class="item-row">
                 <textarea class="in" rows="1" v-model="it.text" @input="grow($event)" :aria-label="c.label + '要求'" :placeholder="'写一条' + c.label + '要求'"></textarea>
                 <select class="in sm" v-model="it.category" aria-label="要求类别"><option v-for="cc in meta.categories" :value="cc.key">{{cc.label}}</option></select>
-                <button class="link danger" @click="form.items.splice(i,1)">删除</button></div>
-              <div class="cat-actions" v-if="!form.readonly"><button class="btn sm" @click="add(c.key)">+ 添加</button>
-                <button v-for="ex in c.examples" class="ex-chip" @click="add(c.key, ex)" :title="ex">示例：{{ex}}</button></div>
+                <button type="button" class="btn link danger" @click="form.items.splice(i,1)">删除</button></div>
+              <div class="cat-actions" v-if="!form.readonly"><button type="button" class="btn sm" @click="add(c.key)">+ 添加</button>
+                <button type="button" v-for="ex in c.examples" class="btn ex-chip" @click="add(c.key, ex)" :title="ex">示例：{{ex}}</button></div>
             </div>
           </fieldset>
           <details v-if="form.retiredItems.length" v-show="tab==='items'" class="card card-pad">
-            <summary>已停用的分析要求（{{form.retiredItems.length}}）</summary>
+            <summary class="btn disclosure">已停用的分析要求（{{form.retiredItems.length}}）</summary>
             <ul class="rule-items"><li v-for="(it, i) in form.retiredItems" :key="i"><span class="cat">{{meta.retired_analysis_categories[it.category]}}</span>{{it.text}}</li></ul>
           </details>
           <div v-show="tab==='theme'">
-            <p class="small muted" style="margin:0 0 10px">调整需要覆盖的样式项。其余设置沿用{{form.scope==='scenario' ? '通用规则或内置经营报告样式' : '内置经营报告样式'}}。</p>
-            <label class="check small" style="margin-bottom:8px"><input type="checkbox" v-model="advanced"> 显示高级选项</label>
+            <div class="style-theme-intro">
+              <p class="small muted">调整需要覆盖的样式项。其余设置沿用{{form.scope==='scenario' ? '通用规则或内置经营报告样式' : '内置经营报告样式'}}。</p>
+              <label class="check small"><input type="checkbox" v-model="advanced"> 显示高级选项</label>
+            </div>
             <TokenGroups v-if="inherited" :meta="meta" :effective="effective" :sources="inherited.sources" :own="form.theme" :readonly="form.readonly" :show-advanced="advanced" @set="setTok" @reset="resetTok"/>
           </div>
         </div>
@@ -1675,7 +1781,7 @@ const Styles = {
     </template>
     <!-- 只读展示服务端的跨场景规则，展示默认值按样式优先级应用。 -->
     <details v-if="meta && meta.reporting_rules" class="card card-pad" style="margin-top:16px">
-      <summary>内置报告规则（{{meta.reporting_rules.length}} 条）</summary>
+      <summary class="btn disclosure">内置报告规则（{{meta.reporting_rules.length}} 条）</summary>
       <p class="small muted">事实与交付要求适用于所有报告。展示默认值按用户要求、业务场景规则和通用规则的优先级应用。</p>
       <ul class="rule-items"><li v-for="rule in meta.reporting_rules" :key="rule.id"><span class="cat">{{rule.label}}</span>{{rule.text}}</li></ul>
     </details>
@@ -1803,7 +1909,7 @@ const Styles = {
       finally { saving.value = false; }
     }
     async function del(r) {
-      if (!confirm('删除样式「' + r.name + '」？')) return;
+      if (!await askConfirm({ title: '删除样式规则', message: '确认删除样式「' + r.name + '」？', confirmText: '删除' })) return;
       await run(() => api('/api/style-rules/' + r.id, { method: 'DELETE' }), '已删除');
       loadStyles();
     }
@@ -1842,50 +1948,54 @@ const Perms = {
   components: { Drawer },
   template: `<div>
     <div class="page-head"><div><h1>员工与授权</h1><p>管理普通用户和管理员，为员工或数据角色授权，并查询有效权限。</p></div></div>
-    <div class="subtabs"><button v-for="t in tabs" :class="{on:tab===t[0]}" @click="tab=t[0]">{{t[1]}}</button></div>
+    <div class="subtabs" role="group" aria-label="员工与授权功能"><button v-for="t in tabs" :key="t[0]" type="button" class="btn toggle" :aria-pressed="tab===t[0]" @click="tab=t[0]">{{t[1]}}</button></div>
+    <div v-if="loading" class="card collection-state" role="status">正在加载员工和授权…</div>
+    <div v-else-if="loadError" class="card collection-state" role="alert">员工和授权加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
+    <template v-else>
 
     <template v-if="tab==='emp'">
-      <div class="actions" style="margin-bottom:12px"><button class="btn primary" @click="editEmp()">新增员工</button></div>
-      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>工号</th><th>姓名</th><th>部门</th><th>数据授权角色</th><th>系统身份</th><th>注册来源</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody><tr v-for="e in emps"><td class="mono">{{e.emp_no}}</td><td>{{e.name}}</td><td>{{e.department}}</td>
-          <td><span v-for="r in e.roles" class="badge" style="margin-right:4px">{{r}}</span><span v-if="e.direct_grants" class="small muted">+{{e.direct_grants}} 项直授</span></td>
-          <td><span class="badge" :class="e.is_admin?'red':''">{{e.is_admin?'管理员（全部数据）':'普通用户'}}</span></td>
-          <td class="small">{{({manual:'管理员登记', iam_login:'IAM 登录', mcp:'IAM 接入'})[e.registered_via] || e.registered_via}}</td>
-          <td><span class="dot" :class="{on:e.enabled}"></span>{{e.enabled?'启用':'停用'}}</td>
-          <td><div class="links"><button class="link" @click="checkEmp(e.emp_no)">查看权限</button>
-            <button class="link" @click="editEmp(e)">编辑</button><button class="link danger" @click="delEmp(e)">删除</button></div></td></tr>
+      <div class="actions" style="margin-bottom:12px"><button type="button" class="btn primary" @click="editEmp()">新增员工</button></div>
+      <div class="card scroll-x" tabindex="0" aria-label="员工表格"><table class="tbl record-table" role="table"><thead><tr><th scope="col">工号</th><th scope="col">姓名</th><th scope="col">部门</th><th scope="col">数据授权角色</th><th scope="col">系统身份</th><th scope="col">注册来源</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+        <tbody><tr v-for="e in emps"><td class="mono">{{e.emp_no}}</td><td data-label="姓名">{{e.name}}</td><td data-label="部门">{{e.department}}</td>
+          <td class="record-wide" data-label="数据授权角色"><span v-for="r in e.roles" class="badge" style="margin-right:4px">{{r}}</span><span v-if="e.direct_grants" class="small muted">+{{e.direct_grants}} 项直授</span></td>
+          <td data-label="系统身份"><span class="badge" :class="e.is_admin?'red':''">{{e.is_admin?'管理员（全部数据）':'普通用户'}}</span></td>
+          <td class="small" data-label="注册来源">{{({manual:'管理员登记', iam_login:'IAM 登录', mcp:'IAM 接入'})[e.registered_via] || e.registered_via}}</td>
+          <td data-label="状态"><span class="dot" :class="{on:e.enabled}"></span>{{e.enabled?'启用':'停用'}}</td>
+          <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="checkEmp(e.emp_no)">查看权限</button>
+            <button type="button" class="btn link" @click="editEmp(e)">编辑</button><button type="button" class="btn link danger" @click="delEmp(e)">删除</button></div></td></tr>
           <tr v-if="!emps.length"><td colspan="8" class="empty">暂无员工</td></tr></tbody></table></div>
     </template>
 
     <template v-if="tab==='grant'">
       <div class="card card-pad" style="margin-bottom:14px">
         <h3>新增授权</h3>
-        <div class="row3" style="grid-template-columns:150px 1fr 1.4fr">
-          <div class="field"><label>授权对象</label><div class="seg"><button :class="{on:g.subject_type==='role'}" @click="g.subject_type='role'">角色</button><button :class="{on:g.subject_type==='employee'}" @click="g.subject_type='employee'">员工</button></div></div>
-          <div class="field"><label>{{g.subject_type==='role'?'角色编码':'员工工号'}}</label>
-            <input v-if="g.subject_type==='role'" class="in" v-model="g.subject" list="role-list" placeholder="如 user（默认数据角色）">
-            <select v-else class="in" v-model="g.subject"><option value="" disabled>选择员工</option><option v-for="e in emps" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select>
+        <div class="row3 grant-fields">
+          <div class="field"><label>授权对象</label><div class="seg" role="group" aria-label="授权对象"><button type="button" class="btn toggle" :aria-pressed="g.subject_type==='role'" @click="g.subject_type='role'">角色</button><button type="button" class="btn toggle" :aria-pressed="g.subject_type==='employee'" @click="g.subject_type='employee'">员工</button></div></div>
+          <div class="field"><label for="grant-subject">{{g.subject_type==='role'?'角色编码':'员工工号'}}</label>
+            <input id="grant-subject" v-if="g.subject_type==='role'" class="in" v-model="g.subject" list="role-list" placeholder="如 user（默认数据角色）">
+            <select v-else id="grant-subject" class="in" v-model="g.subject"><option value="" disabled>选择员工</option><option v-for="e in emps" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select>
             <datalist id="role-list"><option v-for="r in roles" :value="r"></option></datalist></div>
-          <div class="field"><label>业务场景（数据集）</label><select class="in" v-model="g.dataset_id" @change="g.tables=['*']"><option :value="null" disabled>选择</option><option v-for="d in datasets" :value="d.id">{{d.business_scenario}}</option></select></div>
+          <div class="field"><label for="grant-dataset">业务场景（数据集）</label><select id="grant-dataset" class="in" v-model="g.dataset_id" @change="g.tables=['*']"><option :value="null" disabled>选择</option><option v-for="d in datasets" :value="d.id">{{d.business_scenario}}</option></select></div>
         </div>
         <div class="field" v-if="dsTables.length"><label>数据表</label>
           <div style="display:flex;flex-wrap:wrap;gap:6px 18px">
             <label class="check"><input type="checkbox" :checked="g.tables.includes('*')" @change="g.tables = $event.target.checked ? ['*'] : []"> <b>全部表（含今后新增）</b></label>
             <label v-for="t in dsTables" class="check" :style="g.tables.includes('*')?'opacity:.45':''"><input type="checkbox" :disabled="g.tables.includes('*')" :checked="g.tables.includes(t.table_name)" @change="toggleT(t.table_name)"> <span class="mono">{{t.table_name}}</span></label>
           </div></div>
-        <button class="btn primary" @click="addGrant" :disabled="!g.subject || !g.dataset_id || !g.tables.length">授权</button>
+        <button type="button" class="btn primary" @click="addGrant" :disabled="!g.subject || !g.dataset_id || !g.tables.length">授权</button>
       </div>
-      <div class="card scroll-x" tabindex="0" aria-label="数据表格"><table class="tbl"><thead><tr><th>授权对象</th><th>业务场景</th><th>数据表</th><th>授权时间</th><th>操作</th></tr></thead>
+      <div class="card scroll-x" tabindex="0" aria-label="表授权表格"><table class="tbl record-table" role="table"><thead><tr><th scope="col">授权对象</th><th scope="col">业务场景</th><th scope="col">数据表</th><th scope="col">授权时间</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="x in grants"><td><span class="badge" :class="x.subject_type==='role'?'blue':'amber'">{{x.subject_type==='role'?'角色':'员工'}}</span> <span class="mono">{{x.subject}}</span> {{x.employee_name || ''}}</td>
-          <td>{{x.business_scenario}}</td><td class="mono">{{x.table_name==='*' ? '全部表' : x.table_name}}</td><td class="small">{{fmtTime(x.created_at)}}</td>
-          <td><button class="link danger" @click="delGrant(x)">撤销</button></td></tr>
+          <td data-label="业务场景">{{x.business_scenario}}</td><td class="mono" data-label="数据表">{{x.table_name==='*' ? '全部表' : x.table_name}}</td><td class="small" data-label="授权时间">{{fmtTime(x.created_at)}}</td>
+          <td class="record-actions"><button type="button" class="btn link danger" @click="delGrant(x)">撤销</button></td></tr>
           <tr v-if="!grants.length"><td colspan="5" class="empty">暂无授权</td></tr></tbody></table></div>
     </template>
 
     <template v-if="tab==='check'">
       <div class="card card-pad">
-        <div class="actions"><select class="in" v-model="chk" style="width:260px"><option value="" disabled>选择员工</option><option v-for="e in emps" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select><button class="btn primary" @click="checkEmp(chk)" :disabled="!chk">查询有效权限</button></div>
-        <div v-if="chkRes" style="margin-top:14px">
+        <div class="actions"><select class="in" aria-label="选择要查询的员工" v-model="chk" @change="chkRes=null; checkError=''" :disabled="checking" style="width:min(260px,100%)"><option value="" disabled>选择员工</option><option v-for="e in emps" :value="e.emp_no">{{e.emp_no}} {{e.name}}</option></select><button type="button" class="btn primary" @click="checkEmp(chk)" :disabled="!chk || checking">{{checking ? '正在查询…' : '查询有效权限'}}</button></div>
+        <div v-if="checkError" class="msg err check-result" role="alert">{{checkError}}</div>
+        <div v-else-if="chkRes" class="check-result" aria-live="polite">
           <div class="msg warn" v-if="!chkRes.registered">该工号未登记或已停用：HTTP 和 MCP 无法访问业务数据。</div>
           <div class="msg ok" v-else-if="chkRes.all">管理员：可访问全部业务场景与数据表。</div>
           <div v-for="d in chkRes.datasets" class="hit" v-if="!chkRes.all"><h4>{{d.business_scenario}} <span class="score">dataset_id={{d.dataset_id}}</span></h4>
@@ -1893,6 +2003,7 @@ const Perms = {
           <div v-if="chkRes.registered && !chkRes.all && !chkRes.datasets.length" class="muted">没有任何数据表权限。</div>
         </div>
       </div>
+    </template>
     </template>
 
     <Drawer v-if="emp" :title="emp._new ? '新增员工' : '编辑员工 ' + emp.emp_no" :busy="empSaving" @close="emp=null">
@@ -1911,22 +2022,27 @@ const Perms = {
         <label class="check"><input type="checkbox" v-model="emp.enabled"> 启用账号</label>
       </fieldset>
       <div v-if="empSaveError" class="msg err" role="alert" style="margin-top:12px">保存失败：{{empSaveError}}</div>
-      <template #foot><button class="btn" :disabled="empSaving" @click="emp=null">取消</button>
-        <button class="btn primary" :disabled="empSaving" @click="saveEmp">{{empSaving ? '保存中…' : '保存'}}</button></template>
+      <template #foot><button type="button" class="btn" :disabled="empSaving" @click="emp=null">取消</button>
+        <button type="button" class="btn primary" :disabled="empSaving" @click="saveEmp">{{empSaving ? '保存中…' : '保存'}}</button></template>
     </Drawer>
   </div>`,
   setup() {
     const tabs = [['emp', '员工'], ['grant', '表授权'], ['check', '权限查询']];
     const tab = ref('emp'), emps = ref([]), grants = ref([]), datasets = ref([]), emp = ref(null);
+    const loading = ref(true), loadError = ref(''), checking = ref(false), checkError = ref('');
     const empSaving = ref(false), empSaveError = ref('');
     const g = reactive({ subject_type: 'role', subject: '', dataset_id: null, tables: ['*'] });
     const chk = ref(''), chkRes = ref(null), dsDetail = ref(null);
     const roles = computed(() => Array.from(new Set(emps.value.flatMap(e => e.roles || []))));
     const dsTables = computed(() => dsDetail.value ? dsDetail.value.tables : []);
     watch(() => g.dataset_id, async id => { dsDetail.value = id ? await api('/api/datasets/' + id) : null; });
-    const load = async () => {
-      [emps.value, grants.value, datasets.value] = await Promise.all([api('/api/employees'), api('/api/grants'), api('/api/datasets')]);
-    };
+    async function load() {
+      loading.value = true; loadError.value = '';
+      try {
+        [emps.value, grants.value, datasets.value] = await Promise.all([api('/api/employees'), api('/api/grants'), api('/api/datasets')]);
+      } catch (e) { loadError.value = e.message; }
+      finally { loading.value = false; }
+    }
     onMounted(load);
     function editEmp(e) {
       empSaveError.value = '';
@@ -1958,12 +2074,25 @@ const Perms = {
       } catch (err) { empSaveError.value = err.message; }
       finally { empSaving.value = false; }
     }
-    async function delEmp(e) { if (!confirm(`删除员工 ${e.emp_no}？其直接授权和管理台会话会删除。`)) return; await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load(); }
+    async function delEmp(e) {
+      if (!await askConfirm({ title: '删除员工', message: `确认删除员工 ${e.emp_no}？其直接授权和管理台会话会删除。`, confirmText: '删除' })) return;
+      await run(() => api('/api/employees/' + encodeURIComponent(e.emp_no), { method: 'DELETE' }), '已删除'); load();
+    }
     function toggleT(t) { const i = g.tables.indexOf(t); if (i >= 0) g.tables.splice(i, 1); else g.tables.push(t); }
     async function addGrant() { const r = await run(() => api('/api/grants', { method: 'POST', body: { ...g } })); toast(`新增 ${r.added} 条授权`, 'ok'); load(); }
-    async function delGrant(x) { if (!confirm('撤销该授权？')) return; await run(() => api('/api/grants/' + x.id, { method: 'DELETE' }), '已撤销'); load(); }
-    async function checkEmp(no) { tab.value = 'check'; chk.value = no; chkRes.value = await run(() => api('/api/permissions/check?emp_no=' + encodeURIComponent(no))); }
-    return { tabs, tab, emps, grants, datasets, emp, empSaving, empSaveError, g, chk, chkRes, roles, dsTables,
+    async function delGrant(x) {
+      if (!await askConfirm({ title: '撤销授权', message: '确认撤销该数据表授权？', confirmText: '撤销' })) return;
+      await run(() => api('/api/grants/' + x.id, { method: 'DELETE' }), '已撤销'); load();
+    }
+    async function checkEmp(no) {
+      if (checking.value) return;
+      // 查询切换员工时清除旧结果，避免把上一位员工的权限显示在新工号下。
+      tab.value = 'check'; chk.value = no; chkRes.value = null; checkError.value = ''; checking.value = true;
+      try { chkRes.value = await api('/api/permissions/check?emp_no=' + encodeURIComponent(no)); }
+      catch (e) { checkError.value = e.message; }
+      finally { checking.value = false; }
+    }
+    return { tabs, tab, emps, grants, datasets, emp, empSaving, empSaveError, g, chk, chkRes, roles, dsTables, loading, loadError, load, checking, checkError,
       editEmp, saveEmp, delEmp, toggleT, addGrant, delGrant, checkEmp, fmtTime };
   }
 };
@@ -1994,7 +2123,9 @@ const Mine = {
           <dt>身份</dt><dd><span class="badge" :class="state.me.is_admin?'red':''">{{state.me.is_admin ? '管理员' : '员工'}}</span> <span class="badge" v-if="!state.me.registered" style="margin-left:4px">未登记 / 已停用</span></dd>
           <dt>登录方式</dt><dd>{{({session:'海尔 IAM 单点登录', iam:'海尔 IAM'})[state.me.via] || state.me.via}}</dd></dl>
         <h2 class="account-section">我的数据权限</h2>
-        <div v-if="perm">
+        <div v-if="loading" class="msg" role="status">正在加载数据权限…</div>
+        <div v-else-if="loadError" class="msg err" role="alert">数据权限加载失败。<button type="button" class="btn link" @click="load">重试</button></div>
+        <div v-else-if="perm">
           <div class="msg ok" v-if="perm.all">管理员：可访问全部业务场景与数据表。</div>
           <div class="msg warn" v-else-if="!perm.registered">工号未登记或已停用，暂无数据权限，请联系管理员开通。</div>
           <div v-else-if="!perm.datasets.length" class="msg warn">暂无任何数据表权限，请联系管理员授权。</div>
@@ -2015,10 +2146,9 @@ const Mine = {
     </div>
   </div>`,
   setup() {
-    const perm = ref(null);
+    const { list: perm, loading, loadError, load } = useCollection('/api/me/permissions', null);
     const mcpUrl = computed(() => state.meta?.mcp_url);
-    onMounted(async () => { perm.value = await run(() => api('/api/me/permissions')); });
-    return { state, perm, mcpUrl, appPath };
+    return { state, perm, mcpUrl, appPath, loading, loadError, load };
   }
 };
 
@@ -2036,14 +2166,15 @@ const appRoot = document.getElementById('app');
 if (appRoot.dataset.reportId) {
   createApp(ReportViewer, { reportId: appRoot.dataset.reportId, initialVersion: appRoot.dataset.reportVersion }).mount(appRoot);
 } else createApp({
-  components: { Login },
+  components: { Login, ConfirmDialog },
   template: `<Login v-if="state.needLogin"/>
   <div class="shell" v-else-if="state.me">
+    <a class="btn skip-link" href="#main-content" @click.prevent="main?.focus()">跳到主内容</a>
     <aside class="side">
       <div class="brand-area">
         <a class="brand" href="#home" @click="menuOpen=false"><span class="brand-icon" v-html="icon('rep')"></span>
           <span>报告管理台<small>SmartReportGen</small></span></a>
-        <button class="x menu-toggle" type="button" aria-label="导航菜单" aria-controls="workspace-nav" :aria-expanded="menuOpen" @click="menuOpen=!menuOpen" v-html="icon(menuOpen ? 'close' : 'menu')"></button>
+        <button class="btn x menu-toggle" type="button" aria-label="导航菜单" aria-controls="workspace-nav" :aria-expanded="menuOpen" @click="menuOpen=!menuOpen" v-html="icon(menuOpen ? 'close' : 'menu')"></button>
       </div>
       <nav id="workspace-nav" class="nav" :class="{expanded: menuOpen}" aria-label="管理台导航">
         <div class="nav-group" v-for="g in groups" :key="g.title">
@@ -2066,10 +2197,11 @@ if (appRoot.dataset.reportId) {
     </div>
   </div>
   <div v-else class="app-pending" role="status">
-    <template v-if="bootError"><p>无法打开管理台。{{bootError}}</p><button class="btn" @click="init">重试</button></template>
+    <template v-if="bootError"><p>无法打开管理台。{{bootError}}</p><button type="button" class="btn" @click="init">重试</button></template>
     <template v-else>正在打开报告管理台…</template>
   </div>
-  <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>`,
+  <div class="toasts" aria-live="polite"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{t.msg}}</div></div>
+  <ConfirmDialog/>`,
   setup() {
     const menuOpen = ref(false), main = ref(null), bootError = ref('');
     const groups = computed(() => NAV_GROUPS

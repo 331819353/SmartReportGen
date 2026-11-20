@@ -75,11 +75,16 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.get("/docs", include_in_schema=False)
 def api_docs():
-    return get_swagger_ui_html(
+    # 保留 Swagger 原有交互，在生成页上追加管理台主题和本地导航。
+    page = get_swagger_ui_html(
         openapi_url=settings.public_path("/openapi.json"),
         title=f"{settings.app_name} - Swagger UI",
         oauth2_redirect_url=settings.public_path("/docs/oauth2-redirect"),
-    )
+    ).body.decode("utf-8")
+    page = page.replace("<html>", '<html lang="zh-CN">', 1).replace("<head>", f"<head>{_admin_page_head()}", 1)
+    page = page.replace("</head>", f"{_admin_stylesheet()}</head>", 1)
+    page = page.replace("<body>", f'<body class="api-docs">{_api_nav("docs")}', 1)
+    return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/docs/oauth2-redirect", include_in_schema=False)
@@ -219,15 +224,40 @@ def J(obj) -> JSONResponse:
 
 # ------------------------------------------------------------------ 页面
 @cache
+def _admin_asset_url(filename: str) -> str:
+    # 入口与辅助页随镜像更新，按文件内容标记版本，避免继续使用旧缓存。
+    version = sha256((STATIC / "admin" / filename).read_bytes()).hexdigest()[:12]
+    return f"{settings.public_path(f'/static/admin/{filename}')}?v={version}"
+
+
+def _admin_page_head() -> str:
+    return ('<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="theme-color" content="#E6ECF5">')
+
+
+def _admin_stylesheet() -> str:
+    return f'<link rel="stylesheet" href="{_admin_asset_url("app.css")}">'
+
+
+def _api_nav(current: str) -> str:
+    links = (
+        ("home", "/", "管理台"),
+        ("guide", "/api-guide", "HTTP 接入说明"),
+        ("docs", "/docs", "接口调试"),
+        ("openapi", "/openapi.json", "OpenAPI JSON"),
+    )
+    items = []
+    for key, path, label in links:
+        active = ' aria-current="page"' if key == current else ''
+        items.append(f'<a class="btn" href="{settings.public_path(path)}"{active}>{label}</a>')
+    return f'<nav class="card docs-nav" aria-label="接入文档导航">{"".join(items)}</nav>'
+
+
+@cache
 def _admin_index_html() -> str:
-    # 管理台资源随镜像发布。内容变动时换用新的资源 URL，避免浏览器沿用旧脚本或样式。
-    admin = STATIC / "admin"
-    page = (admin / "index.html").read_text(encoding="utf-8")
+    page = (STATIC / "admin" / "index.html").read_text(encoding="utf-8")
     for filename in ("app.css", "app.js"):
-        version = sha256((admin / filename).read_bytes()).hexdigest()[:12]
-        raw_url = f"/static/admin/{filename}"
-        url = settings.public_path(raw_url)
-        page = page.replace(f'"{raw_url}"', f'"{url}?v={version}"')
+        page = page.replace(f'"/static/admin/{filename}"', f'"{_admin_asset_url(filename)}"')
     page = page.replace('"/static/vendor/vue.global.prod.js"',
                         f'"{settings.public_path("/static/vendor/vue.global.prod.js")}"')
     page = page.replace('window.__SRG_BASE_PATH__ = "";',
@@ -254,21 +284,14 @@ def _api_guide_html() -> str:
     markdown = markdown.replace("../skills/smart-report/references/html-assembly.md",
                                 settings.public_path("/api-guide/html-assembly"))
     body = renderer.render(markdown)
-    home = settings.public_path("/")
-    docs = settings.public_path("/docs")
-    openapi = settings.public_path("/openapi.json")
-    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>SmartReportGen HTTP 接入说明</title>
-<style>body{{max-width:70rem;margin:2rem auto;padding:0 1rem;font:16px/1.65 system-ui;color:#24334b}}
-pre{{overflow:auto;padding:1rem;background:#f2f5fa}}table{{display:block;overflow:auto;border-collapse:collapse}}
-td,th{{padding:.4rem .7rem;border:1px solid #dbe3ee}}th{{background:#f2f5fa}}a{{color:#235fba}}</style>
-<nav><a href="{home}">管理台</a> · <a href="{docs}">接口调试</a> · <a href="{openapi}">OpenAPI JSON</a></nav>
-<main>{body}</main></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head>{_admin_page_head()}
+<title>SmartReportGen HTTP 接入说明</title>{_admin_stylesheet()}</head>
+<body class="api-guide">{_api_nav("guide")}<main class="card docs-content">{body}</main></body></html>'''
 
 
 @app.get("/api-guide", response_class=HTMLResponse, include_in_schema=False)
 def api_guide():
-    return _api_guide_html()
+    return HTMLResponse(_api_guide_html(), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api-guide/html-assembly", include_in_schema=False)
@@ -369,11 +392,13 @@ def logout(request: Request):
 
 
 def _auth_page(title: str, msg: str) -> str:
-    return (f'<!doctype html><meta charset="utf-8"><title>{html.escape(title)}</title>'
-            f'<body style="font-family:system-ui,sans-serif;background:#EEF4FE;color:#17396D;display:grid;place-items:center;'
-            f'height:100vh;margin:0"><div style="background:#fff;border:1px solid #DCE7F8;border-radius:16px;padding:28px 32px;'
-            f'max-width:460px"><h2 style="margin:0 0 8px">{html.escape(title)}</h2><p style="color:#5F7DA8">{html.escape(msg)}</p>'
-            f'<a href="{settings.public_path("/")}" style="color:#2168F3">返回管理台</a></div></body>')
+    # 登录错误与报告访问提示复用登录页外壳，错误文案仍按纯文本转义。
+    return (f'<!doctype html><html lang="zh-CN"><head>{_admin_page_head()}'
+            f'<title>{html.escape(title)}</title>{_admin_stylesheet()}</head>'
+            f'<body><main class="login-shell"><div class="card login login-error">'
+            f'<h1>{html.escape(title)}</h1><p class="login-intro">{html.escape(msg)}</p>'
+            f'<a class="btn primary" href="{settings.public_path("/")}">返回管理台</a>'
+            f'</div></main></body></html>')
 
 
 # ------------------------------------------------------------------ 当前用户（自助）
