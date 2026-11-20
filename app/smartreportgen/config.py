@@ -44,7 +44,6 @@ class Settings:
         # 演示 API 数据源的内部地址（compose 网络内 api 服务）
         self.demo_api_base_url = os.getenv("DEMO_API_BASE_URL", "http://api:8000/demo-api")
         self.mcp_port = int(os.getenv("MCP_PORT", "8001"))
-        self.api_port = int(os.getenv("API_PORT", "8000"))
         # 默认与管理台共用对外地址，网关按 /mcp 路径转发。
         self.mcp_public_url = os.getenv("MCP_PUBLIC_URL") or f"{self.public_base_url}/mcp"
         self.app_name = os.getenv("APP_NAME", "SmartReportGen")

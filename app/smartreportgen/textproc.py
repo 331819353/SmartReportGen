@@ -48,11 +48,7 @@ def tokenize(text: str) -> list[str]:
     seen: set[str] = set()
     for t in jieba.lcut_for_search(text.lower()):
         t = t.strip()
-        if not t or t in STOPWORDS or not _TOKEN_OK.match(t):
-            continue
-        if len(t) < 2 and not t.isdigit():
-            continue
-        if t.isdigit() and len(t) < 2:
+        if len(t) < 2 or t in STOPWORDS or not _TOKEN_OK.match(t):
             continue
         if t not in seen:
             seen.add(t)

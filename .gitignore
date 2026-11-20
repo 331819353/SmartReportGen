@@ -6,9 +6,11 @@
 # Python / 系统
 __pycache__/
 *.pyc
+.ruff_cache/
 .DS_Store
 
 # 备份与过程文件
 backup/
 *.dump
 scripts/out/
+/skills/smart-report.zip

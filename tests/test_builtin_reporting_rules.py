@@ -52,10 +52,14 @@ class BuiltinReportingRulesTest(unittest.TestCase):
         with patch.object(mcp_server, "SKILL_DIR", skill_dir), \
                 patch.object(mcp_server, "SKILL_FILE", skill_dir / "SKILL.md"):
             body = mcp_server.get_skill_guide()
-            for reference in ("fact-contract", "green-energy-september-facts", "display-contract"):
+            for reference in ("fact-contract", "display-contract", "declarative-report", "free-report"):
                 with self.subTest(reference=reference):
                     contents = (skill_dir / "references" / f"{reference}.md").read_text(encoding="utf-8")
                     self.assertEqual(mcp_server.get_skill_guide(reference=reference), body + "\n\n---\n\n" + contents)
+            # 旧客户端仍能传历史标识，并得到可执行的现行取数规则。
+            retired = mcp_server.get_skill_guide(reference="green-energy-september-facts")
+            self.assertIn("历史案例已归档", retired)
+            self.assertTrue(retired.endswith((skill_dir / "references/fact-contract.md").read_text(encoding="utf-8")))
             with self.assertRaises(ValueError):
                 mcp_server.get_skill_guide(reference="../../config")
             # MCP-only 客户端取得可直接保存运行的原文，不能混入指南或读取任意路径。

@@ -8,8 +8,6 @@ import os
 import random
 from urllib.parse import urlparse
 
-import psycopg
-
 from . import db, repo
 from .config import settings
 

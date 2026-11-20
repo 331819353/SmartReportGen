@@ -49,16 +49,9 @@ description: 智能报告生成（SmartReportGen）。按业务场景新建、�
 - 保存第 4 步验收通过的 `preview_id`。新发布用 `save_report(name, preview_id)`。修订用 `revise_report(report_id, name, base_version, preview_id)` 追加版本。协作时可用 `expected_version` 检查最新版本是否已变化。内容修改后重新验收，使用新的预览 ID。
 - 交付报告 ID、版本、固定链接、离线下载链接、主要结论和口径缺口。分享前，接收人须已登记并拥有该版本的来源数据权限。读取和下载时复核当前授权。
 
-## 补充优化
-
-- **快**。优先复用业务场景、模板、批量画像和快照。监测首个可审阅预览耗时、纯样式修订耗时及重复取数次数。
-- **准**。跟踪定量结论能否追溯到来源、筛选变更后的对账结果，以及缺数和零是否正确区分。
-- **稳**。跟踪首次验收通过率、协作版本冲突和保存失败。自由模板支持模块级更新，所有正式发布执行整页验收。
-
 ## 参考
 
 - [自由版式模板和模块更新](references/free-report.md)
 - [声明式模板和取数计划](references/declarative-report.md)
 - [事实及数据范围约定](references/fact-contract.md)
 - [展示契约与服务端验收](references/display-contract.md)
-- [绿能场景示例](references/green-energy-september-facts.md)

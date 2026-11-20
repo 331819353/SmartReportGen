@@ -18,7 +18,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from hashlib import sha256
-from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
@@ -477,7 +476,7 @@ def get_skill_guide(include_example: bool = False,
                     asset: Literal["report-formatters.js", "audit_report.py"] | None = None) -> str:
     """返回 smart-report 技能全文：报告生成与修订流程、分析方法、权限及交付要求。
     适用于没有本地技能机制的 agent；开始生成报告前调用一次。include_example=true 时附带可运行的 HTML 示例。
-    reference 可附带取数、展示、声明式模板契约或绿能事实示例。
+    reference 可附带取数、展示及模板契约。旧绿能参考标识返回现行取数契约和历史复现说明。
     asset 单独返回格式化模块或可执行审计脚本的完整原文，供没有本地技能的 agent 保存到同一目录；不可与其他选项并用。"""
     if asset is not None:
         # 固定资产白名单，不开放客户端任意路径读取，也不在返回代码前混入技能正文。
@@ -487,11 +486,14 @@ def get_skill_guide(include_example: bool = False,
             raise ValueError("asset 不能与 reference 或 include_example 同时使用")
         return (SKILL_DIR / "assets" / asset).read_text(encoding="utf-8")
     text = _skill_body()
+    if reference == "green-energy-september-facts":
+        # 已分发的客户端仍可调用旧标识。历史附件只有在用户指定基准后才用于核对。
+        text += "\n\n历史案例已归档。复现时先确认用户指定的报告版本和原始资料，再按授权取得同口径事实。"
+        reference = "fact-contract"
     if reference is not None:
         # 仅允许已维护的参考名，不能把客户端参数当作任意文件路径读取。
-        files = {"fact-contract": "fact-contract.md", "green-energy-september-facts": "green-energy-september-facts.md",
-                 "display-contract": "display-contract.md", "declarative-report": "declarative-report.md",
-                 "free-report": "free-report.md"}
+        files = {"fact-contract": "fact-contract.md", "display-contract": "display-contract.md",
+                 "declarative-report": "declarative-report.md", "free-report": "free-report.md"}
         if reference not in files:
             raise ValueError("不支持的技能参考文档")
         text += "\n\n---\n\n" + (SKILL_DIR / "references" / files[reference]).read_text(encoding="utf-8")

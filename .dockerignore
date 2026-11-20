@@ -1,6 +1,18 @@
+# 构建只读取服务源码、技能和 HTTP 接入文档。
+**
+!app
+!app/Dockerfile
+!app/requirements.txt
+!app/smartreportgen
+!app/smartreportgen/**
+!skills
+!skills/smart-report
+!skills/smart-report/**
+!docs
+!docs/HTTP_API.md
+
+# 排除本机生成的缓存和 macOS 元数据。
 **/__pycache__
 **/*.pyc
-.env
-.git
-scripts/out
-backup
+**/.DS_Store
+**/._*

@@ -28,7 +28,6 @@ _FORBIDDEN = re.compile(
     r"copy|vacuum|analyze|lock|unlock|kill|shutdown|into|outfile|dumpfile|attach|detach|pragma|install|load)\b",
     re.I,
 )
-IDENT_RE = re.compile(r'^[\w$#".]+$', re.U)
 
 
 def ensure_readonly(sql: str) -> str:
@@ -48,12 +47,6 @@ def ensure_readonly(sql: str) -> str:
     if m:
         raise ConnectorError(f"查询中包含不允许的关键字：{m.group(1)}")
     return s
-
-
-def check_ident(name: str) -> str:
-    if not name or not IDENT_RE.match(name):
-        raise ConnectorError(f"非法表名：{name!r}")
-    return name
 
 
 def norm_value(v: Any) -> Any:

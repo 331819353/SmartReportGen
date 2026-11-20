@@ -28,12 +28,9 @@ def skill_dir() -> Path:
 
 
 @cache
-def _inline_echarts() -> str:
-    return (Path(__file__).with_name("static") / "vendor" / "echarts.min.js").read_text(encoding="utf-8")
-
-
 def echarts_js() -> str:
-    return _inline_echarts()
+    """复用内置图表脚本，避免报告展开与合并重复读取同一个大文件。"""
+    return (Path(__file__).with_name("static") / "vendor" / "echarts.min.js").read_text(encoding="utf-8")
 
 
 @cache
@@ -43,7 +40,7 @@ def formatters_js() -> str:
 
 def inline_legacy_echarts(html: str) -> str:
     """内联旧结构化报告引用的内置图表库。新报告已经内联时直接返回原文。"""
-    return LEGACY_ECHARTS.sub(lambda _: f"<script>{_inline_echarts()}</script>", html)
+    return LEGACY_ECHARTS.sub(lambda _: f"<script>{echarts_js()}</script>", html)
 
 
 class _ReportDocument(HTMLParser):

@@ -97,7 +97,6 @@ BUILTIN_TOKENS: dict[str, Any] = {
     **COLOR_TOKENS, **AUTO_COLOR_TOKENS, **PALETTE_TOKENS, **FONT_TOKENS, **SIZE_TOKENS,
     **{k: v[0] for k, v in NUMBER_TOKENS.items()}, **PERCENT_TOKENS, **OTHER_TOKENS, **LAYOUT_OPTIONS,
 }
-DEFAULT_TOKENS = BUILTIN_TOKENS  # 兼容旧名称
 KNOWN_KEYS = set(BUILTIN_TOKENS) | {"custom_css"}
 
 # 旧版主题键 → 令牌
@@ -542,22 +541,6 @@ def items_to_markdown(name: str, items: list[dict]) -> str:
             lines.append(f"### {c['label']}")
             lines += [f"- {t}" for t in group]
     return "\n".join(lines)
-
-
-def legacy_items(content: str) -> list[dict]:
-    """旧版 markdown 规则 → 条目（列表项各成一条，归入“其他”，供人工再分类）。"""
-    items = []
-    for line in (content or "").splitlines():
-        m = re.match(r"^\s*(?:[-*]|\d+[.、])\s+(.+)$", line)
-        if m:
-            items.append({"category": "other", "text": re.sub(r"\*\*|`", "", m.group(1)).strip()})
-    return items
-
-
-def theme_diff(theme: dict, base: dict) -> dict:
-    """只保留与继承值不同的设置（规则只存自己覆盖的部分）。"""
-    overrides, _ = resolve_overrides(theme)
-    return {k: v for k, v in overrides.items() if v != base.get(k)}
 
 
 def resolve_with_sources(layers: list[tuple[str, str, dict]]) -> tuple[dict, dict]:
