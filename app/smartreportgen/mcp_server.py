@@ -538,7 +538,7 @@ def _resolve_style(principal: Principal, business_scenario: str, query: str = ""
         # 自编 HTML 可以直接复用内置组件样式；指定主题和展示要求仍通过原有字段返回。
         "builtin_style": builtin,
         "rules": rules,
-        "note": ("reporting_rules 独立约束事实取数与离线交付，不能因样式调整豁免。"
+        "note": ("reporting_rules 提供跨场景的事实、展示和交付规则。事实与交付要求独立生效，展示默认值按 precedence 应用。"
                  "specified 合并了业务场景、通用及内置样式。直接编写 HTML 时，请将适用的 theme 和 items 落实到 CSS、图表配置与脚本。"
                  "采用内置样式时，可以内联 builtin_style.css 并参考组件说明；同类卡片复用 CSS 与图表配置。"
                  "items 各类别内排在前面的优先，请落实到健康度、升降色、数字格式与文案。"
@@ -555,7 +555,7 @@ def get_style_rules(business_scenario: str, ctx: Context, query: str = "", inclu
     """检索该业务场景的指定样式：你本人为该场景配置的样式 ≥ 管理员配置的通用规则 ≥ 内置经营报告主题，合并为一份 specified，
     作为展示约束交给你：specified.theme 为视觉样式取值（渲染时自动生效），specified.items 为好坏判定、涨跌颜色、数字格式、
     文案等展示要求。章节、图表类型和筛选条件由用户需求、场景分析思路及数据证据决定。
-    reporting_rules 为独立的事实直取、缺失不补算及离线单文件约束，不参与视觉样式覆盖。
+    reporting_rules 提供跨场景的事实、展示和交付规则。事实与交付要求独立生效，展示默认值按下方优先级应用。
     builtin_style 提供 style_id（可通过 <style data-srg-style="style_id"></style> 由服务端展开）及组件说明；
     传 include_css=false 可省略 22KB 内置 CSS 原文以减少上下文占用。
     展示顺序：当前用户明确要求 > 业务场景规则 > 通用规则 > 内置默认值。

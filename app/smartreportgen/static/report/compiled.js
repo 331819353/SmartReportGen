@@ -72,7 +72,8 @@
   }
 
   function table(container, card, matches) {
-    const scroll = element('div', null, 'srg-table');
+    // 复用共享表格容器的浅色边框与滚动样式，保留声明式卡片的高度设置。
+    const scroll = element('div', null, 'rf-table-wrap srg-table');
     const view = element('table', null, 'rf-table');
     const headings = view.createTHead().insertRow();
     for (const column of card.columns) headings.append(element('th', column.label, column.format.kind === 'text' ? null : 'num'));

@@ -20,9 +20,12 @@ class BuiltinReportingRulesTest(unittest.TestCase):
         self.assertEqual(result["scenario_rules"], [])
         self.assertEqual(result["specified"]["items"], [])
         self.assertEqual(result["reporting_rules"], design.builtin_reporting_rules())
-        ids = [rule["id"] for rule in result["reporting_rules"]]
-        self.assertEqual(len(ids), len(set(ids)))
-        self.assertTrue({"direct_facts", "missing_facts", "standalone_html"}.issubset(ids))
+        # 校验整组规则已替换，防止旧条目混入或新条目重复。
+        self.assertCountEqual([rule["id"] for rule in result["reporting_rules"]], [
+            "consistent_scope", "official_measures", "show_missing_data", "kpi_comparison",
+            "number_presentation", "metric_status", "supported_findings", "component_colors",
+            "readable_layout", "report_typography", "table_chart_layout", "offline_report", "version_traceability",
+        ])
 
     def test_visual_overrides_do_not_replace_reporting_rules(self):
         configured = {"id": 1, "name": "测试样式", "scope": "scenario", "items": [

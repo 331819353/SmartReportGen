@@ -581,7 +581,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `defaults`、`suggested` | 两个以样式键为索引的对象，当前均返回内置主题 |
 | `retired_analysis_categories` | 已停用类别到名称的映射，键为 `structure`、`chart`、`filter` |
 | `precedence` | 字符串，描述样式生效顺序 |
-| `reporting_rules` | 只读内置报告规则数组，每项含 `id`、`label`、`text`、`level:"builtin"`、`source`；不参与视觉样式的覆盖 |
+| `reporting_rules` | 只读内置报告规则数组，每项含 `id`、`label`、`text`、`level:"builtin"`、`source` |
 
 **`GET /api/style-rules/resolve` 响应字段**
 
@@ -592,11 +592,11 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `specified.theme` | 合并后已设置的样式键和值 |
 | `specified.theme_sources` | 同一批样式键对应的来源说明字符串 |
 | `specified.items` | 合并后的展示要求，每项含 `category`、`category_label`、`text`、`level`（`general` 或 `scenario`）、`source` |
-| `reporting_rules` | 与 `GET /api/style-tokens` 相同的内置事实及离线交付约束，独立于 `specified` 的展示优先级 |
+| `reporting_rules` | 与 `GET /api/style-tokens` 相同的跨场景内置规则。事实与交付要求独立生效，展示默认值按 `precedence` 应用 |
 | `general_rules`、`scenario_rules` | 生效的通用规则和当前用户个人场景规则数组。规则的 `items` 附 `category_label`。有检索命中时规则附 `relevance`，结构同业务场景检索命中去掉 `dataset` |
 | `warnings` | 字符串数组，例如相关度检索的向量降级提示 |
 
-内置事实和展示规则通过 `reporting_rules` 返回。声明式报告由服务端完成静态审计及 Chromium 验收。本地审计脚本可诊断历史草稿，不能签发保存凭证。场景负责人可通过 `semantic_metrics` 配置官方指标，见[声明式模板和取数计划](../skills/smart-report/references/declarative-report.md)。
+MCP 的 `get_style_rules` 和 `prepare_report_context` 也提供同一份 `reporting_rules`。声明式报告由服务端完成静态审计及 Chromium 验收。本地审计脚本可诊断历史草稿，不能签发保存凭证。场景负责人可通过 `semantic_metrics` 配置官方指标，见[声明式模板和取数计划](../skills/smart-report/references/declarative-report.md)。
 
 **`effective` 与 `preview` 请求示例**
 

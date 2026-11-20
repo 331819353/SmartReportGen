@@ -500,20 +500,25 @@ def _structured_layout(spec, theme, controls):
     sections, toc = [], []
     for index, section in enumerate(spec.sections, 1):
         title = escape(section.title)
+        # 正文仍按纯文本转义，只把有效业务行之间的换行转换为 HTML 分隔。
+        narrative = "\n".join(filter(None, (line.strip() for line in section.narrative.splitlines())))
         pieces, start = [], 0
-        for match in TOKEN.finditer(section.narrative):
+        for match in TOKEN.finditer(narrative):
             mode = ' data-metric-state="true"' if match[2] else ''
-            pieces.extend((escape(section.narrative[start:match.start()]),
+            pieces.extend((escape(narrative[start:match.start()]),
                            f'<strong class="rf-metric" data-metric="{match[1]}"{mode}>—</strong>'))
             start = match.end()
-        pieces.append(escape(section.narrative[start:]))
-        intro = f'<p class="rf-summary">{"".join(pieces)}</p>' if section.narrative else ''
+        pieces.append(escape(narrative[start:]))
+        conclusion = "".join(pieces).replace("\n", "<br>")
+        intro = f'<p class="rf-summary">{conclusion}</p>' if conclusion else ''
         cards = []
         for number, card in enumerate(section.cards):
             metric = f' data-metric="{card.metric}"' if card.metric else ""
             span = card.span * 5 if card.span is not None else (20 if card.metric else 30)
+            # 紧凑指标接入共享的窄屏两列布局，通栏指标尊重作者指定的宽度。
+            compact = " rf-narrow" if card.type == "kpi" and span <= 30 else ""
             height = f";--srg-card-height:{card.height}px" if card.height else ""
-            cards.append(f'<article class="rf-card rf-type-{card.type}" style="--span:{span}{height}">'
+            cards.append(f'<article class="rf-card rf-type-{card.type}{compact}" style="--span:{span}{height}">'
                          f'<h3 class="rf-card-title">{escape(card.title)}</h3>'
                          f'<div class="srg-card-output{" rf-metric" if card.metric else ""}" id="card-{index}-{number}"{metric}>—</div></article>')
         sections.append(f'<section class="rf-section" id="sec-{index}"><h2 class="rf-section-title">{title}</h2>{intro}'

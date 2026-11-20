@@ -29,7 +29,7 @@ description: 智能报告生成（SmartReportGen）。按业务场景新建、�
 
 1. **一步加载上下文。** 复用检索返回的 `context`，或调用 `prepare_report_context(dataset_id, mode="structured"|"free")` 一次获取业务场景（`analysis_approach`、授权表、固定行范围、`semantic_metrics`）、前 10 张授权表的轻量画像、生效样式（含 `style_id`）及模板契约。表数量超过 10 张且需要查看更多候选时，再用 `describe_tables(include_profile=true, offset=...)` 翻页查看。单表需要全表统计时才调用 `describe_table(mode="full")`。
 2. **确认事实和联动。** 上游已有正式汇总值时，优先按期间、组织等维度筛选、直取所需字段，例如总体值、目标、同比和完成率。缺少预聚合口径时，使用场景负责人登记且允许当前分组的官方公式（支持 `when`/`denominator_when` 跨行条件聚合，过滤字段独立于分组 `dimensions`）。`QueryPlan` 支持区间（`gte`/`lte`）、`in`/`not_in`、`ne` 及受控维表 `joins`。探查阶段可用 `run_query` 核实字段、值域、唯一性及实际引用的 `tables_used`；**正式报告所需的单组或多组快照统一用 `query_report_data(..., sample_rows=200)` 一次按同批次获取**（≤200 行且未触发上限时直接复用其 `sample_rows` 与 `snapshot_id` 传入 `bindings`）。当前筛选缺少同口径唯一事实时，相关结论、数字和状态一起显示缺数。结构化正文用 `{{metric}}`（支持 `format.kind="text"` 绑定账期、名称等事实），自由版式正文用 `<srg-val>` 绑定数字。多粒度筛选下需要切换总计与明细的图表/表格，可为卡片配置 `sources` 或 `where`。
-3. **落实生效样式。** 使用 `prepare_report_context` 返回的 `style` 或单独调用 `get_style_rules(..., include_css=false)` 获取样式与规则，按当前用户明确要求、场景规则、通用规则、内置默认的优先级应用。用 `format` 声明精度、单位、比例尺度和判定阈值。按需求配置主题、卡片、图例、状态色等展示选项。
+3. **落实生效规则。** 使用 `prepare_report_context` 返回的 `style` 或单独调用 `get_style_rules(..., include_css=false)`。读取 `reporting_rules` 的跨场景事实、展示和交付规则，并将展示默认值和 `specified` 的样式按当前用户明确要求、场景规则、通用规则、内置默认的优先级应用。用 `format` 声明精度、单位、比例尺度和判定阈值。按需求配置主题、卡片、图例和状态色。
 4. **保存设计结果。** 按需求选模板。标准卡片和图表用 `save_report_spec`（更新协作模板可传 `expected_version`）。需要自定义版式、按模块拼装或更细的 ECharts 视觉时，用 `save_free_report_template`，保存页面骨架、分模块 HTML/CSS 和受管数据槽位。两类模板都保存取数计划、字段绑定、筛选联动和展示规则。使用返回的 `template_id` 与版本进入第 3 步。用 `business_summary` 记录用途和重要口径，有未覆盖的分析项或权限限制时在交付中说明。
 
 ## 3. 基于模板多轮拼装 HTML，按模块调整

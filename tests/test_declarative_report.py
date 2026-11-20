@@ -127,6 +127,38 @@ class DeclarativeReportTest(unittest.TestCase):
         self.assertGreaterEqual(proof["states_checked"], 4)
 
     @unittest.skipUnless(Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file(), "需安装 Chromium")
+    def test_conclusion_breaks_and_responsive_kpi_rows(self):
+        from playwright.sync_api import sync_playwright
+
+        spec, payload = fixture()
+        raw = spec.model_dump(mode="json")
+        section = raw["sections"][0]
+        section["narrative"] = "\n完成率为 {{attainment}}。\n\n可按区域查看明细。\n"
+        section["cards"].insert(1, {**section["cards"][0], "title": "总体执行"})
+        section["cards"].insert(2, {**section["cards"][0], "title": "通栏指标", "span": 12})
+        spec = report_spec.ReportSpec.model_validate(raw)
+        _, page_html, _ = report_spec.compile_report(spec, {"facts": payload}, 91, {})
+
+        with sync_playwright() as api:
+            browser = api.chromium.launch(executable_path=os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium"))
+            page = browser.new_page(viewport={"width": 980, "height": 850}, offline=True)
+            page.set_content(page_html)
+            page.locator("html[data-srg-ready=true]").wait_for(state="attached")
+            self.assertEqual(page.locator(".rf-summary br").count(), 1)
+            self.assertTrue(page.locator(".rf-summary").inner_text().endswith("。\n可按区域查看明细。"))
+            self.assertEqual(page.locator(".rf-table-wrap .num").first.evaluate(
+                "n => getComputedStyle(n).textAlign"), "right")
+
+            # 默认断点和常见手机宽度仍是两列。通栏指标和极窄屏各自独占一行。
+            for width in (980, 390, 360):
+                with self.subTest(width=width):
+                    page.set_viewport_size({"width": width, "height": 850})
+                    first, second, full = page.locator(".rf-type-kpi").evaluate_all(
+                        "cards => cards.map(card => card.getBoundingClientRect().top)")
+                    self.assertEqual(first == second, width > 360)
+                    self.assertLess(second, full)
+
+    @unittest.skipUnless(Path(os.getenv("SRG_CHROMIUM_PATH", "/usr/bin/chromium")).is_file(), "需安装 Chromium")
     def test_custom_theme_and_chart_geometry_in_chromium(self):
         from playwright.sync_api import sync_playwright
 
