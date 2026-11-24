@@ -842,7 +842,78 @@ def save_template(data: dict, tpl_id: int | None = None, *, expected_version: in
 
 
 def delete_template(tpl_id: int) -> None:
-    db.execute("DELETE FROM report_template.report_template WHERE id=%s", (tpl_id,))
+    with db.conn() as c, c.transaction():
+        _one(c.execute("SELECT id FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone(),
+             "报告模板")
+        used = c.execute(
+            "SELECT count(DISTINCT report_id) AS n FROM ("
+            "SELECT id AS report_id FROM report.report WHERE template_id=%s "
+            "UNION SELECT report_id FROM report.report_version WHERE template_id=%s"
+            ") refs",
+            (tpl_id, tpl_id),
+        ).fetchone()
+        if used and used["n"]:
+            raise Invalid(f"仍有 {used['n']} 份报告关联该模板，无法删除")
+        c.execute("DELETE FROM report_template.report_template WHERE id=%s", (tpl_id,))
+
+
+def resolve_template_pair(template_id: int | None, template_version: int | None, *,
+                          default_id: int | None = None, default_version: int | None = None) -> tuple[int | None, int | None]:
+    """合并调用方传入与继承的模板 ID/版本；切换新模板时须显式指定版本。"""
+    if template_id is not None and template_id != default_id and template_version is None:
+        raise Invalid("指定新的 template_id 时须同时提供 template_version")
+    tid = template_id if template_id is not None else default_id
+    tver = (template_version if template_version is not None
+            else (default_version if template_id is None or template_id == default_id else None))
+    return tid, tver
+
+
+def require_report_template(principal: Principal | None, template_id: int | None, template_version: int | None,
+                            *, dataset_id: int | None = None, connection=None) -> dict:
+    """校验报告绑定的模板与版本存在、有权限读取，且与报告业务场景一致。"""
+    if template_id is None or template_version is None:
+        raise Invalid("生成或修订报告必须绑定已保存的报告模板（template_id 和 template_version），"
+                      "请先调用 save_report_template 保存或读取已有模板")
+    if type(template_id) is not int or template_id < 1 or type(template_version) is not int or template_version < 1:
+        raise Invalid("template_id 和 template_version 须为正整数")
+    tpl_sql = "SELECT id, name, dataset_id, created_by, version FROM report_template.report_template WHERE id=%s"
+    if connection is not None:
+        tpl = connection.execute(tpl_sql + " FOR KEY SHARE", (template_id,)).fetchone()
+    else:
+        tpl = db.fetchone(tpl_sql, (template_id,))
+    if not tpl:
+        raise NotFound(f"报告模板 #{template_id} 不存在，请先调用 save_report_template 保存模板")
+    ver_sql = "SELECT version FROM report_template.report_template_version WHERE template_id=%s AND version=%s"
+    ver = connection.execute(ver_sql, (template_id, template_version)).fetchone() if connection is not None else db.fetchone(
+        ver_sql, (template_id, template_version))
+    if not ver:
+        raise NotFound(f"报告模板 #{template_id} 不存在版本 v{template_version}")
+    if principal is not None:
+        from .permission import access_for
+
+        require_template_access(tpl, access_for(principal))
+    if dataset_id is not None:
+        if tpl["dataset_id"] is None:
+            raise Invalid(f"报告模板 #{template_id} 未关联业务场景，请先在模板中关联业务场景（dataset_id={dataset_id}）")
+        if tpl["dataset_id"] != dataset_id:
+            raise Invalid(f"报告模板 #{template_id} 关联的业务场景（dataset_id={tpl['dataset_id']}）"
+                          f"与报告业务场景（dataset_id={dataset_id}）不一致")
+    return tpl
+
+
+def sync_draft_json_template(draft_json: str | None, template_id: int | None, template_version: int | None) -> str | None:
+    """同步分块草稿 JSON 中的模板 ID 与版本，保持报告源码与元数据一致。"""
+    if not draft_json:
+        return draft_json
+    try:
+        payload = json.loads(draft_json)
+    except ValueError:
+        return draft_json
+    if isinstance(payload, dict) and isinstance(payload.get("smartreportgen_html_draft"), dict):
+        payload["smartreportgen_html_draft"]["template_id"] = template_id
+        payload["smartreportgen_html_draft"]["template_version"] = template_version
+        return report_data._json(payload)
+    return draft_json
 
 
 # ============================ 报告 ============================
@@ -880,7 +951,8 @@ def _report_target(connection, report_id: int) -> tuple[int, int | None]:
 def list_reports(principal: Principal, template_id: int | None = None, q: str | None = None) -> list[dict]:
     if not principal.registered:
         return []
-    sql = (f"SELECT {REPORT_COLS}, t.name AS template_name, e.name AS creator_name, s.access_level, "
+    sql = (f"SELECT {REPORT_COLS}, t.name AS template_name, t.version AS template_latest_version, "
+           "e.name AS creator_name, s.access_level, "
            "COALESCE(sel.version,r.revision) AS current_version, (sel.version IS NOT NULL) AS version_selected "
            "FROM report.report r" + REPORT_SHARE_JOIN + REPORT_SELECTION_JOIN +
            " JOIN report.report_version v ON v.report_id=r.id AND v.version=COALESCE(sel.version,r.revision) "
@@ -925,12 +997,14 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
     with db.conn() as c:
         report_id, legacy_version = _report_target(c, report_id)
         row = _one(c.execute(
-            f"SELECT {cols}, s.access_level, COALESCE(sel.version,r.revision) AS current_version, "
+            f"SELECT {cols}, t.name AS template_name, t.version AS template_latest_version, "
+            "s.access_level, COALESCE(sel.version,r.revision) AS current_version, "
             "(sel.version IS NOT NULL) AS version_selected, v.markdown IS NOT NULL AS has_source, "
             "CASE WHEN %s AND (v.source_owner=%s OR %s) THEN v.markdown END AS markdown, "
             "v.dataset_id, v.source_owner "
             f"FROM report.report r{REPORT_SHARE_JOIN}{REPORT_SELECTION_JOIN} "
             "LEFT JOIN report.report_version v ON v.report_id=r.id AND v.version=COALESCE(%s,sel.version,r.revision) "
+            "LEFT JOIN report_template.report_template t ON t.id=v.template_id "
             "WHERE r.id=%s",
             (with_source, principal.emp_no, principal.is_admin,
              principal.emp_no, principal.emp_no, version if version is not None else legacy_version, report_id)
@@ -964,8 +1038,11 @@ def get_report(report_id: int, principal: Principal, with_html: bool = True, *,
 def list_report_versions(report_id: int, principal: Principal) -> dict:
     report = get_report(report_id, principal, with_html=False)
     versions = db.fetchall(
-        "SELECT v.version, v.base_version, v.name, v.created_at, v.created_by, v.change_note, v.meta, "
-        "e.name AS creator_name FROM report.report_version v LEFT JOIN permission.employee e ON e.emp_no=v.created_by "
+        "SELECT v.version, v.base_version, v.name, v.template_id, v.template_version, t.name AS template_name, "
+        "v.created_at, v.created_by, v.change_note, v.meta, "
+        "e.name AS creator_name FROM report.report_version v "
+        "LEFT JOIN report_template.report_template t ON t.id=v.template_id "
+        "LEFT JOIN permission.employee e ON e.emp_no=v.created_by "
         "WHERE v.report_id=%s ORDER BY v.version DESC", (report["id"],))
     report["versions"] = []
     for version in versions:
@@ -1090,17 +1167,9 @@ def _insert_report_version(c, report_id: int, version: int, base_version: int | 
     )
 
 
-def _report_template_reference(c, template_id: int | None, template_version: int | None) -> tuple:
-    # 指南仅记录溯源。在发布事务中锁住仍存在的引用，避免并行删除触发外键失败。
-    if template_id is not None and c.execute(
-        "SELECT id FROM report_template.report_template WHERE id=%s FOR KEY SHARE", (template_id,)
-    ).fetchone():
-        return template_id, template_version
-    return None, None
-
-
 def save_report(name: str, html: str, template_id: int | None, template_version: int | None, meta: dict,
-                created_by: str | None = None, *, source: dict | None = None) -> dict:
+                created_by: str | None = None, *, source: dict | None = None,
+                principal: Principal | None = None) -> dict:
     # 版本库只接收已验收的精确字节，旧格式可读但不能通过另一个入口发布。
     if (not source or meta.get("source") not in ("assembled_html", "compiled_spec") or not meta.get("scopes") or
             meta.get("verification", {}).get("status") != "passed" or
@@ -1110,8 +1179,14 @@ def save_report(name: str, html: str, template_id: int | None, template_version:
         raise Invalid(error)
     name = _report_name(name)
     meta = {**meta, "html_bytes": len(html.encode()), "html_chars": len(html), "single_file": True}
+    source_data = dict(source or {})
+    ds_id = source_data.get("dataset_id") or meta.get("dataset_id")
     with db.conn() as c, c.transaction():
-        template_id, template_version = _report_template_reference(c, template_id, template_version)
+        require_report_template(principal, template_id, template_version, dataset_id=ds_id, connection=c)
+        if source_data.get("markdown"):
+            source_data["markdown"] = sync_draft_json_template(source_data["markdown"], template_id, template_version)
+        source_data["template_id"] = template_id
+        source_data["template_version"] = template_version
         stored_html = _store_report_html(c, html)
         row = c.execute(
             "INSERT INTO report.report(name, template_id, template_version, html, meta, created_by) "
@@ -1119,7 +1194,7 @@ def save_report(name: str, html: str, template_id: int | None, template_version:
             (name, template_id, template_version, "", db.jsonb(meta), created_by),
         ).fetchone()
         _insert_report_version(c, row["id"], 1, None, name, stored_html, meta, template_id, template_version,
-                               source or {}, created_by)
+                               source_data, created_by)
     return {**row, "size": len(html), "revision": 1, "latest_version": 1, "current_version": 1,
             "base_version": None, **report_links(row["id"])}
 
@@ -1169,7 +1244,8 @@ def select_report_version(report_id: int, principal: Principal, version: int | N
 
 def update_report(report_id: int, principal: Principal, name: str, html: str | None, base_version: int | None = None,
                   *, expected_version: int | None = None, change_note: str = "",
-                  rendered: tuple[dict, dict] | None = None) -> dict:
+                  rendered: tuple[dict, dict] | None = None,
+                  template_id: int | None = None, template_version: int | None = None) -> dict:
     name = _report_name(name)
     change_note = change_note.strip()
     if len(change_note) > 500 or "\x00" in change_note:
@@ -1216,17 +1292,51 @@ def update_report(report_id: int, principal: Principal, name: str, html: str | N
         # 仅改名称或说明时直接复用已核对的存储字节，沿用旧版本的脚本引用。
         stored_html = base["html"] if rendered is None else _store_report_html(c, html)
         version = row["revision"] + 1
-        template_id, template_version = source.get("template_id", base["template_id"]), source["template_version"]
         if rendered is not None:
-            template_id, template_version = _report_template_reference(c, template_id, template_version)
-        _insert_report_version(c, report_id, version, base_version, name, stored_html, meta, template_id,
-                               template_version, source, principal.emp_no, change_note)
+            src_tid, src_tver = resolve_template_pair(
+                source.get("template_id"), source.get("template_version"),
+                default_id=base["template_id"], default_version=base["template_version"],
+            )
+            tid, tver = resolve_template_pair(
+                template_id, template_version, default_id=src_tid, default_version=src_tver,
+            )
+            ds_id = source.get("dataset_id") or meta.get("dataset_id") or base.get("dataset_id") or base["meta"].get("dataset_id")
+            require_report_template(principal, tid, tver, dataset_id=ds_id, connection=c)
+            if base["template_id"] is not None and tid == base["template_id"] and (tver or 0) <= (base["template_version"] or 0):
+                raise Invalid(
+                    "修改报告正文时必须同步更新报告模板：请先调用 save_report_template 保存新版模板"
+                    "（若无权修改他人模板，请基于原模板另存为新模板），再传入新的 template_id 和 template_version 提交修订"
+                )
+            source = {
+                **source,
+                "template_id": tid,
+                "template_version": tver,
+                "markdown": sync_draft_json_template(source.get("markdown"), tid, tver),
+            }
+        elif template_id is not None or template_version is not None:
+            tid, tver = resolve_template_pair(
+                template_id, template_version, default_id=base["template_id"], default_version=base["template_version"],
+            )
+            ds_id = base.get("dataset_id") or base["meta"].get("dataset_id")
+            require_report_template(principal, tid, tver, dataset_id=ds_id, connection=c)
+            source = {
+                **base,
+                "template_id": tid,
+                "template_version": tver,
+                "markdown": sync_draft_json_template(base.get("markdown"), tid, tver),
+            }
+        else:
+            tid, tver = base["template_id"], base["template_version"]
+            if tid is not None:
+                c.execute("SELECT id FROM report_template.report_template WHERE id=%s FOR KEY SHARE", (tid,))
+        _insert_report_version(c, report_id, version, base_version, name, stored_html, meta, tid,
+                               tver, source, principal.emp_no, change_note)
         # 保存后让编辑者跟随最新版本，其他员工原有的选择照常保留。
         _select_report_version(c, report_id, principal.emp_no, None)
         c.execute(
             "UPDATE report.report SET name=%s, html=%s, meta=%s, template_id=%s, template_version=%s, revision=%s "
             "WHERE id=%s",
-            (name, "", db.jsonb(meta), template_id, template_version, version, report_id),
+            (name, "", db.jsonb(meta), tid, tver, version, report_id),
         )
     return {**get_report(report_id, principal, with_html=False, version=version), **report_links(report_id, version)}
 

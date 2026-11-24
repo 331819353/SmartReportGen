@@ -54,7 +54,8 @@ INSTRUCTIONS = """SmartReportGen 智能报告 MCP。用 get_skill_guide 获取�
 先区分新建与修订。修订用报告链接或 list_reports 定位，多个匹配候选先请用户确认。get_report 返回的 revision 用于 base_version，latest_version 用于 expected_version。
 新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景时，可用 list_scene_datasources 查看开放数据源与固定范围并配合 save_business_scenario 协助建场景，或给出 scenario_management_url 引导用户配置。
 已知场景后调用 prepare_report_context 获取分析思路、表画像、Markdown 指南摘要和生效样式。
-读取匹配的指南，用 run_query(snapshot=True) 取得授权快照，创建 HTML 草稿并分轮填写章节。复杂报告可在 create_html_draft 绑定数据块、配置筛选和预置有序章节槽位后并行拼装，按 diagnostics.section_ids 分派修复（详见 get_skill_guide(reference="parallel-subagents")）。
+报告模板是生成报告的必备产物：新建报告前必须先通过 save_report_template 保存模板（或确定完全复用的已有模板）并在创建草稿/保存报告时绑定 template_id 和 template_version；修改报告正文时必须同步更新对应的报告模板（save_report_template）并传入更新后的模板版本。
+读取匹配的指南，用 run_query(snapshot=True) 取得授权快照，创建 HTML 草稿并分轮填写章节。复杂报告可在 create_html_draft 绑定数据块、模板、配置筛选和预置有序章节槽位后并行拼装，按 diagnostics.section_ids 分派修复（详见 get_skill_guide(reference="parallel-subagents")）。
 默认用 save_report 或 revise_report 提交 draft_id，服务端按需运行离线 Chromium。先审阅时可调用 verify_html_draft。
 采用海尔 IAM，场景及事实来源受当前员工授权约束。"""
 
@@ -386,8 +387,9 @@ def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
             "next_offset": tables_page["next_offset"],
             "style": style,
             "templates": [_template_brief(row) for row in templates[:50]],
-            "html_assembly_hint": "用 create_html_draft 绑定数据块与 snapshot_id（可传 sections 预置有序章节槽位），"
-                                  "再分轮或并行编写章节。浏览器端通过 window.SRG.rows(blockId) 访问授权快照。",
+            "html_assembly_hint": "先确定或通过 save_report_template 保存关联本业务场景的 Markdown 报告模板（必备产物），"
+                                  "再用 create_html_draft 绑定模板（template_id、template_version）、数据块与 snapshot_id"
+                                  "（可传 sections 预置有序章节槽位），再分轮或并行编写章节。浏览器端通过 window.SRG.rows(blockId) 访问授权快照。",
         })
     except _EXPECTED as e:
         return _err(e)
@@ -610,7 +612,7 @@ def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int
                          user_requirement: str = "", analysis_goal: str = "", business_summary: str | None = None,
                          template_id: int | None = None, expected_version: int | None = None) -> dict:
     """新建或更新 Markdown 报告指南，记录可复用的取数、指标、章节、图表、联动及布局要求。
-    更新时可传 expected_version 检查并行修改。"""
+    报告模板是生成和修订报告的必备产物：新建时请传入 dataset_id 关联业务场景，更新时可传 expected_version 检查并行修改。"""
     acc = _access(ctx)
     data = {"name": name, "markdown": markdown, "user_requirement": user_requirement, "analysis_goal": analysis_goal}
     if dataset_id is not None:
@@ -638,7 +640,8 @@ def create_html_draft(title: str, ctx: Context, dataset_id: int | None = None, s
                       use_echarts: bool = True, template_id: int | None = None, template_version: int | None = None,
                       report_id: int | None = None, base_version: int | None = None,
                       sections: list[dict[str, Any]] | None = None) -> dict:
-    """创建多轮或并行拼装的 HTML 草稿。可传 sections 预置有序章节槽位，提供报告和基准版本时复用已保存的源码与快照。"""
+    """创建多轮或并行拼装的 HTML 草稿。新建报告须绑定已保存的 template_id 和 template_version；
+    可传 sections 预置有序章节槽位，提供报告和基准版本时复用已保存的源码与快照。"""
     with measure("draft.create"):
         result = report_draft.create_draft(
             title, _access(ctx).principal, dataset_id=dataset_id, snapshots=snapshots, head_css=head_css,
@@ -653,9 +656,11 @@ def create_html_draft(title: str, ctx: Context, dataset_id: int | None = None, s
 def upsert_html_section(draft_id: str, ctx: Context, section_id: str | None = None, html: str = "", title: str = "",
                         css: str = "", js: str = "", after_section_id: str | None = None, delete: bool = False,
                         sections: list[dict[str, Any]] | None = None, snapshots: dict[str, str] | None = None,
-                        head_css: str | None = None, shell_html: str | None = None, shared_js: str | None = None) -> dict:
-    """增改、移动或删除章节，可批量应用。批量元素支持 index 和显式空字符串清除字段。"""
-    owner = _access(ctx).principal.emp_no
+                        head_css: str | None = None, shell_html: str | None = None, shared_js: str | None = None,
+                        template_id: int | None = None, template_version: int | None = None) -> dict:
+    """增改、移动或删除章节，可批量应用。批量元素支持 index 和显式空字符串清除字段，也可更新草稿绑定的模板版本。"""
+    acc = _access(ctx)
+    owner = acc.principal.emp_no
     if sections is not None and section_id is not None:
         raise repo.Invalid("请使用 section_id 更新单个章节，或使用 sections 批量更新")
     if section_id is not None:
@@ -669,7 +674,9 @@ def upsert_html_section(draft_id: str, ctx: Context, section_id: str | None = No
         raise repo.Invalid("单个章节的修改须提供 section_id")
     with measure("draft.upsert"):
         result = report_draft.upsert_sections(draft_id, owner, sections or [], snapshots=snapshots, head_css=head_css,
-                                              shell_html=shell_html, shared_js=shared_js)
+                                              shell_html=shell_html, shared_js=shared_js,
+                                              template_id=template_id, template_version=template_version,
+                                              principal=acc.principal)
     return _ok({"ok": True, **result})
 
 
@@ -686,19 +693,23 @@ def get_html_draft(draft_id: str, ctx: Context, include_code: bool = False, sect
 
 @_tool()
 def verify_html_draft(ctx: Context, draft_id: str | None = None, html: str | None = None,
-                      dataset_id: int | None = None, report_id: int | None = None, base_version: int | None = None) -> dict:
+                      dataset_id: int | None = None, report_id: int | None = None, base_version: int | None = None,
+                      template_id: int | None = None, template_version: int | None = None) -> dict:
     """展开报告，使用离线 Chromium 校验，并返回可审阅和入库的预览。"""
     result = report_pipeline.verify_and_stage(_access(ctx).principal, draft_id=draft_id, html=html,
-                                               dataset_id=dataset_id, report_id=report_id, base_version=base_version)
+                                               dataset_id=dataset_id, report_id=report_id, base_version=base_version,
+                                               template_id=template_id, template_version=template_version)
     return _ok({"ok": True, **result})
 
 
 @_tool()
 def preview_report_html(html: str, ctx: Context, report_id: int | None = None,
-                        base_version: int | None = None, dataset_id: int | None = None) -> dict:
+                        base_version: int | None = None, dataset_id: int | None = None,
+                        template_id: int | None = None, template_version: int | None = None) -> dict:
     """完整 HTML 的兼容预览入口，返回通过 Chromium 校验的预览。"""
     result = report_pipeline.verify_and_stage(_access(ctx).principal, html=html, dataset_id=dataset_id,
-                                               report_id=report_id, base_version=base_version)
+                                               report_id=report_id, base_version=base_version,
+                                               template_id=template_id, template_version=template_version)
     return _ok({"ok": True, **result})
 
 
@@ -714,7 +725,8 @@ def _report_delivery(row: dict) -> dict:
 def save_report(name: str, ctx: Context, draft_id: str | None = None, preview_id: str | None = None,
                 html: str | None = None, dataset_id: int | None = None, template_id: int | None = None,
                 template_version: int | None = None) -> dict:
-    """保存草稿、通过校验的预览或完整 HTML。草稿和 HTML 按需自动完成离线 Chromium 校验。"""
+    """保存草稿、通过校验的预览或完整 HTML。必须绑定已保存的 template_id 和 template_version（可由草稿/预览继承）。
+    草稿和 HTML 按需自动完成离线 Chromium 校验。"""
     row = report_pipeline.persist_report(name, _access(ctx).principal, draft_id=draft_id, preview_id=preview_id,
                                          html=html, dataset_id=dataset_id, template_id=template_id,
                                          template_version=template_version)
@@ -732,8 +744,9 @@ def list_reports(ctx: Context, keyword: str = "", template_id: int | None = None
     return _ok({"ok": True, "reports": [
         {"report_id": r["id"], "name": r["name"], "current_version": r["current_version"],
          "latest_version": r["latest_version"], "access_level": r["access_level"],
-         "template_id": r["template_id"], "template_name": r["template_name"], "created_by": r["created_by"],
-         **repo.report_links(r["id"])} for r in rows[:50]
+         "template_id": r["template_id"], "template_version": r["template_version"],
+         "template_name": r["template_name"], "template_latest_version": r["template_latest_version"],
+         "created_by": r["created_by"], **repo.report_links(r["id"])} for r in rows[:50]
     ], "total": len(rows)})
 
 
@@ -775,10 +788,13 @@ def select_report_version(report_id: int, ctx: Context, version: int | None = No
 @_tool()
 def revise_report(report_id: int, name: str, ctx: Context, base_version: int | None = None,
                   draft_id: str | None = None, preview_id: str | None = None, html: str | None = None,
+                  template_id: int | None = None, template_version: int | None = None,
                   change_note: str = "", expected_version: int | None = None) -> dict:
-    """追加报告版本。正文支持草稿、已校验预览或完整 HTML。只改名称或说明时省略正文。"""
+    """追加报告版本。正文支持草稿、已校验预览或完整 HTML，修改正文须同步更新报告模板并绑定新版 template_id/template_version。
+    只改名称或说明时省略正文。"""
     row = services.revise_report(report_id, _access(ctx).principal, name, base_version=base_version,
                                  draft_id=draft_id, preview_id=preview_id, html=html,
+                                 template_id=template_id, template_version=template_version,
                                  change_note=change_note, expected_version=expected_version)
     return _ok({**row, **_report_delivery(row)})
 

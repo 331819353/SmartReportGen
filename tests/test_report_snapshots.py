@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
-from smartreportgen import mcp_server, report_browser, report_data, report_document, report_queries
+from smartreportgen import mcp_server, repo, report_browser, report_data, report_document, report_queries
 from smartreportgen.api import app
 from smartreportgen.auth import Principal
 from smartreportgen.config import settings
@@ -56,6 +56,15 @@ class ReportSnapshotsTest(unittest.TestCase):
         self.addCleanup(self.connector.close)
         self.enterContext(patch.object(mcp_server.services, "datasource_for_dataset", return_value=self.source))
         self.enterContext(patch.object(mcp_server.services, "get_connector", return_value=self.connector))
+        self.enterContext(patch.object(repo, "require_report_template", side_effect=self._require_template))
+
+    def _require_template(self, principal, template_id, template_version, *, dataset_id=None, connection=None):
+        if template_id is None or template_version is None:
+            raise repo.Invalid("生成或修订报告必须绑定已保存的报告模板")
+        if dataset_id is not None and dataset_id != 1:
+            raise repo.Invalid("报告模板关联的业务场景与报告业务场景不一致")
+        return {"id": template_id, "name": "快照测试模板", "dataset_id": 1,
+                "created_by": self.owner.emp_no, "version": template_version}
 
     def test_multi_table_inventory_and_join_enforce_same_scope(self):
         first = mcp_server.describe_tables(1, None, limit=1)
@@ -92,7 +101,7 @@ class ReportSnapshotsTest(unittest.TestCase):
         self.assertNotIn("rows", orders)
         draft = document(block("orders", orders["snapshot_id"]), block("targets", targets["snapshot_id"]))
         expected = report_document.enforce_offline_policy(report_data.embed(draft, self.owner.emp_no))
-        preview = mcp_server.preview_report_html(draft, None)
+        preview = mcp_server.preview_report_html(draft, None, dataset_id=1, template_id=1, template_version=1)
         self.assertTrue(preview["ok"], preview)
         self.assertNotIn("html", preview)
         self.assertNotIn(orders["snapshot_id"], expected)
@@ -156,17 +165,20 @@ class ReportSnapshotsTest(unittest.TestCase):
             document(data, '<input id="forecast" />'),
         ):
             with self.subTest(draft=draft):
-                preview = mcp_server.preview_report_html(draft, None)
-                saved = mcp_server.save_report("测试报告", None, html=draft)
+                preview = mcp_server.preview_report_html(draft, None, dataset_id=1, template_id=1, template_version=1)
+                saved = mcp_server.save_report("测试报告", None, html=draft, dataset_id=1,
+                                             template_id=1, template_version=1)
                 self.assertFalse(preview["ok"])
                 self.assertIn("数据块 id 与页面元素重复：forecast", saved["error"])
                 self.assertIn("数据块 id 与页面元素重复：forecast", preview["error"])
         # 静态 template 的普通元素不与主文档争用 id；数据块本身必须在主文档中。
         valid = document('<template><section id="forecast"></section></template>', data)
         with patch.object(report_browser, "verify_html", return_value={"status": "passed"}):
-            self.assertTrue(mcp_server.preview_report_html(valid, None)["ok"])
+            self.assertTrue(mcp_server.preview_report_html(valid, None, dataset_id=1,
+                                                           template_id=1, template_version=1)["ok"])
         inert = document(f"<template>{data}</template>")
-        self.assertIn("数据块位于 template 内", mcp_server.preview_report_html(inert, None)["error"])
+        self.assertIn("数据块位于 template 内", mcp_server.preview_report_html(
+            inert, None, dataset_id=1, template_id=1, template_version=1)["error"])
 
     def test_can_correct_an_existing_snapshot_id_conflict(self):
         # 旧报告的已内联数据仍可读出，修订时可保留数据块 id 并修正冲突元素。

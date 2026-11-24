@@ -29,7 +29,7 @@
 
 ## 3. 串行同步屏障：初始化草稿与契约（阶段 3）
 
-进入章节并行编写前，**必须由主智能体串行完成 `create_html_draft`**，并向所有章节子智能体下发统一的四项契约：
+进入章节并行编写前，**必须由主智能体先完成报告模板的读取或保存（`save_report_template`），再串行完成 `create_html_draft`（新建传入 `template_id` 和 `template_version`）**，并向所有章节子智能体下发统一的四项契约：
 
 1. **快照清单**：`snapshots` 映射的 `blockId`、工具返回的实际列名、`$decimal` 包装值及数值单位；
 2. **筛选协议**：`shared_js` 中 `SRG.filters.subscribe(state => ...)` 的状态结构（如统一筛选对象字段名与默认值）；
@@ -53,7 +53,7 @@
 - **按 `diagnostics.section_ids` 并行修复**：校验返回 `verify_failed` 时，查看当前失败阶段可归因的章节。源 HTML 和验收期间生成的重名元素 `id` 都会报告在 `diagnostics.duplicate_ids` 中：
   - 若有 ≥ 2 个非 `__shared__` 章节需修复，主智能体按 `section_id` 并行唤醒对应子智能体（可用 `get_html_draft(draft_id, include_code=true, section_id=...)` 或 `section_ids=[...]` 按需读取故障章节源码），完成后统一重跑校验；
   - 若故障涉及 `__shared__`（共享脚本或骨架），主智能体通过 `get_html_draft(draft_id, include_code=true, section_id="__shared__")` 读取并串行修复。
-- **串行入库屏障**：主智能体在章节写入和复核收敛后单次提交 `save_report` 或 `revise_report`。修订时以实际读取的 `revision` 为 `base_version`，用同时返回的 `latest_version` 作为 `expected_version` 检查其他写入者是否已更新报告。
+- **串行入库屏障**：主智能体在章节写入和复核收敛后单次提交 `save_report` 或 `revise_report`。修订正文时须同步更新对应报告模板（`save_report_template`）并在 `upsert_html_section`、`verify_html_draft` 或 `revise_report` 传入新版 `template_id`/`template_version`；同时以实际读取的 `revision` 为 `base_version`，用同时返回的 `latest_version` 作为 `expected_version` 检查其他写入者是否已更新报告。
 
 ## 6. 跨报告级端到端并行
 

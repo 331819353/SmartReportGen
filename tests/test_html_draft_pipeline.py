@@ -51,6 +51,17 @@ def facts(monkeypatch):
     monkeypatch.setattr(report_draft, "access_for", lambda principal: access)
     monkeypatch.setattr(repo, "get_dataset", lambda dataset_id: DATASET)
     monkeypatch.setattr(repo, "get_datasource", lambda source_id: SOURCE)
+
+    def _require_template(principal, template_id, template_version, *, dataset_id=None, connection=None):
+        if template_id is None or template_version is None:
+            raise repo.Invalid("生成或修订报告必须绑定已保存的报告模板")
+        if template_id != 101 or template_version != 1:
+            raise repo.NotFound("报告模板不存在")
+        if dataset_id is not None and dataset_id != 91:
+            raise repo.Invalid("报告模板关联的业务场景与报告业务场景不一致")
+        return {"id": 101, "name": "夹具模板", "dataset_id": 91, "created_by": OWNER.emp_no, "version": 1}
+
+    monkeypatch.setattr(repo, "require_report_template", _require_template)
     ref = report_data.save_query(OWNER.emp_no, ["month", "amount"], [["1月", {"$decimal": "123.45"}],
                                                                   ["2月", {"$decimal": "250.25"}]],
                                  2, origin={"scope": SCOPE})["snapshot_id"]
@@ -164,7 +175,8 @@ def test_official_metric_batch_still_uses_one_source_revision_and_authorized_ran
 
 
 def test_batch_is_atomic_and_parallel_updates_keep_order_and_isolation(facts):
-    draft_id = mcp.create_html_draft("并行更新", None, dataset_id=91, snapshots={"facts": facts[1]})["draft_id"]
+    draft_id = mcp.create_html_draft("并行更新", None, dataset_id=91, snapshots={"facts": facts[1]},
+                                     template_id=101, template_version=1)["draft_id"]
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda i: mcp.upsert_html_section(
             draft_id, None, f"s{i}", f"<h2>章节 {i}</h2>"), range(8)))
@@ -186,7 +198,8 @@ def test_batch_is_atomic_and_parallel_updates_keep_order_and_isolation(facts):
 
 @pytest.mark.usefixtures("chromium")
 def test_runtime_diagnostics_repair_and_reuse_preview(facts, monkeypatch):
-    draft_id = mcp.create_html_draft("月报", None, dataset_id=91, snapshots={"facts": facts[1]})["draft_id"]
+    draft_id = mcp.create_html_draft("月报", None, dataset_id=91, snapshots={"facts": facts[1]},
+                                     template_id=101, template_version=1)["draft_id"]
     _populate(draft_id)
     mcp.upsert_html_section(draft_id, None, "broken", "<h2>待修复</h2>", js="throw new Error('章节异常');")
     failure = mcp.save_report("月报", None, draft_id=draft_id)
@@ -217,7 +230,7 @@ def test_runtime_diagnostics_repair_and_reuse_preview(facts, monkeypatch):
     assert latest["ok"], latest
     calls = []
 
-    def save(name, html, template_id, template_version, meta, owner, *, source):
+    def save(name, html, template_id, template_version, meta, owner, *, source, principal=None):
         calls.append((meta, source))
         return {"id": 7, "revision": 1, "meta": meta, "template_id": template_id, "template_version": template_version}
 
@@ -247,7 +260,7 @@ def test_runtime_diagnostics_repair_and_reuse_preview(facts, monkeypatch):
     ('<h1>语法</h1>', 'const no = ;', "errors"),
 ])
 def test_runtime_errors_find_section_and_trigger(facts, html, js, key):
-    draft = mcp.create_html_draft("诊断", None, dataset_id=91, use_echarts=False)
+    draft = mcp.create_html_draft("诊断", None, dataset_id=91, use_echarts=False, template_id=101, template_version=1)
     mcp.upsert_html_section(draft["draft_id"], None, "target", html, js=js)
     result = mcp.verify_html_draft(None, draft_id=draft["draft_id"])
     assert not result["ok"] and result["failed_stage"] == "chromium.verify", result
@@ -281,6 +294,7 @@ def test_same_runtime_resource_failure_is_attributed_to_both_sections(facts):
                 SRG.section('{section_id}').append(img);"""}
 
     draft = mcp.create_html_draft("重复外部依赖", None, dataset_id=91, use_echarts=False,
+                                  template_id=101, template_version=1,
                                   sections=[section("first"), section("second")])
     result = mcp.verify_html_draft(None, draft_id=draft["draft_id"])
     assert result["error_type"] == "verify_failed", result
@@ -401,10 +415,38 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     }}))
     assert "## 概览" in legacy_free and "## 明细" in legacy_free
 
-    # 完整 HTML 也可用业务场景权限通过一步验收，允许简单的静态报告。
-    raw = mcp.save_report("静态说明", None, html="<!doctype html><html><head></head><body><h1>经营说明</h1></body></html>",
-                          dataset_id=dataset)
+    # 生成报告必须先保存并绑定有效的报告模板（存在、有权限且归属同一业务场景）。
+    static_html = "<!doctype html><html><head></head><body><h1>经营说明</h1></body></html>"
+    assert not mcp.create_html_draft("缺少模板", None, dataset)["ok"]
+    assert not mcp.save_report("缺少模板", None, html=static_html, dataset_id=dataset)["ok"]
+    assert not mcp.save_report("模板不存在", None, html=static_html, dataset_id=dataset,
+                               template_id=999999, template_version=1)["ok"]
+    assert not mcp.save_report("模板版本不存在", None, html=static_html, dataset_id=dataset,
+                               template_id=tpl_id, template_version=99)["ok"]
+    unbound_tpl = mcp.save_report_template("未关联场景模板", markdown, None)
+    assert unbound_tpl["ok"]
+    assert not mcp.create_html_draft("模板未关联场景", None, dataset,
+                                     template_id=unbound_tpl["template_id"], template_version=1)["ok"]
+    assert client.delete(f'/api/templates/{unbound_tpl["template_id"]}', headers=headers).status_code == 200
+    with db.conn() as conn, conn.transaction():
+        other_src = repo.get_dataset(dataset)["datasource_id"]
+        other_ds = conn.execute("INSERT INTO dataset.dataset(business_scenario,datasource_id) VALUES (%s,%s) RETURNING id",
+                                (f"other-{uuid4().hex[:6]}", other_src)).fetchone()["id"]
+        conn.execute("INSERT INTO dataset.dataset_table(dataset_id,table_name) VALUES (%s,'facts')", (other_ds,))
+        conn.execute("INSERT INTO permission.table_grant(subject_type,subject,dataset_id,table_name) "
+                     "VALUES ('employee',%s,%s,'facts')", (owner.emp_no, other_ds))
+    other_tpl = mcp.save_report_template("其他场景模板", markdown, None, other_ds)
+    assert not mcp.create_html_draft("跨场景模板", None, dataset,
+                                     template_id=other_tpl["template_id"], template_version=1)["ok"]
+    login[0] = outsider
+    assert mcp.create_html_draft("越权读取模板", None, dataset, template_id=tpl_id, template_version=1)["error_type"] == "permission_denied"
+    login[0] = owner
+
+    # 完整 HTML 也可用业务场景权限通过一步验收，允许简单的静态报告，同时必须绑定模板。
+    raw = mcp.save_report("静态说明", None, html=static_html, dataset_id=dataset,
+                          template_id=tpl_id, template_version=1)
     assert raw["ok"] and raw["verification"]["engine"] == "chromium", raw
+    assert raw["template_id"] == tpl_id and raw["template_version"] == 1
 
     ds = repo.get_dataset(dataset)
     scope = report_queries.scope_for(dataset, ds, repo.get_datasource(ds["datasource_id"]), ["facts"])
@@ -418,12 +460,16 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     saved = mcp.save_report("经营报告", None, draft_id=draft["draft_id"])
     assert saved["ok"], saved
     assert saved["version"] == 1 and "chromium.verify" in saved["timing"]["stages"]
+    assert saved["template_id"] == tpl_id and saved["template_version"] == 1
     assert any("390px" in warning for warning in saved["warnings"])
     rid = saved["report_id"]
     r1 = repo.get_report(rid, owner, version=1, with_source=True)
     assert r1["meta"]["source"] == "assembled_html"
+    assert r1["template_name"] == "经营模板" and r1["template_latest_version"] == 2
     assert "data-srg-style" in r1["html"]
     assert db.fetchone("SELECT length(html) AS size FROM report.report_version WHERE report_id=%s", (rid,))["size"] < len(r1["html"]) / 2
+    # 仍有关联报告的模板不能删除。
+    assert client.delete(f"/api/templates/{tpl_id}", headers=headers).status_code == 400
 
     repo.set_report_share(rid, owner, editor.emp_no, "edit")
     repo.set_report_share(rid, owner, viewer.emp_no, "view")
@@ -436,22 +482,65 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     edits = [edit, competing_edit]
     for draft in edits:
         mcp.upsert_html_section(draft["draft_id"], None, "overview", '<h1>修订概览</h1><output id="amount">—</output>')
-    # 独立草稿可同时验收，入库时由报告版本锁阻止同一 expected_version 被提交两次。
+    # 独立草稿可同时验收；修改正文未同步更新模板时拒绝入库，协作者无权改原模板须另存为新模板。
     with ThreadPoolExecutor(max_workers=2) as pool:
         previews = list(pool.map(lambda draft: mcp.verify_html_draft(None, draft_id=draft["draft_id"]), edits))
         assert all(preview["ok"] for preview in previews), previews
+    unsynced = mcp.revise_report(rid, "修订", None, base_version=1, draft_id=edit["draft_id"], expected_version=1)
+    assert not unsynced["ok"] and "同步更新报告模板" in unsynced["error"]
+    editor_tpl = mcp.save_report_template("协作者修订模板", markdown + "\n\n## 修订概览", None, dataset)
+    assert editor_tpl["ok"] and editor_tpl["version"] == 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
         revisions = list(pool.map(lambda draft: mcp.revise_report(
             rid, "修订", None, base_version=1, draft_id=draft["draft_id"], expected_version=1,
+            template_id=editor_tpl["template_id"], template_version=1,
         ), edits))
     assert sum(item["ok"] for item in revisions) == 1, revisions
     winner = next(i for i, item in enumerate(revisions) if item["ok"])
     edit, preview, revised = edits[winner], previews[winner], revisions[winner]
     assert revisions[1 - winner]["error_type"] == "conflict", revisions
     assert revised["ok"] and revised["version"] == 2, revised
+    assert revised["template_id"] == editor_tpl["template_id"] and revised["template_version"] == 1
     assert "chromium.verify" not in revised["timing"]["stages"]
+    r2 = repo.get_report(rid, editor, version=2, with_source=True)
+    assert r2["template_id"] == editor_tpl["template_id"] and r2["template_version"] == 1
+    r2_draft = json.loads(r2["markdown"])["smartreportgen_html_draft"]
+    assert (r2_draft["template_id"], r2_draft["template_version"]) == (editor_tpl["template_id"], 1)
 
-    # 模拟旧模板已编译的成品与其聚合数据块，修订时继续提供单独可用的旧快照查询。
+    # 先验证草稿再更新模板（Ordering B）：复用已验收预览且在入库版本及草稿 JSON 中记录新版模板。
     login[0] = owner
+    owner_edit = mcp.create_html_draft("修订同步版", None, report_id=rid, base_version=1)
+    mcp.upsert_html_section(owner_edit["draft_id"], None, "overview", '<h1>修订同步版</h1><output id="amount">—</output>')
+    owner_preview = mcp.verify_html_draft(None, draft_id=owner_edit["draft_id"])
+    assert owner_preview["ok"], owner_preview
+    tpl_v3 = mcp.save_report_template("经营模板", markdown + "\n\n## 趋势\n\n## 同步修订", None,
+                                      template_id=tpl_id, expected_version=2)
+    assert tpl_v3["ok"] and tpl_v3["version"] == 3
+    owner_rev = mcp.revise_report(rid, "修订同步版", None, base_version=1, draft_id=owner_edit["draft_id"],
+                                  expected_version=2, template_id=tpl_id, template_version=3)
+    assert owner_rev["ok"] and owner_rev["version"] == 3
+    assert owner_rev["template_id"] == tpl_id and owner_rev["template_version"] == 3
+    assert "chromium.verify" not in owner_rev["timing"]["stages"]
+    r3 = repo.get_report(rid, owner, version=3, with_source=True)
+    assert json.loads(r3["markdown"])["smartreportgen_html_draft"]["template_version"] == 3
+    versions_info = mcp.list_report_versions(rid, None)
+    assert [(v["version"], v["template_id"], v["template_version"]) for v in versions_info["versions"]] == [
+        (3, tpl_id, 3), (2, editor_tpl["template_id"], 1), (1, tpl_id, 1),
+    ]
+    listed = mcp.list_reports(None, "修订同步版")["reports"][0]
+    assert (listed["template_id"], listed["template_version"], listed["template_latest_version"]) == (tpl_id, 3, 3)
+
+    # HTTP 仅改名保留模板关联；纯元数据也可修正绑定的模板版本。
+    renamed = client.put(f"/api/reports/{rid}", headers=headers, json={
+        "name": "修订重命名", "base_version": 3, "expected_version": 3, "change_note": "改名",
+    })
+    assert renamed.status_code == 200 and renamed.json()["template_version"] == 3
+    rebound = client.put(f"/api/reports/{rid}", headers=headers, json={
+        "name": "修订重命名", "base_version": 4, "expected_version": 4, "template_id": tpl_id, "template_version": 2,
+    })
+    assert rebound.status_code == 200 and rebound.json()["template_version"] == 2
+
+    # 模拟旧模板已编译的成品与其聚合数据块，修订时继续提供单独可用的旧快照查询，并须同步更新模板。
     packed = json.dumps({"data": {"legacy_fact": {"columns": ["amount"], "rows": [[12]]}}})
     legacy_page = ("<!doctype html><html><head>"
                    """<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">"""
@@ -459,7 +548,7 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
                    f'<script id="srg-data" type="application/json" data-srg-snapshot="embedded">{packed}</script>'
                    '<script>window.legacyLoaded = true;</script><script data-srg-vendor="echarts"></script></body></html>')
     legacy_page = report_data.embed(legacy_page, owner.emp_no)
-    historic = repo.save_report("旧版", legacy_page, None, None,
+    historic = repo.save_report("旧版", legacy_page, row["id"], 1,
                                 {"source": "compiled_spec", "scopes": [scope], "dataset_id": dataset,
                                  "verification": {"status": "passed", "html_sha256": sha256(legacy_page.encode()).hexdigest()}},
                                 owner.emp_no, source={"markdown": legacy_schema, "dataset_id": dataset})
@@ -468,9 +557,39 @@ def test_postgres_templates_versions_download_merge_and_iam_rechecks(postgres):
     assert legacy["snapshots"] == {"srg-data": "base", "legacy_fact": "base"}
     mcp.upsert_html_section(legacy["draft_id"], None, "extension", "<h2>新增说明</h2>",
                             js="if (SRG.rows('legacy_fact')[0].amount !== 12 || !legacyLoaded) throw Error('基准失败')")
-    result = mcp.revise_report(legacy_id, "历史报告修订", None, 1, draft_id=legacy["draft_id"])
+    assert not mcp.revise_report(legacy_id, "历史报告修订", None, 1, draft_id=legacy["draft_id"])["ok"]
+    legacy_tpl_v2 = mcp.save_report_template("历史", guide + "\n\n## 新增说明", None, dataset, template_id=row["id"])
+    assert legacy_tpl_v2["ok"] and legacy_tpl_v2["version"] == 2
+    result = mcp.revise_report(legacy_id, "历史报告修订", None, 1, draft_id=legacy["draft_id"],
+                               template_id=row["id"], template_version=2)
     assert result["ok"] and result["version"] == 2, json.dumps(result, ensure_ascii=False)
+    assert result["template_id"] == row["id"] and result["template_version"] == 2
     assert repo.get_report(legacy_id, owner, version=1)["html"] == legacy_page
+
+    # 历史遗留无模板报告在修订正文时也必须补全绑定已保存的模板。
+    with db.conn() as conn, conn.transaction():
+        orphan_draft_json = repo.sync_draft_json_template(r1["markdown"], None, None)
+        orphan_stored_html = repo._store_report_html(conn, r1["html"])
+        orphan = conn.execute(
+            "INSERT INTO report.report(name, template_id, template_version, html, meta, created_by) "
+            "VALUES (%s, NULL, NULL, '', %s, %s) RETURNING id",
+            ("历史无模板报告", db.jsonb(r1["meta"]), owner.emp_no),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO report.report_version(report_id, version, base_version, name, html, meta, "
+            "template_id, template_version, markdown, dataset_id, source_owner, created_by) "
+            "VALUES (%s, 1, NULL, %s, %s, %s, NULL, NULL, %s, %s, %s, %s)",
+            (orphan["id"], "历史无模板报告", orphan_stored_html, db.jsonb(r1["meta"]),
+             orphan_draft_json, dataset, owner.emp_no, owner.emp_no),
+        )
+    orphan_draft = mcp.create_html_draft("补齐模板修订", None, report_id=orphan["id"], base_version=1)
+    mcp.upsert_html_section(orphan_draft["draft_id"], None, "overview",
+                            '<h1>补齐模板</h1><output id="amount">—</output>')
+    assert not mcp.revise_report(orphan["id"], "补齐模板修订", None, 1, draft_id=orphan_draft["draft_id"])["ok"]
+    orphan_fixed = mcp.revise_report(orphan["id"], "补齐模板修订", None, 1, draft_id=orphan_draft["draft_id"],
+                                     template_id=tpl_id, template_version=3)
+    assert orphan_fixed["ok"], orphan_fixed
+    assert orphan_fixed["template_id"] == tpl_id and orphan_fixed["template_version"] == 3
 
     for report_id, version in ((rid, 2), (legacy_id, 1), (legacy_id, 2)):
         download = client.get(f"/reports/{report_id}/download?version={version}", headers=headers)

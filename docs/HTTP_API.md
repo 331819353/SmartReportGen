@@ -82,7 +82,7 @@ IAM 返回 `resultCode=0` 时从 `data.access_token` 读取令牌，部分 IAM �
 
 ## 生成并下载报告
 
-报告新建从 MCP 发起。用 `prepare_report_context` 获取场景及 Markdown 指南，用 `run_query(snapshot=true)` 获取快照，用 `create_html_draft` 与 `upsert_html_section` 拼装章节。将 `draft_id` 传给 `save_report`，服务端展开为离线 HTML，通过 Chromium 后返回 `report_id`、`version` 及 `download_url`。需先审阅时，调用 `verify_html_draft` 获取 `preview_id` 和预览链接，确认后将 `preview_id` 传给 `save_report`。
+报告新建从 MCP 发起。用 `prepare_report_context` 获取场景及 Markdown 指南，先通过 `save_report_template` 保存（或选用完全匹配的已有）报告模板并绑定其 `template_id`、`template_version`，用 `run_query(snapshot=true)` 获取快照，用 `create_html_draft` 与 `upsert_html_section` 拼装章节。将 `draft_id` 传给 `save_report`，服务端校验模板对应关系并展开为离线 HTML，通过 Chromium 后返回 `report_id`、`version`、`template_id`、`template_version` 及 `download_url`。需先审阅时，调用 `verify_html_draft` 获取 `preview_id` 和预览链接，确认后将 `preview_id` 传给 `save_report`。修订正文时需同步更新模板并传入新版模板参数。
 
 用同一个 IAM 账号访问预览及报告，或使用获得报告分享及底层数据授权的账号查看已保存版本。
 
@@ -371,7 +371,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 ## 报告模板
 
-模板是 `business` 类型的 Markdown 指南。Agent 按模板版本中的取数、指标、章节、图表绑定、筛选联动和展示要求编写 HTML 草稿，并可在草稿中记录使用的模板 ID 和版本。历史声明式模板及自由版式定义在读取时转换成 Markdown，保留分析文案、绑定及 SQL、HTML/CSS 片段。历史版本的存档原文保留。
+模板是 `business` 类型的 Markdown 指南，也是生成和修订报告的必备产物。Agent 在新建报告前须保存或确认归属同一业务场景的模板，并在草稿与报告入库时绑定 `template_id` 和 `template_version`；修改报告正文时须同步更新对应模板版本。历史声明式模板及自由版式定义在读取时转换成 Markdown，保留分析文案、绑定及 SQL、HTML/CSS 片段。历史版本的存档原文保留。
 
 | 方法与路径 | 权限 | 请求与响应 |
 |---|---|---|
@@ -380,7 +380,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `GET /api/templates/{tpl_id}` | 本人或有场景权限 | 返回指南正文、概要及 `versions` |
 | `PUT /api/templates/{tpl_id}` | 创建人或管理员 | 提交 Markdown 与待更新字段。可传 `expected_version`，冲突返回 `409` |
 | `GET /api/templates/{tpl_id}/versions/{version}` | 本人或有场景权限 | 返回 `version`、`markdown`、`created_at` |
-| `DELETE /api/templates/{tpl_id}` | 创建人或管理员 | 删除模板及其历史版本，已保存报告仍可访问 |
+| `DELETE /api/templates/{tpl_id}` | 创建人或管理员 | 删除模板及其历史版本；若仍有报告关联该模板则返回 `400` 拒绝删除 |
 
 写入字段包括 `name`、`markdown`、`dataset_id`、`user_requirement`、`analysis_goal`、`business_summary`。`markdown` 必填。更新时省略可选业务字段会沿用原值，`dataset_id:null` 可解除关联。正文或模板业务字段变化时追加版本。载入历史版本的 `markdown` 再提交更新即可恢复正文。摘要包含 `title`、`sections` 和 `format:"markdown"`。
 
@@ -397,7 +397,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `GET /api/reports/{report_id}` | 本人或获分享 | 可选查询参数 `version`（正整数）、`include_html`、`include_source`（布尔值，均默认 `false`） | 报告详情与固定版本链接。按需增加 `html`（字符串）及 `markdown`（字符串或 `null`） |
 | `GET /api/reports/{report_id}/versions` | 本人或获分享 | 无额外参数 | 默认查看的版本详情（无链接字段）及 `versions` 数组，按版本号降序 |
 | `PUT /api/reports/{report_id}/selection` | 本人或获分享 | JSON 必填 `version`，正整数或 `null`。例如 `{"version":2}` | 保存当前账号的版本选择，返回所选版本详情。`{"version":null}` 恢复跟随最新。格式错误返回 `422` |
-| `PUT /api/reports/{report_id}` | 本人或获编辑权限 | JSON 必填 `name`。修改正文传其中一项 `draft_id`、`preview_id` 或 `html`。可选 `base_version`、`expected_version`、`revision`、`change_note` | 在同一报告追加版本，返回新版本详情。并发冲突返回 `409`，字段校验失败返回 `422`，内容或渲染失败返回 `400` |
+| `PUT /api/reports/{report_id}` | 本人或获编辑权限 | JSON 必填 `name`。修改正文传其中一项 `draft_id`、`preview_id` 或 `html`，且须同步更新关联模板并传入新版 `template_id`/`template_version`（或已在草稿/预览中绑定新版）。可选 `base_version`、`expected_version`、`revision`、`change_note` | 在同一报告追加版本，返回新版本详情。并发冲突返回 `409`，字段校验失败返回 `422`，内容、模板同步或渲染失败返回 `400` |
 | `DELETE /api/reports/{report_id}` | 本人 | 无额外参数 | `{"ok":true}`，删除报告及版本和分享记录 |
 | `GET /api/reports/{report_id}/shares` | 本人 | 无额外参数 | 分享对象数组，按工号升序 |
 | `GET /api/reports/{report_id}/share-recipients` | 本人 | 可选查询参数 `q`（姓名或工号，最多 100 个字符） | 最多 20 个已启用接收人，仅返回 `emp_no`、`name` |
@@ -435,14 +435,14 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 | 响应 | 字段区别 |
 |---|---|
-| 列表摘要 | 以上详情去掉 `dataset_id`、`source_available`、三个 URL 字段，增加 `template_name`、`creator_name`（均可为 `null`） |
-| 详情、编辑、版本选择 | 以上结构。仅详情 GET 可按查询参数返回 `html` 或 `markdown`。`source_available` 表示当前账号有权获取该版本保存的分块源码或历史源码。请求源码但无法提供时，`markdown` 为 `null` |
-| 版本列表 | 以上详情去掉三个 URL 字段，增加 `versions` 数组。每项含 `version`、`base_version`、`name`、`created_at`、`created_by`、`creator_name`、`change_note` |
+| 列表摘要 | 以上详情去掉 `dataset_id`、`source_available`、三个 URL 字段，增加 `template_name`、`template_latest_version`、`creator_name`（均可为 `null`） |
+| 详情、编辑、版本选择 | 以上结构（另附 `template_name`、`template_latest_version`）。仅详情 GET 可按查询参数返回 `html` 或 `markdown`。`source_available` 表示当前账号有权获取该版本保存的分块源码或历史源码。请求源码但无法提供时，`markdown` 为 `null` |
+| 版本列表 | 以上详情去掉三个 URL 字段，增加 `versions` 数组。每项含 `version`、`base_version`、`name`、`template_id`、`template_version`、`template_name`、`created_at`、`created_by`、`creator_name`、`change_note` |
 | 生成结果 | `id`、`name`、`template_id`、`template_version`、`meta`、`created_at`、`created_by`、`size`、`revision`、`latest_version`、`current_version`、`base_version`、三个 URL 字段和顶层 `warnings`。三个版本号初始为 `1`，`base_version` 为 `null`，链接省略 `version` |
 
 `revision` 是本次返回的报告版本，`base_version` 是其来源版本，`latest_version` 是报告最新版本，`current_version` 是该账号默认查看的版本，`version_selected` 表示账号是否主动固定了版本。`template_version` 是模板版本号。报告详情的三个链接均固定到本次返回的 `revision`。
 
-`size` 是已保存 HTML 的字符数，`meta.html_bytes` 是字节数。旧报告或通过 MCP 直接保存的 HTML 可能只有部分 `meta` 字段，`template_id`、`template_version`、`dataset_id`、`created_by`、`version_created_by` 可为 `null`。
+`size` 是已保存 HTML 的字符数，`meta.html_bytes` 是字节数。旧报告或早期保存记录可能只有部分 `meta` 字段，`template_id`、`template_version`、`dataset_id`、`created_by`、`version_created_by` 可为 `null`；新报告与新修订必须绑定有效的 `template_id` 和 `template_version`。
 
 `access_level` 表示当前调用者对报告的权限。`view` 可查看、下载和选择自己的版本，`edit` 还可保存新版本，`manage` 还可管理分享和删除报告，由创建人及管理员持有。
 
@@ -458,6 +458,8 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `draft_id` | 由当前账号从相同报告及基准版本创建的草稿，服务端按需校验 |
 | `html` | 完整 HTML，可用 `dataset_id` 指定场景，服务端校验后追加版本 |
 | `preview_id` | 与报告和基准版本匹配、由当前账号生成的服务端验收预览 |
+| `template_id` | 正整数，修改正文时若切换或同步更新模板，可在此指定模板 ID |
+| `template_version` | 正整数，修改正文须绑定更新后的模板版本号（或在草稿/预览中绑定） |
 | `base_version` | 可选正整数，从详情的 `revision` 读取。指定编辑使用的版本，允许从历史版本生成新版本。省略时使用个人选定版本或最新版本，旧链接默认用原快照 |
 | `expected_version` | 可选正整数，从详情的 `latest_version` 读取。传入后，如果报告在读取后产生了新版本，保存返回 `409` |
 | `revision` | 兼容旧客户端的可选正整数，同时作为 `base_version` 与 `expected_version`。传入时省略另外两个版本字段 |

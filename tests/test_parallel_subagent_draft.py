@@ -34,6 +34,7 @@ class ParallelSubagentDraftTest(unittest.TestCase):
         self.enterContext(patch.object(report_draft, "access_for", return_value=self.access))
         self.enterContext(patch.object(repo, "get_dataset", return_value=self.dataset))
         self.enterContext(patch.object(repo, "get_datasource", return_value=self.source))
+        self.enterContext(patch.object(repo, "require_report_template", side_effect=self._require_template))
         self.snapshot_id = report_data.save_query(
             self.owner.emp_no,
             ["region", "month", "amount"],
@@ -47,13 +48,27 @@ class ParallelSubagentDraftTest(unittest.TestCase):
             origin={"scope": self.scope},
         )["snapshot_id"]
 
+    def _require_template(self, principal, template_id, template_version, *, dataset_id=None, connection=None):
+        if template_id is None or template_version is None:
+            raise repo.Invalid("生成或修订报告必须绑定已保存的报告模板")
+        if dataset_id is not None and dataset_id != 1:
+            raise repo.Invalid("报告模板关联的业务场景与报告业务场景不一致")
+        return {"id": template_id, "name": "并行测试模板", "dataset_id": 1,
+                "created_by": self.owner.emp_no, "version": template_version}
+
     def test_pre_slotted_parallel_upserts_preserve_order_titles_and_scoped_reads(self):
+        missing_tpl = mcp_server.create_html_draft("无模板草稿", None, dataset_id=1, snapshots={"facts": self.snapshot_id})
+        self.assertFalse(missing_tpl["ok"])
+        self.assertIn("报告模板", missing_tpl["error"])
+
         slots = [{"section_id": f"s{i}", "title": f"第 {i} 章"} for i in range(6)]
         draft = mcp_server.create_html_draft(
             "并行槽位报告",
             None,
             dataset_id=1,
             snapshots={"facts": self.snapshot_id},
+            template_id=1,
+            template_version=1,
             shared_js="SRG.filters = { state: '华东' };",
             sections=slots,
         )
@@ -105,7 +120,8 @@ class ParallelSubagentDraftTest(unittest.TestCase):
 
         # 新建和批量更新共用保留标识规则。失败的批次不得写入前面已处理的章节。
         invalid_slots = [{"section_id": "extra"}, {"section_id": "__shared__"}]
-        invalid = mcp_server.create_html_draft("冲突槽位", None, dataset_id=1, sections=invalid_slots)
+        invalid = mcp_server.create_html_draft("冲突槽位", None, dataset_id=1, template_id=1, template_version=1,
+                                               sections=invalid_slots)
         self.assertIn("保留给页面骨架与共享脚本", invalid["error"])
         invalid = mcp_server.upsert_html_section(draft_id, None, sections=invalid_slots)
         self.assertIn("保留给页面骨架与共享脚本", invalid["error"])
@@ -123,6 +139,8 @@ class ParallelSubagentDraftTest(unittest.TestCase):
             None,
             dataset_id=1,
             snapshots={"facts": self.snapshot_id},
+            template_id=1,
+            template_version=1,
             shell_html=shell,
             sections=[
                 {
@@ -192,7 +210,7 @@ class ParallelSubagentDraftTest(unittest.TestCase):
             self.skipTest("需要部署镜像中的 Chromium")
         self.addCleanup(report_browser.close_pool)
         draft = mcp_server.create_html_draft(
-            "筛选后生成的 ID", None, dataset_id=1, use_echarts=False,
+            "筛选后生成的 ID", None, dataset_id=1, use_echarts=False, template_id=1, template_version=1,
             sections=[
                 {"section_id": "overview", "html": '<p id="total">总览</p>'},
                 {"section_id": "detail", "html": '<label>区域 <select><option>华东</option><option>华南</option></select></label>',
@@ -231,6 +249,8 @@ class ParallelSubagentDraftTest(unittest.TestCase):
             None,
             dataset_id=1,
             snapshots={"facts": self.snapshot_id},
+            template_id=1,
+            template_version=1,
             shell_html=shell,
             shared_js=shared_js,
             sections=[
@@ -313,7 +333,7 @@ class ParallelSubagentDraftTest(unittest.TestCase):
 
         persisted = []
 
-        def fake_save(name, html, template_id, template_version, meta, owner, *, source):
+        def fake_save(name, html, template_id, template_version, meta, owner, *, source, principal=None):
             persisted.append((name, html, meta, source))
             return {
                 "id": 901,

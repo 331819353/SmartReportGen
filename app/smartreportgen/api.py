@@ -852,6 +852,8 @@ class ReportUpdate(BaseModel):
     html: str | None = None
     draft_id: str | None = None
     dataset_id: int | None = Field(default=None, ge=1)
+    template_id: int | None = Field(default=None, ge=1, strict=True)
+    template_version: int | None = Field(default=None, ge=1, strict=True)
     preview_id: str | None = None
     base_version: int | None = Field(default=None, ge=1, strict=True)
     expected_version: int | None = Field(default=None, ge=1, strict=True)
@@ -904,8 +906,9 @@ def report_update(request: Request, report_id: int, data: ReportUpdate):
         raise repo.Invalid("请使用 revision，或使用 base_version 和 expected_version")
     base_version, expected = data.base_version or data.revision, data.expected_version or data.revision
     return J(services.revise_report(report_id, _p(request), data.name, html=data.html, draft_id=data.draft_id,
-                                   preview_id=data.preview_id, dataset_id=data.dataset_id, base_version=base_version,
-                                   change_note=data.change_note, expected_version=expected))
+                                   preview_id=data.preview_id, dataset_id=data.dataset_id,
+                                   template_id=data.template_id, template_version=data.template_version,
+                                   base_version=base_version, change_note=data.change_note, expected_version=expected))
 
 
 @app.get("/api/reports/{report_id}/versions")

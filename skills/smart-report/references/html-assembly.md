@@ -2,7 +2,7 @@
 
 ## 草稿和数据
 
-`create_html_draft` 的 `snapshots` 示例为 `{"summary":"<snapshot_id>","trend":"<snapshot_id>"}`。数据块 ID 由字母或下划线开头，可含数字和连字符，须与页面其他 ID 区分。修订草稿以 `base` 复用原数据，用新快照覆盖对应绑定即可换数。
+`create_html_draft` 新建报告时须同时传入已保存的 `template_id`、`template_version` 及 `dataset_id`；`snapshots` 示例为 `{"summary":"<snapshot_id>","trend":"<snapshot_id>"}`。数据块 ID 由字母或下划线开头，可含数字和连字符，须与页面其他 ID 区分。修订草稿以 `base` 复用原数据，用新快照覆盖对应绑定即可换数，并在入库前同步更新报告模板版本（传给 `create_html_draft`、`upsert_html_section`、`verify_html_draft` 或 `revise_report`）。
 
 `SRG.raw("summary")` 返回 `{columns, rows}`，`SRG.rows("summary")` 返回按列名访问的行对象。Decimal 与超出 JavaScript 安全整数范围的数据以 `{"$decimal":"原始文本"}` 保留精度。显示精确值时保留原始文本。绘图用 `SRG.num(v)` 解包为 Number，空值返回 NaN。画图时用 `null` 表示缺值。
 

@@ -67,13 +67,23 @@ def _scopes(source: str, principal, dataset_id: int | None, base: dict | None, *
     return list(scopes.values()), dataset_id
 
 
+def _check_revision_template_sync(base: dict, template_id: int | None, template_version: int | None) -> None:
+    if (base.get("template_id") is not None and template_id == base["template_id"]
+            and (template_version or 0) <= (base.get("template_version") or 0)):
+        raise repo.Invalid(
+            "修改报告正文时必须同步更新报告模板：请先调用 save_report_template 保存新版模板"
+            "（若无权修改他人模板，请基于原模板另存为新模板），再传入新的 template_id 和 template_version 提交修订"
+        )
+
+
 def _verify(principal, *, draft=None, html=None, dataset_id=None, report_id=None, base_version=None,
-            template_id=None, template_version=None) -> dict:
+            template_id=None, template_version=None, explicit_template: bool = False) -> dict:
     started = perf_counter()
     if draft:
         draft.status, draft.last_error = "verifying", None
         report_draft.record(draft, "verify_start", started)
     try:
+        explicit = explicit_template if draft is not None else (template_id is not None or template_version is not None)
         with measure("draft.load_source"):
             base = report_draft.edit_base(principal, report_id, base_version) if report_id is not None else None
             source = report_draft.assemble_source_html(draft) if draft else html
@@ -81,10 +91,17 @@ def _verify(principal, *, draft=None, html=None, dataset_id=None, report_id=None
                 raise repo.Invalid("请提交草稿 ID 或完整 HTML")
             if base:
                 dataset_id = dataset_id or base.get("dataset_id") or base["meta"].get("dataset_id")
-                if template_id is None:
-                    template_id, template_version = base.get("template_id"), base.get("template_version")
+            base_tid = base.get("template_id") if base else None
+            base_tver = base.get("template_version") if base else None
+            template_id, template_version = repo.resolve_template_pair(
+                template_id, template_version, default_id=base_tid, default_version=base_tver,
+            )
         with measure("report.scope"):
             scopes, dataset_id = _scopes(source, principal, dataset_id, base, inherit=draft is None and base is not None)
+        if report_id is None:
+            repo.require_report_template(principal, template_id, template_version, dataset_id=dataset_id)
+        elif explicit or (draft is not None and (template_id != base_tid or template_version != base_tver)):
+            repo.require_report_template(principal, template_id, template_version, dataset_id=dataset_id)
         legacy = draft.legacy_full_html if draft and not draft.shell_html else ""
         with measure("html.embed_and_check"):
             if draft:
@@ -106,9 +123,10 @@ def _verify(principal, *, draft=None, html=None, dataset_id=None, report_id=None
             evidence = report_browser.verify_html(page, expected_sections=expected, allow_shared_duplicate_ids=bool(legacy))
         with measure("preview.save"):
             evidence.update(source_sha256=_hash(source), html_sha256=_hash(page))
+            draft_json = repo.sync_draft_json_template(draft.to_source_json(), template_id, template_version) if draft else None
             proof = {"source": "assembled_html", "scopes": scopes, "verification": evidence,
                      "dataset_id": dataset_id, "template_id": template_id, "template_version": template_version,
-                     "draft_json": draft.to_source_json() if draft else None,
+                     "draft_json": draft_json,
                      "draft_id": draft.draft_id if draft else None, "draft_revision": draft.revision if draft else None}
             ref = str(report_data.save_preview(
                 principal.emp_no, page, source_html=source, proof=proof,
@@ -117,6 +135,8 @@ def _verify(principal, *, draft=None, html=None, dataset_id=None, report_id=None
             ))
             if draft:
                 draft.status = "verified"
+                if explicit:
+                    draft.template_id, draft.template_version = template_id, template_version
                 draft.last_preview_id, draft.last_verified_revision = ref, draft.revision
                 draft.last_verification = evidence
                 report_draft.record(draft, "verify_passed", started)
@@ -144,10 +164,13 @@ def _verify_draft(principal, draft, *, dataset_id=None, report_id=None, base_ver
     _check_base_match(principal, draft.report_id, draft.report_id, draft.base_version, report_id, base_version)
     if dataset_id is not None and draft.dataset_id is not None and dataset_id != draft.dataset_id:
         raise repo.Invalid("草稿与指定业务场景不一致")
+    explicit_template = template_id is not None or template_version is not None
+    tid, tver = repo.resolve_template_pair(
+        template_id, template_version, default_id=draft.template_id, default_version=draft.template_version,
+    )
     return _verify(principal, draft=draft, dataset_id=draft.dataset_id or dataset_id,
                    report_id=draft.report_id, base_version=draft.base_version,
-                   template_id=template_id if template_id is not None else draft.template_id,
-                   template_version=template_version if template_version is not None else draft.template_version)
+                   template_id=tid, template_version=tver, explicit_template=explicit_template)
 
 
 def verify_and_stage(principal, *, draft_id=None, html=None, dataset_id=None, report_id=None,
@@ -217,13 +240,32 @@ def persist_report(name, principal, *, draft_id=None, preview_id=None, html=None
                         # 临时预览失效时才重跑 Chromium。撤权、证据异常等错误直接返回。
                         pass
             if staged is None:
+                if report_id is not None:
+                    tid, tver = repo.resolve_template_pair(
+                        template_id, template_version,
+                        default_id=draft.template_id, default_version=draft.template_version,
+                    )
+                    base = report_draft.edit_base(principal, draft.report_id, draft.base_version, with_html=False)
+                    ds_id = dataset_id or draft.dataset_id or base.get("dataset_id") or base["meta"].get("dataset_id")
+                    repo.require_report_template(principal, tid, tver, dataset_id=ds_id)
+                    _check_revision_template_sync(base, tid, tver)
                 preview_id = _verify_draft(principal, draft, dataset_id=dataset_id, report_id=report_id,
-                                           base_version=base_version)["preview_id"]
+                                           base_version=base_version, template_id=template_id,
+                                           template_version=template_version)["preview_id"]
                 with measure("preview.load"):
                     staged = load_preview(principal, preview_id, certified=True)
             return _persist(name, principal, staged, report_id, base_version, expected_version, change_note,
                             dataset_id, template_id, template_version, draft)
     if html is not None:
+        if report_id is not None:
+            base = report_draft.edit_base(principal, report_id, base_version, with_html=False)
+            tid, tver = repo.resolve_template_pair(
+                template_id, template_version,
+                default_id=base.get("template_id"), default_version=base.get("template_version"),
+            )
+            ds_id = dataset_id or base.get("dataset_id") or base["meta"].get("dataset_id")
+            repo.require_report_template(principal, tid, tver, dataset_id=ds_id)
+            _check_revision_template_sync(base, tid, tver)
         preview_id = verify_and_stage(principal, html=html, dataset_id=dataset_id, report_id=report_id,
                                       base_version=base_version, template_id=template_id,
                                       template_version=template_version)["preview_id"]
@@ -255,21 +297,27 @@ def _persist(name, principal, staged, report_id, base_version, expected_version,
     _check_base_match(principal, src["report_id"], src["requested_report_id"], src["base_version"], report_id, base_version)
     if dataset_id is not None and dataset_id != proof["dataset_id"]:
         raise repo.Invalid("指定业务场景与预览不一致")
-    if template_id is None or template_id == proof["template_id"]:
-        template_id = proof["template_id"]
-        if template_version is None:
-            template_version = proof["template_version"]
+    template_id, template_version = repo.resolve_template_pair(
+        template_id, template_version,
+        default_id=proof["template_id"], default_version=proof["template_version"],
+    )
+    repo.require_report_template(principal, template_id, template_version, dataset_id=proof["dataset_id"])
+    draft_json = repo.sync_draft_json_template(proof["draft_json"], template_id, template_version)
     with measure("report.persist"):
-        source = {"markdown": proof["draft_json"], "dataset_id": proof["dataset_id"],
+        source = {"markdown": draft_json, "dataset_id": proof["dataset_id"],
                   "source_owner": principal.emp_no, "template_id": template_id, "template_version": template_version}
         meta = {k: proof[k] for k in ("source", "scopes", "verification", "dataset_id")}
         if report_id is None:
-            result = repo.save_report(name, page, template_id, template_version, meta, principal.emp_no, source=source)
+            result = repo.save_report(name, page, template_id, template_version, meta, principal.emp_no,
+                                      source=source, principal=principal)
         else:
             result = repo.update_report(src["report_id"], principal, name, page, src["base_version"],
-                                        change_note=change_note, expected_version=expected_version, rendered=(meta, source))
+                                        change_note=change_note, expected_version=expected_version,
+                                        rendered=(meta, source), template_id=template_id,
+                                        template_version=template_version)
     if draft:
         draft.status = "saved"
+        draft.template_id, draft.template_version = template_id, template_version
         draft.saved_report_id, draft.saved_version = result["id"], result["revision"]
         try:
             report_draft.record(draft, "save", started)

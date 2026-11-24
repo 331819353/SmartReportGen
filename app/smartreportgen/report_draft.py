@@ -280,12 +280,26 @@ def create_draft(title: str, principal, *, dataset_id: int | None = None, snapsh
             source["style_id"] = "base"
         source.update(dataset_id=base.get("dataset_id") or base["meta"].get("dataset_id"),
                       template_id=base.get("template_id"), template_version=base.get("template_version"))
+    resolved_tpl_id, resolved_tpl_ver = repo.resolve_template_pair(
+        template_id, template_version,
+        default_id=source.get("template_id"), default_version=source.get("template_version"),
+    )
+    resolved_dataset_id = dataset_id if dataset_id is not None else source.get("dataset_id")
+    if report_id is None:
+        tpl = repo.require_report_template(
+            principal, resolved_tpl_id, resolved_tpl_ver, dataset_id=resolved_dataset_id,
+        )
+        if resolved_dataset_id is None and tpl.get("dataset_id") is not None:
+            resolved_dataset_id = tpl["dataset_id"]
+    elif template_id is not None or template_version is not None:
+        repo.require_report_template(
+            principal, resolved_tpl_id, resolved_tpl_ver, dataset_id=resolved_dataset_id,
+        )
     draft = HtmlDraft(
         draft_id=str(uuid4()), owner=principal.emp_no, title=title.strip() or source.get("title", ""),
-        dataset_id=dataset_id if dataset_id is not None else source.get("dataset_id"),
-        template_id=template_id if template_id is not None else source.get("template_id"),
-        template_version=template_version if template_version is not None else (
-            source.get("template_version") if template_id is None or template_id == source.get("template_id") else None),
+        dataset_id=resolved_dataset_id,
+        template_id=resolved_tpl_id,
+        template_version=resolved_tpl_ver,
         report_id=report_id, base_version=base_version, style_id=style_id or source.get("style_id"),
         snapshots=restored, use_echarts=use_echarts,
         head_css=head_css or source.get("head_css", ""), shell_html=shell_html or source.get("shell_html", ""),
@@ -353,11 +367,19 @@ def _patch_section(draft: HtmlDraft, patch: dict) -> None:
 
 def upsert_sections(draft_id: str, owner: str, sections_patch: list[dict], *, snapshots: dict | None = None,
                     head_css: str | None = None, shell_html: str | None = None, shared_js: str | None = None,
-                    title: str | None = None) -> dict:
+                    title: str | None = None, template_id: int | None = None,
+                    template_version: int | None = None, principal=None) -> dict:
     started = perf_counter()
     draft_id = load_draft(owner, draft_id).draft_id
     with lock_draft(owner, draft_id):
         draft = load_draft(owner, draft_id)
+        if template_id is not None or template_version is not None:
+            tid, tver = repo.resolve_template_pair(
+                template_id, template_version,
+                default_id=draft.template_id, default_version=draft.template_version,
+            )
+            repo.require_report_template(principal, tid, tver, dataset_id=draft.dataset_id)
+            draft.template_id, draft.template_version = tid, tver
         # 批次全部通过后才写入。改动使旧预览失效，历史诊断仍可在草稿中定位。
         for patch in sections_patch:
             _patch_section(draft, patch)

@@ -145,18 +145,21 @@ def run_query(ds_row: dict, sql: str, limit: int | None = None,
 
 def revise_report(report_id: int, principal: Principal, name: str, *, base_version: int | None = None,
                   draft_id: str | None = None, preview_id: str | None = None, html: str | None = None,
-                  dataset_id: int | None = None, change_note: str = "", expected_version: int | None = None) -> dict:
+                  dataset_id: int | None = None, template_id: int | None = None, template_version: int | None = None,
+                  change_note: str = "", expected_version: int | None = None) -> dict:
     """正文修订走浏览器验收，纯元数据更新沿用原版本内容与证据。"""
     if any(item is not None for item in (draft_id, preview_id, html)):
         from . import report_pipeline
 
         return report_pipeline.persist_report(name, principal, report_id=report_id, base_version=base_version,
                                               draft_id=draft_id, preview_id=preview_id, html=html,
-                                              dataset_id=dataset_id, change_note=change_note,
+                                              dataset_id=dataset_id, template_id=template_id,
+                                              template_version=template_version, change_note=change_note,
                                               expected_version=expected_version)
     with measure("report.persist"):
         return repo.update_report(report_id, principal, name, None, base_version,
-                                  change_note=change_note, expected_version=expected_version)
+                                  change_note=change_note, expected_version=expected_version,
+                                  template_id=template_id, template_version=template_version)
 
 
 def merge_reports(principal: Principal, name: str, versions: list[tuple[int, int]]) -> str:

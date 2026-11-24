@@ -1561,7 +1561,7 @@ const Templates = {
       finally { busy.value = false; }
     }
     async function del(t) {
-      if (!await askConfirm({ title: '删除报告模板', message: `确认删除模板「${t.name}」？已生成的报告会保留。`, confirmText: '删除' })) return;
+      if (!await askConfirm({ title: '删除报告模板', message: `确认删除模板「${t.name}」？仍有关联报告的模板无法删除。`, confirmText: '删除' })) return;
       await run(() => api(`/api/templates/${t.id}`, { method: 'DELETE' }), '已删除'); load();
     }
     async function loadVer() {
@@ -1761,7 +1761,7 @@ const ReportEditor = {
         <input id="report-edit-name" class="in" v-model.trim="form.name" required :disabled="busy"></div>
       <div class="field"><label for="report-edit-note">修改说明 <small>选填</small></label>
         <input id="report-edit-note" class="in" v-model.trim="form.change_note" maxlength="500" :disabled="busy"></div>
-      <p class="field-help">正文修订可通过已接入的 AI 助手完成。</p>
+      <p class="field-help">正文修订可通过已接入的 AI 助手完成，修订正文时会同步更新关联的报告模板。</p>
       <a class="btn link" :href="preview" target="_blank" rel="noopener">打开基准版本</a>
     </form>
     <template #foot>
@@ -1823,7 +1823,7 @@ const ReportVersions = {
               <span v-if="v.version === report.revision" class="badge">正在查看</span>
               <span v-if="v.version === history.current_version && v.version !== report.revision" class="badge">当前选择</span>
               <span v-if="v.version === history.latest_version" class="small muted">最新</span></div>
-            <div class="small muted"><time :datetime="v.created_at">{{fmtTime(v.created_at)}}</time> · {{creator(v)}}<span v-if="v.base_version"> · 基于版本 {{v.base_version}}</span></div>
+            <div class="small muted"><time :datetime="v.created_at">{{fmtTime(v.created_at)}}</time> · {{creator(v)}}<span v-if="v.base_version"> · 基于版本 {{v.base_version}}</span><span v-if="v.template_id"> · 模板 {{v.template_name || ('#' + v.template_id)}}<template v-if="v.template_version"> v{{v.template_version}}</template></span></div>
             <div v-if="v.name !== report.name || v.change_note" class="report-version-note">
               <span v-if="v.name !== report.name">{{v.name}}</span><span v-if="v.name !== report.name && v.change_note"> · </span>{{v.change_note}}</div>
           </div>
@@ -1962,7 +1962,7 @@ const Reports = {
             <details v-if="r.meta?.warnings?.length" class="small report-warnings"><summary class="btn disclosure">{{r.meta.warnings.length}} 条生成提示</summary>
               <ul><li v-for="(w,i) in r.meta.warnings" :key="i">{{w}}</li></ul></details></div></div></td>
           <td><button type="button" class="btn report-version-button" :aria-label="r.name + '，当前版本 ' + r.revision + '，切换版本'" @click="versions=r">版本 {{r.revision}}</button></td>
-          <td data-label="来源模板">{{r.template_name || '—'}} <span class="badge" v-if="r.template_version">v{{r.template_version}}</span></td>
+          <td data-label="来源模板">{{r.template_name || '—'}} <span class="badge" v-if="r.template_id && r.template_version">v{{r.template_version}}</span></td>
           <td v-if="admin" data-label="创建人">{{creator(r)}}</td><td data-label="版本时间"><time :datetime="r.version_created_at">{{fmtTime(r.version_created_at)}}</time></td>
           <td class="record-actions"><div class="links"><a class="btn link" :href="reportVersionPath(r)" target="_blank" rel="noopener">查看</a><a class="btn link" :href="reportVersionPath(r, '/download')">下载 HTML</a>
             <button type="button" v-if="r.access_level !== 'view'" class="btn link" @click="editing=r">编辑</button>
