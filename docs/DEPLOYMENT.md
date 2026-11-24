@@ -261,7 +261,40 @@ server {
 
 ## 7. 内网 / 离线部署
 
-- **PyPI 镜像**：
+### 7.1 本地构建缓存（首次联网，后续优先复用本地）
+
+如果希望在目标服务器（如 `linux/amd64`）上**只联网下载一次**基础镜像、Chromium / 中文字体和 Python wheel，之后每次发版直接引用本地缓存、**仅在新增依赖包时增量联网**，可使用 `scripts/local-cache.sh`：
+
+```bash
+# 1. 首次发版（可按需指定国内 PyPI / Debian 镜像源加速首次下载）
+scripts/local-cache.sh up \
+  --pip-index https://mirrors.aliyun.com/pypi/simple/ \
+  --apt-mirror mirrors.aliyun.com
+
+# 2. 后续发版（本地底座与 wheel 已就绪：未增改依赖时 0 联网；新增包时只下新增包并自动落盘）
+git pull
+scripts/local-cache.sh up
+
+# 3. 纯离线模式（彻底断网时校验并构建；若缺少依赖或镜像直接报错提示）
+scripts/local-cache.sh up --offline
+
+# 4. 查看缓存状态 / 清理 Docker 后从本地归档恢复镜像
+scripts/local-cache.sh status
+scripts/local-cache.sh load
+```
+
+缓存默认保存在 `local-cache/`（已加入 `.gitignore`，不进 Git），按架构隔离目录结构如下：
+- `local-cache/images/<platform>/`：`python:3.12-slim`、`pgvector/pgvector:pg16`、`nginx:stable-alpine` 以及预制底座 `smartreportgen-builder-base:py3.12`、`smartreportgen-runtime-base:py3.12` 的 `.tar.gz` 归档（由 `app/Dockerfile.base` 构建）。
+- `local-cache/wheels/<platform>-py312/`：`app/requirements.txt` 及其全部传递依赖预编好的 `.whl` 文件。
+
+常用自定义选项（也可直接写入 `.env`）：
+- `LOCAL_CACHE_DIR=/data/smartreportgen-cache`（或 `--cache-dir`）：将缓存放到仓库外的固定目录，重新克隆仓库也能直接复用。
+- `--refresh-base`：仅在需要升级 Python / Chromium / 系统安全补丁时手动重建底座镜像并刷新归档。
+- `--platform linux/amd64`：跨架构预先准备缓存时显式指定目标平台（在目标服务器本机运行会自动探测当前架构）。
+
+### 7.2 传统离线迁移与 PyPI 镜像
+
+- **原生构建指定 PyPI 镜像**：
   ```bash
   docker compose build --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
   ```
@@ -303,6 +336,8 @@ git pull
 docker compose build
 docker compose up -d
 ```
+
+若启用了[第 7.1 节本地构建缓存](#71-本地构建缓存首次联网后续优先复用本地)，可直接运行 `scripts/local-cache.sh up` 替代上述两步，复用本地镜像与 wheel。
 
 表结构与数据迁移在 `api` 启动时自动、幂等执行（迁移标记记录在 `sys.setting`）。已保存的报告是 HTML 快照。需要变更时，读取所选版本，修改并验证单文件后保存新版本。
 

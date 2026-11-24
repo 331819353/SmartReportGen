@@ -2,6 +2,7 @@
 **
 !app
 !app/Dockerfile
+!app/Dockerfile.base
 !app/requirements.txt
 !app/smartreportgen
 !app/smartreportgen/**

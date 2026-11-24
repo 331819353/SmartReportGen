@@ -55,7 +55,15 @@ services:
       retries: 20
 
   api:
-    build: { context: ., dockerfile: app/Dockerfile }
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
+        BUILDER_BASE_IMAGE: ${BUILDER_BASE_IMAGE:-${BASE_IMAGE:-python:3.12-slim}}
+        RUNTIME_BASE_IMAGE: ${RUNTIME_BASE_IMAGE:-${BASE_IMAGE:-python:3.12-slim}}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_OFFLINE: ${PIP_OFFLINE:-0}
     image: smartreportgen:latest
     init: true
     restart: unless-stopped

@@ -11,6 +11,7 @@ __pycache__/
 
 # 备份与过程文件
 backup/
+local-cache/
 *.dump
 scripts/out/
 /scripts/template-editor/node_modules

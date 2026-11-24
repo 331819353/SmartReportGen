@@ -78,5 +78,6 @@ app/smartreportgen/
   static/report/            报告主题组件与历史运行时
   static/admin/             管理台（Vue 3，无构建）
 scripts/install-skill.sh    把技能安装到各 agent 的用户级技能目录（复制或软链接）
+scripts/local-cache.sh      本地保存基础镜像/底座与 wheel 缓存，支持离线优先与增量发版
 scripts/mcp_call.py         MCP 调试客户端
 ```
