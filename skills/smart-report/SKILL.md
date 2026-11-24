@@ -11,7 +11,7 @@ description: 按业务场景新建、重跑或修订经营与分析报告。通�
 
 - 新建或重跑时优先复用已有授权业务场景。场景未知时用原始需求调用 `search_business_scenarios(query, include_context=true)`。已知场景时调用 `prepare_report_context(dataset_id)`。高相关且无歧义的检索结果附相同上下文，含分析思路、授权表、行范围、官方指标、相关指南、前 10 张表的轻量画像和生效样式。
 - 修订时用链接或 `list_reports` 定位，再用 `get_report(report_id, version, include_source=true)` 读取。多个候选匹配时请用户确认。记录返回的 `revision`、`latest_version`、`template_id`、`template_version`（及 `template_latest_version`），其中 `revision` 和 `latest_version` 分别用作修订的 `base_version` 和 `expected_version`。只改名称或说明时直接调用 `revise_report`，省略正文。
-- 找不到适用场景时可换业务术语检索。需要新建场景时，提供工具返回的 `scenario_management_url`，引导用户从已开放的数据源配置。缺少所需表权限时联系管理员。
+- 找不到适用场景时可换业务术语检索。需要新建或批量配置业务场景时，可通过 `list_scene_datasources`、`list_datasource_tables` 查看可用数据源、表与字段结构，再调用 `save_business_scenario` 或 `batch_save_business_scenarios`（支持 `dry_run` 预检、按场景名 Upsert 及管理员同步配置授权）协助建场景；也可提供工具返回的 `scenario_management_url`，引导用户在管理台配置或通过 Excel 批量导入。缺少所需表权限时联系管理员。
 
 ## 2. 必备报告模板与取数
 

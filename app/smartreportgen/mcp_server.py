@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 
 from psycopg.errors import UniqueViolation
 
-from . import auth, db, design, repo, report_browser, report_data, report_draft, report_pipeline, report_queries, services
+from . import auth, db, design, repo, report_browser, report_data, report_draft, report_pipeline, report_queries, scenario_batch, services
 from .auth import AuthError, Principal
 from .config import settings
 from .connectors import ConnectorError
@@ -52,7 +52,7 @@ def _skill_body() -> str:
 
 INSTRUCTIONS = """SmartReportGen 智能报告 MCP。用 get_skill_guide 获取从报告分流到验收保存的主流程。
 先区分新建与修订。修订用报告链接或 list_reports 定位，多个匹配候选先请用户确认。get_report 返回的 revision 用于 base_version，latest_version 用于 expected_version。
-新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景时，可用 list_scene_datasources 查看开放数据源与固定范围并配合 save_business_scenario 协助建场景，或给出 scenario_management_url 引导用户配置。
+新建用 search_business_scenarios 匹配已授权场景，复用适用场景。缺少适用场景或需批量配置场景时，可用 list_scene_datasources / list_datasource_tables 查看可用数据源、物理表与字段，配合 save_business_scenario 或 batch_save_business_scenarios 单条/批量建场景，或给出 scenario_management_url 引导用户在管理台配置及通过 Excel 批量导入。
 已知场景后调用 prepare_report_context 获取分析思路、表画像、Markdown 指南摘要和生效样式。
 报告模板是生成报告的必备产物：新建报告前必须先通过 save_report_template 保存模板（或确定完全复用的已有模板）并在创建草稿/保存报告时绑定 template_id 和 template_version；修改报告正文时必须同步更新对应的报告模板（save_report_template）并传入更新后的模板版本。
 读取匹配的指南，用 run_query(snapshot=True) 取得授权快照，创建 HTML 草稿并分轮填写章节。复杂报告可在 create_html_draft 绑定数据块、模板、配置筛选和预置有序章节槽位后并行拼装，按 diagnostics.section_ids 分派修复（详见 get_skill_guide(reference="parallel-subagents")）。
@@ -258,6 +258,87 @@ def list_scene_datasources(ctx: Context) -> dict:
 
 
 @_tool()
+def list_datasource_tables(
+    datasource_id: int,
+    ctx: Context,
+    schema: str | None = None,
+    keyword: str = "",
+    include_columns: bool = False,
+    table_names: list[str] | None = None,
+) -> dict:
+    """查看数据源中当前账号可用于建场景的表或视图；管理员可浏览物理目录，可选附带前 20 张表字段结构。"""
+    try:
+        acc = _access(ctx)
+        ds_row = repo.get_datasource(datasource_id, with_secret=True)
+        if acc.all:
+            conn = services.get_connector(ds_row)
+            raw_tables = [
+                {
+                    "table_name": t["name"],
+                    "table": t.get("table"),
+                    "schema": t.get("schema"),
+                    "kind": t.get("kind", "table"),
+                    "description": t.get("comment", ""),
+                }
+                for t in conn.list_tables(schema)
+            ]
+            catalog = {}
+        else:
+            catalog = source_scene_tables(ds_row, acc.principal)
+            if not ds_row.get("enabled", True) or not catalog:
+                raise PermissionDenied(f"{acc.principal.label} 无权从该数据源（datasource_id={datasource_id}）构建业务场景")
+            raw_tables = [
+                {
+                    "table_name": name,
+                    "kind": "table",
+                    "description": entry.get("description", ""),
+                    "row_filters": entry.get("row_filters", []),
+                }
+                for name, entry in catalog.items()
+            ]
+            conn = services.get_connector(ds_row) if include_columns else None
+
+        kw = keyword.strip().casefold()
+        matched = [
+            dict(t) for t in raw_tables
+            if not kw or kw in t["table_name"].casefold() or kw in (t.get("description") or "").casefold()
+        ]
+
+        if table_names is not None:
+            wanted = list(dict.fromkeys(table_names))
+            if not acc.all:
+                for name in wanted:
+                    if name not in catalog:
+                        raise PermissionDenied(f"该表尚未授权用于创建业务场景：{name}")
+            by_raw = {t["table_name"]: t for t in matched}
+            matched = [by_raw[name] for name in wanted if name in by_raw]
+            if include_columns and acc.all and not kw:
+                for name in wanted:
+                    if name not in by_raw:
+                        matched.append({"table_name": name, "kind": "table", "description": ""})
+
+        if include_columns:
+            col_targets = [t["table_name"] for t in matched[:20]]
+            by_name = {t["table_name"]: t for t in matched}
+            for name in col_targets:
+                entry = by_name[name]
+                try:
+                    entry["columns"] = conn.cached_columns(name)
+                except ConnectorError as exc:
+                    entry["columns_error"] = str(exc)
+
+        return _ok({
+            "ok": True,
+            "datasource": {"id": ds_row["id"], "name": ds_row["name"], "type": ds_row["type"]},
+            "all_tables": acc.all,
+            "total": len(matched),
+            "tables": matched,
+        })
+    except _EXPECTED as e:
+        return _err(e)
+
+
+@_tool()
 def save_business_scenario(
     business_scenario: str,
     business_description: str,
@@ -268,10 +349,20 @@ def save_business_scenario(
     analysis_approach: str = "",
     tags: list[str] | None = None,
     semantic_metrics: dict[str, Any] | None = None,
+    grant_roles: list[str] | None = None,
+    grant_employees: list[str] | None = None,
 ) -> dict:
-    """按当前员工数据源授权新建或更新个人业务场景（含分析思路、逐表筛选和官方指标）。"""
+    """按当前员工数据源授权新建或更新业务场景（含分析思路、逐表筛选、官方指标及管理员整场景授权）。"""
     try:
         acc = _access(ctx)
+        roles_to_grant = [r.strip() for r in (grant_roles or []) if isinstance(r, str) and r.strip()]
+        emps_to_grant = [e.strip() for e in (grant_employees or []) if isinstance(e, str) and e.strip()]
+        if (roles_to_grant or emps_to_grant) and not acc.all:
+            raise PermissionDenied("仅管理员可配置场景的角色或员工授权；个人场景创建后本人自动拥有访问权限")
+        for emp_no in emps_to_grant:
+            if not db.fetchone("SELECT 1 AS x FROM permission.employee WHERE emp_no=%s", (emp_no,)):
+                raise repo.Invalid(f"工号 {emp_no} 未登记，请先在员工中添加")
+
         payload: dict[str, Any] = {
             "business_scenario": business_scenario,
             "business_description": business_description,
@@ -295,8 +386,48 @@ def save_business_scenario(
                      else repo.create_dataset(payload, acc.principal))
         except UniqueViolation as exc:
             raise repo.Invalid("业务场景名称已存在，请更换名称或传入 dataset_id 更新") from exc
+
+        grants_added = 0
+        for role in roles_to_grant:
+            grants_added += repo.add_grants(
+                {"subject_type": "role", "subject": role, "dataset_id": saved["id"], "tables": ["*"]}
+            )["added"]
+        for emp_no in emps_to_grant:
+            grants_added += repo.add_grants(
+                {"subject_type": "employee", "subject": emp_no, "dataset_id": saved["id"], "tables": ["*"]}
+            )["added"]
+
         refreshed = access_for(acc.principal)
-        return _ok({"ok": True, **_dataset_brief(saved, refreshed)})
+        out = {"ok": True, **_dataset_brief(saved, refreshed)}
+        if roles_to_grant or emps_to_grant:
+            out["grants_added"] = grants_added
+        return _ok(out)
+    except _EXPECTED as e:
+        return _err(e)
+
+
+@_tool()
+def batch_save_business_scenarios(
+    scenarios: list[dict[str, Any]],
+    ctx: Context,
+    mode: Literal["upsert", "create_only"] = "upsert",
+    dry_run: bool = False,
+) -> dict:
+    """批量校验并新建或更新业务场景（支持按场景名 Upsert、only-create 与 dry_run 预检）。
+    每项可传 business_scenario、business_description、datasource_id 或 datasource_name、
+    tables（含 table_name、table_description、row_filters；row_filters 支持对象数组或 `列=值1,值2` 简明文本）、
+    可选 dataset_id、analysis_approach、tags、enabled、semantic_metrics；
+    管理员还可传 grant_roles、grant_employees 或 grants 同步配置场景访问授权。"""
+    try:
+        acc = _access(ctx)
+        res = scenario_batch.batch_save_scenarios(scenarios, acc.principal, mode=mode, dry_run=dry_run)
+        if not dry_run and not res["ok"]:
+            return _ok({
+                **res,
+                "error_type": "validation_failed",
+                "error": f"批量配置校验未通过（共 {res['summary']['error_count']} 处错误），未写入任何场景",
+            })
+        return _ok(res)
     except _EXPECTED as e:
         return _err(e)
 

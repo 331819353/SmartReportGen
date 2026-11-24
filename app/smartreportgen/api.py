@@ -14,7 +14,7 @@ from typing import Literal
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.openapi.utils import get_openapi
@@ -25,7 +25,7 @@ from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from . import auth, db, design, embedding, iam, permission, repo, report_browser, report_data, report_draft, report_pipeline, seed, services
+from . import auth, db, design, embedding, iam, permission, repo, report_browser, report_data, report_draft, report_pipeline, scenario_batch, seed, services
 from .config import settings
 from .connectors import ConnectorError, get_connector
 from .report_document import inline_legacy_echarts, skill_dir
@@ -168,8 +168,8 @@ async def auth_middleware(request: Request, call_next):
 USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("GET", r"^/api/meta$"),
     ("GET", r"^/api/datasources(/\d+(/tables|/columns|/values)?)?$"),
-    ("GET", r"^/api/datasets(/search|/\d+)?$"), ("GET", r"^/api/scenarios$"),
-    ("POST", r"^/api/datasets$"), ("PUT", r"^/api/datasets/\d+$"), ("DELETE", r"^/api/datasets/\d+$"),
+    ("GET", r"^/api/datasets(/search|/template|/export|/\d+)?$"), ("GET", r"^/api/scenarios$"),
+    ("POST", r"^/api/datasets(/import|/batch)?$"), ("PUT", r"^/api/datasets/\d+$"), ("DELETE", r"^/api/datasets/\d+$"),
     ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
     ("POST", r"^/api/style-rules(/effective|/preview)?$"), ("PUT", r"^/api/style-rules/\d+$"),
     ("DELETE", r"^/api/style-rules/\d+$"),
@@ -658,6 +658,70 @@ def dataset_search(request: Request, q: str, top_k: int = 5):
 def dataset_reindex(request: Request):
     _require_admin(request)
     return J(repo.reindex_all())
+
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _xlsx_attachment(content: bytes, name: str) -> Response:
+    fname = quote(f"{name}.xlsx", safe="")
+    return Response(
+        content,
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}", "Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/datasets/template")
+def dataset_template(request: Request):
+    return _xlsx_attachment(scenario_batch.build_template_xlsx(_p(request)), "业务场景导入模板")
+
+
+@app.get("/api/datasets/export")
+def dataset_export(request: Request, q: str | None = None, ids: str | None = None):
+    parsed_ids: list[int] | None = None
+    if ids is not None and ids.strip():
+        parts = [p.strip() for p in ids.split(",") if p.strip()]
+        if not parts or any(not p.isdigit() or int(p) < 1 for p in parts):
+            raise repo.Invalid("ids 须为逗号分隔的正整数")
+        parsed_ids = [int(p) for p in parts]
+    return _xlsx_attachment(scenario_batch.export_scenarios_xlsx(_p(request), q=q, ids=parsed_ids), "业务场景导出")
+
+
+@app.post("/api/datasets/import")
+async def dataset_import(
+    request: Request,
+    file: UploadFile = File(...),
+    dry_run: bool = Query(False),
+    mode: Literal["upsert", "create_only"] = Query("upsert"),
+):
+    raw = await file.read(scenario_batch.MAX_EXCEL_BYTES + 1)
+    res = await run_in_threadpool(
+        scenario_batch.import_scenarios_xlsx, raw, _p(request), mode=mode, dry_run=dry_run
+    )
+    if not dry_run and not res["ok"]:
+        return JSONResponse(
+            jsonable_encoder({"detail": f"批量导入校验未通过（共 {res['summary']['error_count']} 处错误）", **res}),
+            status_code=400,
+        )
+    return J(res)
+
+
+@app.post("/api/datasets/batch")
+async def dataset_batch(request: Request, data: dict = Body(...)):
+    mode = data.get("mode", "upsert")
+    dry_run = data.get("dry_run", False)
+    if type(dry_run) is not bool:
+        raise repo.Invalid("dry_run 须为布尔值")
+    res = await run_in_threadpool(
+        scenario_batch.batch_save_scenarios, data.get("scenarios"), _p(request), mode=mode, dry_run=dry_run
+    )
+    if not dry_run and not res["ok"]:
+        return JSONResponse(
+            jsonable_encoder({"detail": f"批量保存校验未通过（共 {res['summary']['error_count']} 处错误）", **res}),
+            status_code=400,
+        )
+    return J(res)
 
 
 @app.get("/api/datasets/{dataset_id}")

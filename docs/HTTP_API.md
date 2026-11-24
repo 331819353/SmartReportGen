@@ -328,6 +328,10 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `PUT /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`。JSON 传要修改的字段，传入 `tables` 时整体替换，个人场景至少保留一张可引用的表 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
 | `DELETE /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true}`，删除场景及其表清单和授权，已关联的模板解除场景关联 |
 | `GET /api/datasets/search` | 登录 | 必填查询参数 `q` 为业务需求，可选整数 `top_k`，默认 5 | 混合检索结果，见下方。仅检索启用场景，普通用户限已授权场景 |
+| `GET /api/datasets/template` | 登录 | 无 | 下载 `.xlsx` 批量导入模板（含 `业务场景`、`场景数据表`、`官方指标` 表头及当前账号可用数据源清单） |
+| `GET /api/datasets/export` | 登录 | 可选查询参数 `q`、`ids`（逗号分隔正整数） | 下载 `.xlsx` 场景导出文件。管理员导出全部匹配场景，普通用户导出本人创建的个人场景 |
+| `POST /api/datasets/import` | 登录 | `multipart/form-data` 上传 `file`（`.xlsx`，最大 5 MB）；可选查询参数 `dry_run`（默认 `false`）、`mode`（`upsert` 或 `create_only`） | 批量预检或导入结果（含 `ok`、`summary`、`items`、`errors`）。`dry_run=false` 且校验失败返回 `400` |
+| `POST /api/datasets/batch` | 登录 | JSON 传 `scenarios`（1–200 项），可选 `mode`（`upsert` 或 `create_only`）、`dry_run`（布尔值） | 同 `/api/datasets/import` |
 | `POST /api/datasets/reindex` | 管理员 | 无 | 如 `{"datasets":3,"style_rules":2,"not_vectorized":0}`，前两项为重建索引的记录数，末项为操作后仍无向量的记录数 |
 | `GET /api/scenarios` | 登录 | 无 | 场景名称字符串数组，如 `["客服工单分析"]`。管理员见全部，普通用户限启用且已授权的场景 |
 
@@ -368,6 +372,34 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 **混合检索结果**
 
 返回 `query_tokens`（分词字符串数组）、`hits`（命中数组）、`warnings`（字符串数组，向量不可用时说明关键词降级）。每个命中有 `id`、`rrf`（融合排序分）、`relevance`（0–1）、`dataset`（上述场景详情）。有向量命中时附 `vector_score` 和 `vector_rank`，有关键词命中时附 `keyword_score`、`keyword_rank` 和 `matched_terms`（字符串数组）。排名从 1 开始，结果按 `rrf` 降序。无命中时 `hits:[]`。
+
+**批量导入与 Excel 工作表说明**
+
+`/api/datasets/template` 与 `/api/datasets/export` 返回统一结构的 `.xlsx` 工作簿，包含 `业务场景`、`场景数据表`、`官方指标` 三张数据表（模板另附 `填写说明` 表及当前账号可用数据源参考）。
+
+- `业务场景`：`业务场景*`、`数据源*`（名称或 ID）、`业务描述*`、`分析思路`、`标签`（逗号分隔）、`启用`（`是`/`否`）、`授权角色`、`授权工号`（仅管理员可填写整场景授权列）。
+- `场景数据表`：`业务场景*`、`表名*`、`表描述`、`行过滤条件`（支持 JSON 数组，或 `region=华东,华南,NULL; status=1` 简明写法；导出时固定输出紧凑 JSON 以保证无损往返）。
+- `官方指标`：`业务场景*`、`指标标识*`、`所属表*`、`公式类型*`、`主字段/分子*`、`分母字段`、`允许分组维度`、`允许过滤维度`、`比例尺度`、`说明`、`高级条件JSON`。
+
+`POST /api/datasets/batch` 支持直接传入 JSON 数组批量校验并写入，单批最多 200 个场景。任一场景校验失败或存在孤立子表行时整批不写入数据库：
+
+```json
+{
+  "mode": "upsert",
+  "dry_run": false,
+  "scenarios": [
+    {
+      "business_scenario": "客服工单分析",
+      "datasource_name": "客服工单接口",
+      "business_description": "跟踪工单量、处理时长与超时情况。",
+      "tables": [{"table_name": "tickets", "row_filters": "status=已解决"}],
+      "grant_roles": ["user"]
+    }
+  ]
+}
+```
+
+成功或 `dry_run=true` 返回 `{"ok":true,"dry_run":false,"mode":"upsert","summary":{"total":1,"create_count":1,"update_count":0,"error_count":0,"warning_count":0,"grants_added":1},"items":[...],"errors":[]}`。
 
 ## 报告模板
 

@@ -14,7 +14,12 @@ function toast(msg, kind = '') {
 }
 async function api(path, opts = {}) {
   const init = { method: opts.method || 'GET', headers: {}, credentials: 'same-origin', signal: opts.signal };
-  if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
+  if (opts.body instanceof FormData) {
+    init.body = opts.body;
+  } else if (opts.body !== undefined) {
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(opts.body);
+  }
   const r = await fetch(appPath(path), init);
   if (r.ok && opts.download) return r.blob();
   const ct = r.headers.get('content-type') || '';
@@ -22,9 +27,17 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     const msg = (data && data.detail) ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : String(data).slice(0, 300);
     if (r.status === 401 && !path.startsWith('/api/auth/')) state.needLogin = true;
-    throw Object.assign(new Error(msg), { status: r.status });
+    throw Object.assign(new Error(msg), { status: r.status, data });
   }
   return data;
+}
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 async function run(fn, okMsg) {
   try { const r = await fn(); if (okMsg) toast(okMsg, 'ok'); return r; } catch (e) { toast(e.message, 'err'); throw e; }
@@ -105,6 +118,8 @@ const ICONS = {
   menu: '<path d="M3 5h14M3 10h14M3 15h14"/>',
   close: '<path d="m5 5 10 10M5 15 15 5"/>',
   check: '<path d="m4 10 4 4 8-8"/>',
+  upload: '<path d="M10 13V4m-3.5 3.5L10 4l3.5 3.5M4 13.5v2a1.5 1.5 0 0 0 1.5 1.5h9a1.5 1.5 0 0 0 1.5-1.5v-2"/>',
+  download: '<path d="M10 4v9m-3.5-3.5L10 13l3.5-3.5M4 13.5v2a1.5 1.5 0 0 0 1.5 1.5h9a1.5 1.5 0 0 0 1.5-1.5v-2"/>',
   alert: '<path d="M9.1 3.7 2.7 15a1 1 0 0 0 .9 1.5h12.8a1 1 0 0 0 .9-1.5L10.9 3.7a1 1 0 0 0-1.8 0Z"/><path d="M10 8v3.5m0 2.2h.01"/>'
 };
 const icon = k => `<svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICONS[k]}</svg>`;
@@ -645,7 +660,7 @@ const Datasets = {
   components: { Drawer, SceneFilterValues },
   template: `<div>
     <div class="page-head"><div><h1>业务场景</h1><p>按业务主题找数据，查看每个场景可用于分析的数据表。</p></div>
-      <div class="actions"><button type="button" v-if="admin" class="btn" @click="reindex">重建检索索引</button><button type="button" class="btn primary" @click="edit()">新建业务场景</button></div></div>
+      <div class="actions"><button type="button" v-if="admin" class="btn" @click="reindex">重建检索索引</button><button type="button" class="btn" @click="exportExcel"><span class="ico" v-html="icon('download')"></span>导出 Excel</button><button type="button" class="btn" @click="openImport"><span class="ico" v-html="icon('upload')"></span>Excel 批量导入</button><button type="button" class="btn primary" @click="edit()">新建业务场景</button></div></div>
     <section class="card list-panel" aria-label="业务场景列表" :aria-busy="loading">
       <div class="list-tools">
         <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索业务场景、描述或标签" aria-label="搜索业务场景"></label>
@@ -813,6 +828,63 @@ const Datasets = {
       <div v-if="saveError" class="msg err" role="alert">{{saveError}}</div>
       <template #foot><button class="btn" type="button" @click="closeForm" :disabled="busy">取消</button><button class="btn primary" type="button" @click="save" :disabled="busy">{{busy ? '正在保存…' : '保存业务场景'}}</button></template>
     </Drawer>
+    <Drawer v-if="imp.open" title="Excel 批量导入业务场景" wide :busy="imp.busy" :backdrop-close="false" @close="closeImport">
+      <div class="scene-import-bar">
+        <p class="field-help">请使用标准导入模板（或导出已有场景修改），上传 <span class="mono">.xlsx</span> 后将先执行全量预检。</p>
+        <div class="actions">
+          <button type="button" class="btn sm" :disabled="imp.busy" @click="downloadTemplate"><span class="ico" v-html="icon('download')"></span>下载导入模板</button>
+          <button type="button" class="btn sm" :disabled="imp.busy" @click="exportExcel"><span class="ico" v-html="icon('download')"></span>导出已有场景</button>
+        </div>
+      </div>
+      <div class="scene-import-controls">
+        <div class="seg" role="group" aria-label="导入模式">
+          <button type="button" class="btn toggle" :disabled="imp.busy" :aria-pressed="imp.mode === 'upsert'" @click="switchImportMode('upsert')">同名更新（Upsert）</button>
+          <button type="button" class="btn toggle" :disabled="imp.busy" :aria-pressed="imp.mode === 'create_only'" @click="switchImportMode('create_only')">仅新增（同名报错）</button>
+        </div>
+        <div class="scene-import-file">
+          <input ref="importFileInput" type="file" accept=".xlsx" class="sr-only-file" @change="onImportFileChange">
+          <button type="button" class="btn" :disabled="imp.busy" @click="pickImportFile"><span class="ico" v-html="icon('upload')"></span>{{imp.file ? '重新选择文件' : '选择 .xlsx 文件'}}</button>
+          <span class="mono small muted" v-if="imp.file">{{imp.file.name}}</span>
+          <span class="small muted" v-else>未选择文件（最大 5 MB，单批最多 200 个场景）</span>
+        </div>
+      </div>
+      <div v-if="imp.error" class="msg err" role="alert">{{imp.error}}</div>
+      <div v-if="imp.busy && !imp.preview" class="collection-state" role="status">正在解析并预检 Excel…</div>
+      <div v-if="imp.preview" class="scene-import-preview" aria-live="polite">
+        <div class="msg" :class="imp.preview.ok ? (imp.preview.summary.warning_count ? 'warn' : 'ok') : 'err'">
+          <template v-if="imp.preview.ok">预检通过：共 {{imp.preview.summary.total}} 个场景（新增 {{imp.preview.summary.create_count}}，更新 {{imp.preview.summary.update_count}}<template v-if="imp.preview.summary.warning_count">，告警 {{imp.preview.summary.warning_count}}</template>）。</template>
+          <template v-else>预检未通过：共 {{imp.preview.summary.total}} 个场景，发现 {{imp.preview.summary.error_count}} 处错误，请修正后重新上传。</template>
+        </div>
+        <div v-if="workbookErrors.length" class="msg err" role="alert">
+          <div v-for="(err, idx) in workbookErrors" :key="idx">{{err.message}}</div>
+        </div>
+        <div v-if="imp.preview.items.length" class="scroll-x table-well" tabindex="0" aria-label="导入预检明细">
+          <table class="tbl scene-import-table">
+            <thead><tr><th scope="col">行号</th><th scope="col">业务场景</th><th scope="col">操作</th><th scope="col">数据源</th><th scope="col">数据表</th><th scope="col">官方指标</th><th v-if="admin" scope="col">授权</th><th scope="col">校验说明</th></tr></thead>
+            <tbody>
+              <tr v-for="item in imp.preview.items" :key="item.index">
+                <td class="mono">{{item.row}}</td>
+                <td><b>{{item.business_scenario || '—'}}</b></td>
+                <td><span class="badge" :class="item.action === 'create' ? 'green' : item.action === 'update' ? 'blue' : 'red'">{{item.action === 'create' ? '新增' : item.action === 'update' ? '更新' : '错误'}}</span></td>
+                <td>{{item.datasource_name || '—'}}</td>
+                <td class="mono">{{item.table_count}} 张</td>
+                <td class="mono">{{item.metric_count}} 项</td>
+                <td v-if="admin" class="small">{{formatImportGrants(item.grants)}}</td>
+                <td class="small">
+                  <div v-for="(err, ei) in item.errors" :key="'e' + ei" class="scene-import-err">{{err}}</div>
+                  <div v-for="(warn, wi) in item.warnings" :key="'w' + wi" class="scene-import-warn">{{warn}}</div>
+                  <span v-if="!item.errors.length && !item.warnings.length" class="muted">正常</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <template #foot>
+        <button class="btn" type="button" @click="closeImport" :disabled="imp.busy">取消</button>
+        <button class="btn primary" type="button" @click="confirmImport" :disabled="imp.busy || !imp.preview?.ok || !imp.preview?.summary?.total">{{imp.busy ? '正在导入…' : '确认导入'}}</button>
+      </template>
+    </Drawer>
   </div>`,
   setup() {
     const scenes = useCollection('/api/datasets');
@@ -949,10 +1021,74 @@ const Datasets = {
       if (rule.column !== column) { rule.column = column; rule.values = []; }
     }
     function addRule(t) { t.row_filters.push({ column: '', values: [] }); }
+    const importFileInput = ref(null);
+    const imp = reactive({ open: false, busy: false, mode: 'upsert', file: null, preview: null, error: '' });
+    const workbookErrors = computed(() => (imp.preview?.errors || []).filter(e => e.row === null));
+    function formatImportGrants(grants = []) {
+      if (!grants.length) return '—';
+      return grants.map(g => `${g.subject_type === 'role' ? '角色' : '工号'}:${g.subject}`).join('、');
+    }
+    function openImport() {
+      Object.assign(imp, { open: true, busy: false, mode: 'upsert', file: null, preview: null, error: '' });
+    }
+    function closeImport() {
+      if (!imp.busy) imp.open = false;
+    }
+    async function downloadTemplate() {
+      const blob = await run(() => api('/api/datasets/template', { download: true }));
+      triggerDownload(blob, '业务场景导入模板.xlsx');
+    }
+    async function exportExcel() {
+      const blob = await run(() => api('/api/datasets/export', { download: true }));
+      triggerDownload(blob, '业务场景导出.xlsx');
+    }
+    function pickImportFile() { importFileInput.value?.click(); }
+    function onImportFileChange(event) {
+      const file = event.target?.files?.[0];
+      if (event.target) event.target.value = '';
+      if (!file) return;
+      imp.file = file;
+      runImport(true);
+    }
+    function switchImportMode(mode) {
+      if (imp.busy || imp.mode === mode) return;
+      imp.mode = mode;
+      if (imp.file) runImport(true);
+    }
+    async function runImport(dryRun) {
+      if (!imp.file || imp.busy) return;
+      imp.busy = true;
+      imp.error = '';
+      if (dryRun) imp.preview = null;
+      try {
+        const body = new FormData();
+        body.append('file', imp.file);
+        const res = await api(`/api/datasets/import?dry_run=${dryRun ? 'true' : 'false'}&mode=${encodeURIComponent(imp.mode)}`, {
+          method: 'POST',
+          body,
+        });
+        if (dryRun) {
+          imp.preview = res;
+        } else {
+          const s = res.summary;
+          toast(`导入成功：新增 ${s.create_count}，更新 ${s.update_count}${s.grants_added ? '，授权 ' + s.grants_added + ' 条' : ''}`, 'ok');
+          imp.open = false;
+          load();
+        }
+      } catch (e) {
+        if (e.data && Array.isArray(e.data.items)) imp.preview = e.data;
+        imp.error = e.message;
+      } finally {
+        imp.busy = false;
+      }
+    }
+    function confirmImport() { runImport(false); }
     return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
       picker, pickKw, pickShown, pickLoading, pickError, edit, closeForm, save, del, search, reindex, pick, has, togglePick,
       addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule,
       switchMetricsMode, onMetricOpChange, addMetric, METRIC_OPS, BINARY_METRIC_OPS, RATIO_METRIC_OPS,
+      importFileInput, imp, workbookErrors, formatImportGrants, openImport, closeImport, downloadTemplate, exportExcel,
+      pickImportFile, onImportFileChange, switchImportMode, confirmImport,
       filterValueLabel, DS_LABEL, OBJECT_LABEL, icon, appPath, hasMine: computed(canVisitMine) };
   }
 };

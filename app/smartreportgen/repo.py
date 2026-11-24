@@ -197,6 +197,42 @@ def reindex_dataset(dataset_id: int) -> None:
     )
 
 
+def reindex_datasets(dataset_ids: list[int]) -> None:
+    """批量重建指定业务场景的关键词与向量索引（先统一加词，再一次分词与批量向量化）。"""
+    ids = list(dict.fromkeys(int(i) for i in dataset_ids))
+    if not ids:
+        return
+    rows = db.fetchall("SELECT * FROM dataset.dataset WHERE id = ANY(%s) ORDER BY id", (ids,))
+    if not rows:
+        return
+    table_rows = db.fetchall(
+        "SELECT * FROM dataset.dataset_table WHERE dataset_id = ANY(%s) ORDER BY dataset_id, sort, id",
+        (ids,),
+    )
+    tables_by_ds: dict[int, list[dict]] = {}
+    for t in table_rows:
+        tables_by_ds.setdefault(t["dataset_id"], []).append(t)
+    words: list[str] = []
+    for ds in rows:
+        metric_words = [w for k in (ds.get("semantic_metrics") or {}) for w in (k, k.replace("_", " "))]
+        words.extend([ds["business_scenario"], *(ds.get("tags") or []), *metric_words])
+    add_words(words)
+    indices = [(ds, _dataset_index(ds, tables_by_ds.get(ds["id"], []))) for ds in rows]
+    try:
+        vectors = [to_pgvector(v) for v in embed_many([idx["text"] for _, idx in indices])]
+    except EmbeddingError as e:
+        log.error("批量向量化失败（相关记录仅可被关键词检索命中）: %s", e)
+        vectors = [None] * len(indices)
+    sig = _dataset_index_signature()
+    with db.conn() as c, c.transaction():
+        for (ds, idx), vec in zip(indices, vectors):
+            c.execute(
+                "UPDATE dataset.dataset SET kw_a=%s, kw_b=%s, kw_c=%s, kw_all=%s, embedding=%s::vector, embedding_sig=%s "
+                "WHERE id=%s",
+                (idx["kw_a"], idx["kw_b"], idx["kw_c"], idx["kw_all"], vec, sig if vec else None, ds["id"]),
+            )
+
+
 def _dataset_index_signature() -> str:
     # 分析思路、指标描述与同义词规则纳入索引后，启动时补齐已有场景。
     return f"{settings.embedding_signature}:scenario-v2"
