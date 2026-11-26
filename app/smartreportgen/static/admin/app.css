@@ -982,6 +982,42 @@ pre.block + .actions { margin-top: 14px; }
 .scene-import-table td { vertical-align: top; }
 .scene-import-err { color: var(--danger); }
 .scene-import-warn { color: var(--warn); }
+.scene-md-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  border-radius: 13px;
+  background: var(--surface-2);
+  box-shadow: var(--nm-inset-sm);
+}
+.scene-md-meta { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.scene-md-meta b { overflow-wrap: anywhere; }
+.scene-md-preview {
+  padding: 18px 20px;
+  border-radius: 14px;
+  border: 1px solid var(--rim-light);
+  background: var(--surface-raised);
+  box-shadow: var(--nm-raised-sm);
+  max-height: 62vh;
+  overflow: auto;
+}
+.scene-md-raw {
+  margin: 0;
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: var(--surface-2);
+  box-shadow: var(--nm-inset);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 62vh;
+  overflow: auto;
+}
 
 /* 阅读与编辑共享文档宽度，目录根据屏幕宽度从左栏移到正文上方。 */
 .template-workhead { align-items: center; margin-bottom: 18px; }

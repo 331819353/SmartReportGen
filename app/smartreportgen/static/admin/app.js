@@ -677,10 +677,10 @@ const Datasets = {
       <div v-else class="scroll-x" tabindex="0" aria-label="业务场景表格">
         <table class="tbl record-table scene-table" role="table"><thead><tr><th scope="col">业务场景</th><th scope="col">分析范围</th><th scope="col">数据表</th><th v-if="admin" scope="col">状态</th><th scope="col">操作</th></tr></thead>
           <tbody><tr v-for="d in shown" :key="d.id">
-            <td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div></td>
+            <td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div><div class="small muted mono" v-if="d.analysis_file_name">{{d.analysis_file_name}}</div></td>
             <td class="scene-description"><div class="clip">{{d.business_description || '—'}}</div></td><td data-label="数据表">{{d.table_count}} 张</td>
             <td v-if="admin" data-label="状态"><span class="badge" :class="!d.enabled ? '' : d.vectorized ? 'green' : 'amber'">{{!d.enabled ? '停用' : d.vectorized ? '可用' : '索引待更新'}}</span></td>
-            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(d)">查看场景</button><template v-if="admin || d.read_only === false"><button type="button" class="btn link" @click="edit(d)">编辑</button><button type="button" class="btn link danger" @click="del(d)">删除</button></template></div></td>
+            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(d)">查看场景</button><button v-if="admin || d.read_only === false || d.analysis_file_name" type="button" class="btn link" @click="openAnalysisFile(d)">{{d.analysis_file_name ? '分析思路文件' : '添加分析思路'}}</button><template v-if="admin || d.read_only === false"><button type="button" class="btn link" @click="edit(d)">编辑</button><button type="button" class="btn link danger" @click="del(d)">删除</button></template></div></td>
           </tr></tbody>
         </table>
       </div>
@@ -708,6 +708,7 @@ const Datasets = {
     <Drawer v-if="detail" :title="detail.business_scenario" @close="detail=null">
       <dl class="kv"><dt>业务描述</dt><dd class="business-copy">{{detail.business_description}}</dd>
         <dt>分析思路</dt><dd class="business-copy">{{detail.analysis_approach || '暂未填写'}}</dd>
+        <dt v-if="detail.analysis_file_name">分析思路文件</dt><dd v-if="detail.analysis_file_name"><span class="mono">{{detail.analysis_file_name}}</span> <button type="button" class="btn link" @click="openAnalysisFile(detail)">预览文件</button></dd>
         <dt>标签</dt><dd>{{(detail.tags||[]).join('、') || '-'}}</dd>
         <dt>数据源</dt><dd>{{detail.datasource_name}}（{{DS_LABEL[detail.datasource_type]}}）</dd></dl>
       <h4 style="margin:16px 0 8px">表和视图 <small class="muted" v-if="!admin">（仅显示你有权限的对象）</small></h4>
@@ -885,6 +886,50 @@ const Datasets = {
         <button class="btn primary" type="button" @click="confirmImport" :disabled="imp.busy || !imp.preview?.ok || !imp.preview?.summary?.total">{{imp.busy ? '正在导入…' : '确认导入'}}</button>
       </template>
     </Drawer>
+    <Drawer v-if="analysisDoc.open" :title="'分析思路文件 · ' + analysisDoc.scenarioName" wide :busy="analysisDoc.busy" @close="closeAnalysisFile">
+      <input ref="analysisFileInput" type="file" accept=".md,text/markdown" class="sr-only-file" @change="onAnalysisFileChange">
+      <div v-if="analysisDoc.loading" class="collection-state" role="status">正在读取分析思路文件…</div>
+      <div v-else-if="analysisDoc.error && !analysisDoc.fileName" class="msg err" role="alert">
+        {{analysisDoc.error}}
+        <button type="button" class="btn link" @click="loadAnalysisFile(analysisDoc.datasetId)">重试</button>
+      </div>
+      <template v-else-if="analysisDoc.fileName">
+        <div class="scene-md-bar">
+          <div class="scene-md-meta">
+            <b class="mono">{{analysisDoc.fileName}}</b>
+            <span v-if="analysisDoc.updatedAt" class="small muted">更新于 <time :datetime="analysisDoc.updatedAt">{{fmtTime(analysisDoc.updatedAt)}}</time></span>
+          </div>
+          <div class="actions">
+            <div class="seg" role="group" aria-label="查看模式">
+              <button type="button" class="btn toggle sm" :aria-pressed="!analysisDoc.rawMode" @click="analysisDoc.rawMode = false">预览</button>
+              <button type="button" class="btn toggle sm" :aria-pressed="analysisDoc.rawMode" @click="analysisDoc.rawMode = true">Markdown 源码</button>
+            </div>
+            <button type="button" class="btn sm" :disabled="analysisDoc.busy" @click="downloadAnalysisFile"><span class="ico" v-html="icon('download')"></span>下载 .md</button>
+            <button v-if="!analysisDoc.readOnly" type="button" class="btn sm" :disabled="analysisDoc.busy" @click="pickAnalysisFile"><span class="ico" v-html="icon('upload')"></span>{{analysisDoc.busy ? '处理中…' : '重新上传'}}</button>
+            <button v-if="!analysisDoc.readOnly" type="button" class="btn sm danger" :disabled="analysisDoc.busy" @click="removeAnalysisFile">删除文件</button>
+          </div>
+        </div>
+        <div v-if="analysisDoc.error" class="msg err" role="alert">{{analysisDoc.error}}</div>
+        <pre v-if="analysisDoc.rawMode" class="scene-md-raw mono">{{analysisDoc.markdown}}</pre>
+        <div v-else-if="analysisDoc.renderedHtml" class="template-prose template-reader scene-md-preview" v-html="analysisDoc.renderedHtml"></div>
+        <template v-else>
+          <p v-if="analysisDoc.renderFailed" class="msg warn" role="status">Markdown 排版加载失败，已切换纯文本展示。</p>
+          <pre class="template-fallback scene-md-raw mono">{{analysisDoc.markdown}}</pre>
+        </template>
+      </template>
+      <div v-else class="collection-state">
+        <span class="empty-icon" v-html="icon('tpl')"></span>
+        <h2>尚未添加分析思路文件</h2>
+        <p>仅支持上传 UTF-8 编码的 <span class="mono">.md</span> 文件（最大 1 MB）。每个业务场景绑定一份文件，重新上传将直接替换。</p>
+        <div v-if="analysisDoc.error" class="msg err" role="alert">{{analysisDoc.error}}</div>
+        <button v-if="!analysisDoc.readOnly" type="button" class="btn primary" :disabled="analysisDoc.busy" @click="pickAnalysisFile">
+          <span class="ico" v-html="icon('upload')"></span>{{analysisDoc.busy ? '正在上传…' : '选择 .md 文件上传'}}
+        </button>
+      </div>
+      <template #foot>
+        <button class="btn" type="button" @click="closeAnalysisFile" :disabled="analysisDoc.busy">关闭</button>
+      </template>
+    </Drawer>
   </div>`,
   setup() {
     const scenes = useCollection('/api/datasets');
@@ -894,7 +939,7 @@ const Datasets = {
     const pickLoading = ref(false), pickError = ref('');
     const initialSnapshot = ref('');
     const formDirty = computed(() => !!form.value && sceneFormSnapshot(form.value) !== initialSnapshot.value);
-    const shown = computed(() => scenes.list.value.filter(d => matches(kw.value, d.business_scenario, d.business_description, ...(d.tags || []))));
+    const shown = computed(() => scenes.list.value.filter(d => matches(kw.value, d.business_scenario, d.business_description, d.analysis_file_name, ...(d.tags || []))));
     const admin = computed(isAdmin);
     async function view(d) { detail.value = await run(() => api('/api/datasets/' + d.id)); }
     onMounted(async () => {
@@ -1083,12 +1128,133 @@ const Datasets = {
       }
     }
     function confirmImport() { runImport(false); }
+    const analysisFileInput = ref(null);
+    const analysisDoc = reactive({
+      open: false, loading: false, busy: false, datasetId: null, scenarioName: '',
+      readOnly: false, fileName: '', markdown: '', updatedAt: '', rawMode: false,
+      renderedHtml: '', renderFailed: false, error: '',
+    });
+    let renderMd = null;
+    async function ensureMdRenderer() {
+      if (renderMd) return renderMd;
+      renderMd = (await loadTemplateEditor()).renderGuide;
+      return renderMd;
+    }
+    async function renderAnalysisMarkdown(md) {
+      analysisDoc.renderedHtml = '';
+      analysisDoc.renderFailed = false;
+      if (!md) return;
+      try {
+        const render = await ensureMdRenderer();
+        if (analysisDoc.markdown === md) analysisDoc.renderedHtml = render(md);
+      } catch {
+        analysisDoc.renderFailed = true;
+      }
+    }
+    async function loadAnalysisFile(datasetId) {
+      analysisDoc.loading = true;
+      analysisDoc.error = '';
+      try {
+        const res = await api(`/api/datasets/${datasetId}/analysis-file`);
+        if (analysisDoc.datasetId !== datasetId) return;
+        analysisDoc.fileName = res.analysis_file_name || '';
+        analysisDoc.markdown = res.analysis_file_markdown || '';
+        analysisDoc.updatedAt = res.analysis_file_updated_at || '';
+        analysisDoc.readOnly = !!res.read_only;
+        await renderAnalysisMarkdown(analysisDoc.markdown);
+      } catch (e) {
+        if (analysisDoc.datasetId === datasetId) analysisDoc.error = e.message;
+      } finally {
+        if (analysisDoc.datasetId === datasetId) analysisDoc.loading = false;
+      }
+    }
+    function openAnalysisFile(d) {
+      detail.value = null;
+      Object.assign(analysisDoc, {
+        open: true, loading: true, busy: false, datasetId: d.id, scenarioName: d.business_scenario || '',
+        readOnly: !(admin.value || d.read_only === false), fileName: d.analysis_file_name || '',
+        markdown: '', updatedAt: d.analysis_file_updated_at || '', rawMode: false,
+        renderedHtml: '', renderFailed: false, error: '',
+      });
+      loadAnalysisFile(d.id);
+    }
+    function closeAnalysisFile() {
+      if (!analysisDoc.busy) analysisDoc.open = false;
+    }
+    function pickAnalysisFile() { analysisFileInput.value?.click(); }
+    async function onAnalysisFileChange(event) {
+      const file = event.target?.files?.[0];
+      if (event.target) event.target.value = '';
+      if (!file || analysisDoc.busy || !analysisDoc.datasetId) return;
+      const name = (file.name || '').trim();
+      if (!name.toLowerCase().endsWith('.md') || name.length <= 3) {
+        analysisDoc.error = '仅支持上传 .md 格式的分析思路文件。';
+        return;
+      }
+      if (!file.size) {
+        analysisDoc.error = '分析思路文件内容不能为空。';
+        return;
+      }
+      if (file.size > 1024 * 1024) {
+        analysisDoc.error = '分析思路文件不能超过 1 MB。';
+        return;
+      }
+      analysisDoc.busy = true;
+      analysisDoc.error = '';
+      try {
+        const body = new FormData();
+        body.append('file', file);
+        const saved = await api(`/api/datasets/${analysisDoc.datasetId}/analysis-file`, { method: 'PUT', body });
+        analysisDoc.fileName = saved.analysis_file_name || name;
+        analysisDoc.markdown = saved.analysis_file_markdown || '';
+        analysisDoc.updatedAt = saved.analysis_file_updated_at || '';
+        analysisDoc.rawMode = false;
+        await renderAnalysisMarkdown(analysisDoc.markdown);
+        toast('分析思路文件已保存', 'ok');
+        load();
+      } catch (e) {
+        analysisDoc.error = e.message;
+      } finally {
+        analysisDoc.busy = false;
+      }
+    }
+    async function downloadAnalysisFile() {
+      if (!analysisDoc.datasetId || !analysisDoc.fileName) return;
+      const blob = await run(() => api(`/api/datasets/${analysisDoc.datasetId}/analysis-file?download=true`, { download: true }));
+      triggerDownload(blob, analysisDoc.fileName);
+    }
+    async function removeAnalysisFile() {
+      if (analysisDoc.busy || !analysisDoc.datasetId || !analysisDoc.fileName) return;
+      if (!await askConfirm({
+        title: '删除分析思路文件',
+        message: `确认删除业务场景「${analysisDoc.scenarioName}」的分析思路文件「${analysisDoc.fileName}」？`,
+        confirmText: '删除',
+      })) return;
+      analysisDoc.busy = true;
+      analysisDoc.error = '';
+      try {
+        await api(`/api/datasets/${analysisDoc.datasetId}/analysis-file`, { method: 'DELETE' });
+        analysisDoc.fileName = '';
+        analysisDoc.markdown = '';
+        analysisDoc.updatedAt = '';
+        analysisDoc.renderedHtml = '';
+        analysisDoc.renderFailed = false;
+        toast('已删除分析思路文件', 'ok');
+        load();
+      } catch (e) {
+        analysisDoc.error = e.message;
+      } finally {
+        analysisDoc.busy = false;
+      }
+    }
     return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
       picker, pickKw, pickShown, pickLoading, pickError, edit, closeForm, save, del, search, reindex, pick, has, togglePick,
       addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule,
       switchMetricsMode, onMetricOpChange, addMetric, METRIC_OPS, BINARY_METRIC_OPS, RATIO_METRIC_OPS,
       importFileInput, imp, workbookErrors, formatImportGrants, openImport, closeImport, downloadTemplate, exportExcel,
       pickImportFile, onImportFileChange, switchImportMode, confirmImport,
+      analysisFileInput, analysisDoc, openAnalysisFile, closeAnalysisFile, loadAnalysisFile, pickAnalysisFile,
+      onAnalysisFileChange, downloadAnalysisFile, removeAnalysisFile, fmtTime,
       filterValueLabel, DS_LABEL, OBJECT_LABEL, icon, appPath, hasMine: computed(canVisitMine) };
   }
 };

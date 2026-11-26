@@ -153,6 +153,9 @@ def _dataset_brief(ds: dict, acc: Access) -> dict:
         "tables": [{"table_name": t["table_name"], "table_description": t["table_description"],
                     "row_filters": effective_filters(t)} for t in tables],
     }
+    if ds.get("analysis_file_name") or ds.get("analysis_file_markdown"):
+        out["analysis_file_name"] = ds.get("analysis_file_name")
+        out["analysis_file_markdown"] = ds.get("analysis_file_markdown")
     if hidden:
         out["unauthorized_table_count"] = hidden
     return out

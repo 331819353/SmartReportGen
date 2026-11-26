@@ -327,6 +327,9 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `GET /api/datasets/{dataset_id}` | 登录 | 路径 `dataset_id` | 场景详情。普通用户仅见获授权的表。不存在或不可见返回 `404` |
 | `PUT /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`。JSON 传要修改的字段，传入 `tables` 时整体替换，个人场景至少保留一张可引用的表 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
 | `DELETE /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true}`，删除场景及其表清单和授权，已关联的模板解除场景关联 |
+| `GET /api/datasets/{dataset_id}/analysis-file` | 登录 | 路径 `dataset_id`，可选查询参数 `download=true` | 读取场景绑定的 `.md` 分析思路文件元数据与正文（含 `analysis_file_name`、`analysis_file_markdown`、`analysis_file_updated_at`、`read_only`）；`download=true` 时以 `text/markdown` 附件下载，未绑定文件或不可见返回 `404` |
+| `PUT /api/datasets/{dataset_id}/analysis-file` | 本人或管理员 | `multipart/form-data` 上传 `file`（仅限 `.md` 后缀、UTF-8 编码、最大 1 MB；重新上传直接替换） | 更新后的场景详情（含 `.md` 分析思路文件），同步刷新检索索引 |
+| `DELETE /api/datasets/{dataset_id}/analysis-file` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true,"dataset_id":...}`，移除已绑定的 `.md` 分析思路文件并刷新检索索引 |
 | `GET /api/datasets/search` | 登录 | 必填查询参数 `q` 为业务需求，可选整数 `top_k`，默认 5 | 混合检索结果，见下方。仅检索启用场景，普通用户限已授权场景 |
 | `GET /api/datasets/template` | 登录 | 无 | 下载 `.xlsx` 批量导入模板（含 `业务场景`、`场景数据表`、`官方指标` 表头及当前账号可用数据源清单） |
 | `GET /api/datasets/export` | 登录 | 可选查询参数 `q`、`ids`（逗号分隔正整数） | 下载 `.xlsx` 场景导出文件。管理员导出全部匹配场景，普通用户导出本人创建的个人场景 |
@@ -367,7 +370,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 }
 ```
 
-场景摘要以 `table_count` 替代 `analysis_approach` 和 `tables`。个人场景返回 `owner_emp_no`。普通用户查看本人场景时返回 `read_only:false`，表的 `source_row_filters` 表示只读的源范围。管理员详情不含 `table_count`。
+场景摘要以 `table_count` 替代 `analysis_approach`、`analysis_file_markdown` 和 `tables`（摘要保留 `analysis_file_name`、`analysis_file_updated_at`）。每个业务场景最多可绑定 1 份 `.md` 分析思路文件（`analysis_file_name`、`analysis_file_markdown`、`analysis_file_updated_at`），通过 `/api/datasets/{dataset_id}/analysis-file` 独立维护，普通编辑与 Excel 批量导入不会覆盖该文件。个人场景返回 `owner_emp_no`。普通用户查看本人场景时返回 `read_only:false`，表的 `source_row_filters` 表示只读的源范围。管理员详情不含 `table_count`。
 
 **混合检索结果**
 

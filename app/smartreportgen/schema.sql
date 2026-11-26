@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS dataset.dataset (
     business_scenario    text NOT NULL UNIQUE,
     business_description text NOT NULL DEFAULT '',
     analysis_approach    text NOT NULL DEFAULT '',  -- 供 Agent 参考的业务分析思路
+    analysis_file_name   text,
+    analysis_file_markdown text,
+    analysis_file_updated_at timestamptz,
     datasource_id        bigint REFERENCES datasource.datasource(id) ON DELETE RESTRICT,
     tags                 text[] NOT NULL DEFAULT '{}',
     enabled              boolean NOT NULL DEFAULT true,
@@ -276,3 +279,8 @@ ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS semantic_metrics jsonb NOT 
 -- 个人场景记录所有者，查询按数据源当前授权计算。未登记所有者的历史共享场景继续使用原有场景授权。
 ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS owner_emp_no text;
 CREATE INDEX IF NOT EXISTS dataset_owner_idx ON dataset.dataset(owner_emp_no) WHERE owner_emp_no IS NOT NULL;
+
+-- 单场景可选绑定一份 .md 分析思路文件，独立于常规表单与 Excel 批量导入维护。
+ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_file_name text;
+ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_file_markdown text;
+ALTER TABLE dataset.dataset ADD COLUMN IF NOT EXISTS analysis_file_updated_at timestamptz;

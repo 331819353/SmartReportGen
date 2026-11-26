@@ -168,8 +168,9 @@ async def auth_middleware(request: Request, call_next):
 USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("GET", r"^/api/meta$"),
     ("GET", r"^/api/datasources(/\d+(/tables|/columns|/values)?)?$"),
-    ("GET", r"^/api/datasets(/search|/template|/export|/\d+)?$"), ("GET", r"^/api/scenarios$"),
-    ("POST", r"^/api/datasets(/import|/batch)?$"), ("PUT", r"^/api/datasets/\d+$"), ("DELETE", r"^/api/datasets/\d+$"),
+    ("GET", r"^/api/datasets(/search|/template|/export|/\d+(/analysis-file)?)?$"), ("GET", r"^/api/scenarios$"),
+    ("POST", r"^/api/datasets(/import|/batch)?$"), ("PUT", r"^/api/datasets/\d+(/analysis-file)?$"),
+    ("DELETE", r"^/api/datasets/\d+(/analysis-file)?$"),
     ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
     ("POST", r"^/api/style-rules(/effective|/preview)?$"), ("PUT", r"^/api/style-rules/\d+$"),
     ("DELETE", r"^/api/style-rules/\d+$"),
@@ -724,12 +725,59 @@ async def dataset_batch(request: Request, data: dict = Body(...)):
     return J(res)
 
 
+def _markdown_attachment(content: str, filename: str) -> Response:
+    fname = quote(filename, safe="")
+    return Response(
+        content.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fname}", "Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/datasets/{dataset_id}")
 def dataset_get(request: Request, dataset_id: int):
     dataset = repo.get_dataset(dataset_id)
     if not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no and not _access(request).can_dataset(dataset_id):
         raise repo.NotFound("数据集不存在")
     return J(_scoped_dataset(request, dataset))
+
+
+@app.get("/api/datasets/{dataset_id}/analysis-file")
+def dataset_get_analysis_file(request: Request, dataset_id: int, download: bool = Query(False)):
+    dataset = repo.get_dataset(dataset_id)
+    if not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no and not _access(request).can_dataset(dataset_id):
+        raise repo.NotFound("数据集不存在")
+    if download:
+        markdown = dataset.get("analysis_file_markdown")
+        if not markdown:
+            raise repo.NotFound("该业务场景尚未添加分析思路文件")
+        return _markdown_attachment(
+            markdown,
+            dataset.get("analysis_file_name") or f"scenario-{dataset_id}-analysis.md",
+        )
+    return J({
+        "dataset_id": dataset["id"],
+        "business_scenario": dataset["business_scenario"],
+        "analysis_file_name": dataset.get("analysis_file_name"),
+        "analysis_file_markdown": dataset.get("analysis_file_markdown"),
+        "analysis_file_updated_at": dataset.get("analysis_file_updated_at"),
+        "read_only": (not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no),
+    })
+
+
+@app.put("/api/datasets/{dataset_id}/analysis-file")
+async def dataset_upload_analysis_file(request: Request, dataset_id: int, file: UploadFile = File(...)):
+    raw = await file.read(repo.MAX_ANALYSIS_FILE_BYTES + 1)
+    saved = await run_in_threadpool(
+        repo.save_dataset_analysis_file, dataset_id, file.filename or "", raw, _p(request)
+    )
+    return J(_scoped_dataset(request, saved))
+
+
+@app.delete("/api/datasets/{dataset_id}/analysis-file")
+async def dataset_delete_analysis_file(request: Request, dataset_id: int):
+    await run_in_threadpool(repo.delete_dataset_analysis_file, dataset_id, _p(request))
+    return {"ok": True, "dataset_id": dataset_id}
 
 
 @app.put("/api/datasets/{dataset_id}")

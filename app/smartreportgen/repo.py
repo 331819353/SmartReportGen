@@ -148,11 +148,51 @@ def delete_datasource(ds_id: int) -> None:
 
 
 # ============================ 数据集 ============================
+MAX_ANALYSIS_FILE_BYTES = 1 * 1024 * 1024
+
+
+def _normalize_md_filename(filename: str | None) -> str:
+    if not isinstance(filename, str):
+        raise Invalid("仅支持上传 .md 格式的分析思路文件")
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if "\x00" in name or any(ord(ch) < 32 for ch in name) or len(name) > 200:
+        raise Invalid("分析思路文件名无效")
+    if not name.lower().endswith(".md") or len(name) <= 3:
+        raise Invalid("仅支持上传 .md 格式的分析思路文件")
+    return name
+
+
+def _normalize_analysis_markdown(content: str | bytes) -> str:
+    if isinstance(content, (bytes, bytearray)):
+        raw = bytes(content)
+        if len(raw) > MAX_ANALYSIS_FILE_BYTES:
+            raise Invalid("分析思路文件不能超过 1 MB")
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise Invalid("分析思路文件须为 UTF-8 编码的 Markdown 文本") from exc
+    elif isinstance(content, str):
+        text = content[1:] if content.startswith("\ufeff") else content
+        if len(text.encode("utf-8")) > MAX_ANALYSIS_FILE_BYTES:
+            raise Invalid("分析思路文件不能超过 1 MB")
+    else:
+        raise Invalid("分析思路文件内容须为文本")
+    if "\x00" in text:
+        raise Invalid("分析思路文件不能包含空字符")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise Invalid("分析思路文件内容不能为空")
+    return text
+
+
 def _dataset_index(ds: dict, tables: list[dict]) -> dict:
     kw_a = scenario_tokens(" ".join([ds["business_scenario"], *ds.get("tags", [])]))
     kw_a += [w for w in [ds["business_scenario"].lower(), *[t.lower() for t in ds.get("tags", [])]] if w not in kw_a]
     approach = ds.get("analysis_approach") or ""
-    kw_b = scenario_tokens(f"{ds.get('business_description') or ''} {approach}")
+    file_name = (ds.get("analysis_file_name") or "").strip()
+    file_md = (ds.get("analysis_file_markdown") or "").strip()
+    file_stem = file_name[:-3].strip() if file_name.lower().endswith(".md") else file_name
+    kw_b = scenario_tokens(" ".join(p for p in (ds.get("business_description") or "", approach, file_stem, file_md) if p))
     metrics = ds.get("semantic_metrics") or {}
     metric_text = " ".join(f"{k.replace('_', ' ')} {m.get('description') or ''}" for k, m in metrics.items())
     kw_c = scenario_tokens(
@@ -166,6 +206,8 @@ def _dataset_index(ds: dict, tables: list[dict]) -> dict:
     ]
     if approach:
         parts.append(f"分析思路：{approach}")
+    if file_md:
+        parts.append(f"分析思路文件（{file_name or 'analysis.md'}）：\n{file_md[:8000]}")
     if metrics:
         parts.append("官方指标：\n" + "\n".join(
             f"- {k}：{m.get('description') or m.get('op', '')}" for k, m in metrics.items()
@@ -248,10 +290,12 @@ def list_datasets(q: str | None = None) -> list[dict]:
     if q and q.strip():
         pattern = _contains_pattern(q)
         where = (" WHERE d.business_scenario ILIKE %s OR d.business_description ILIKE %s "
+                 "OR COALESCE(d.analysis_file_name, '') ILIKE %s "
                  "OR EXISTS (SELECT 1 FROM unnest(d.tags) tag WHERE tag ILIKE %s)")
-        params = (pattern, pattern, pattern)
+        params = (pattern, pattern, pattern, pattern)
     rows = db.fetchall(
-        "SELECT d.id, d.business_scenario, d.business_description, d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
+        "SELECT d.id, d.business_scenario, d.business_description, d.analysis_file_name, d.analysis_file_updated_at, "
+        "d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
         "d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
         "s.type AS datasource_type, (SELECT count(*) FROM dataset.dataset_table t WHERE t.dataset_id=d.id) AS table_count "
         "FROM dataset.dataset d LEFT JOIN datasource.datasource s ON s.id=d.datasource_id" + where + " ORDER BY d.id",
@@ -263,7 +307,9 @@ def list_datasets(q: str | None = None) -> list[dict]:
 def get_dataset(dataset_id: int) -> dict:
     ds = _one(
         db.fetchone(
-            "SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, d.semantic_metrics, d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
+            "SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, "
+            "d.analysis_file_name, d.analysis_file_markdown, d.analysis_file_updated_at, "
+            "d.semantic_metrics, d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
             "s.config AS source_config, s.enabled AS source_enabled, d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
             "s.type AS datasource_type FROM dataset.dataset d LEFT JOIN datasource.datasource s "
             "ON s.id=d.datasource_id WHERE d.id=%s",
@@ -409,6 +455,34 @@ def delete_dataset(dataset_id: int, principal: Principal | None = None) -> None:
     if principal is not None and not principal.is_admin:
         _require_scene_manager(get_dataset(dataset_id), principal)
     db.execute("DELETE FROM dataset.dataset WHERE id=%s", (dataset_id,))
+
+
+def save_dataset_analysis_file(
+    dataset_id: int, filename: str, content: str | bytes, principal: Principal | None = None
+) -> dict:
+    cur = get_dataset(dataset_id)
+    _require_scene_manager(cur, principal)
+    clean_name = _normalize_md_filename(filename)
+    markdown = _normalize_analysis_markdown(content)
+    db.execute(
+        "UPDATE dataset.dataset SET analysis_file_name=%s, analysis_file_markdown=%s, "
+        "analysis_file_updated_at=now(), updated_at=now() WHERE id=%s",
+        (clean_name, markdown, dataset_id),
+    )
+    reindex_dataset(dataset_id)
+    return get_dataset(dataset_id)
+
+
+def delete_dataset_analysis_file(dataset_id: int, principal: Principal | None = None) -> dict:
+    cur = get_dataset(dataset_id)
+    _require_scene_manager(cur, principal)
+    db.execute(
+        "UPDATE dataset.dataset SET analysis_file_name=NULL, analysis_file_markdown=NULL, "
+        "analysis_file_updated_at=NULL, updated_at=now() WHERE id=%s",
+        (dataset_id,),
+    )
+    reindex_dataset(dataset_id)
+    return get_dataset(dataset_id)
 
 
 def search_datasets(query: str, top_k: int = 5, dataset_ids: list[int] | None = None) -> dict:
