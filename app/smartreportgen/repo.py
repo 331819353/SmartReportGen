@@ -680,6 +680,13 @@ def style_rules_for(business_scenario: str | None, query: str | None = None, own
 
 
 # ============================ 报告模板 ============================
+MAX_TEMPLATE_FILE_BYTES = 2 * 1024 * 1024
+MAX_TEMPLATE_IMPORT_FILES = 50
+_FRONTMATTER_KV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$")
+_FRONTMATTER_KNOWN_KEYS = {
+    "name", "title", "business_summary", "description", "summary", "analysis_goal", "user_requirement"
+}
+
 TPL_COLS = ("t.id, t.name, t.dataset_id, t.user_requirement, t.analysis_goal, t.business_summary, t.summary, t.version, t.created_at, "
             "t.updated_at, t.created_by, t.template_type, d.business_scenario, "
             "(SELECT e.name FROM permission.employee e WHERE e.emp_no = t.created_by) AS creator_name")
@@ -891,7 +898,131 @@ def template_versions(tpl_id: int) -> list[dict]:
     )
 
 
-def save_template(data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
+def _normalize_template_filename(filename: str | None) -> tuple[str, str]:
+    if not isinstance(filename, str):
+        raise Invalid("仅支持导入 .md 或 .markdown 格式的报告模板文件")
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if "\x00" in name or any(ord(ch) < 32 for ch in name) or len(name) > 200:
+        raise Invalid("报告模板文件名无效")
+    low = name.lower()
+    if low.endswith(".markdown"):
+        stem = name[:-9].strip()
+    elif low.endswith(".md"):
+        stem = name[:-3].strip()
+    else:
+        raise Invalid("仅支持导入 .md 或 .markdown 格式的报告模板文件")
+    if not stem:
+        raise Invalid("仅支持导入 .md 或 .markdown 格式的报告模板文件")
+    return name, stem
+
+
+def _extract_template_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """仅当开头存在受约束的 YAML 风格头部且之后仍有正文时提取元数据。"""
+    if not text.startswith("---\n"):
+        return {}, text
+    end_pos = text.find("\n---\n", 3, 4000)
+    if end_pos == -1:
+        return {}, text
+    header_block = text[4:end_pos]
+    body = text[end_pos + 5:].lstrip("\n")
+    if not header_block.strip() or not body.strip():
+        return {}, text
+    lines = header_block.splitlines()
+    if len(lines) > 30:
+        return {}, text
+    raw_meta: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _FRONTMATTER_KV_RE.match(stripped)
+        if not match:
+            return {}, text
+        key = match.group(1).lower()
+        val = match.group(2).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1].strip()
+        raw_meta[key] = val
+    if not (set(raw_meta) & _FRONTMATTER_KNOWN_KEYS):
+        return {}, text
+    meta = {
+        "name": raw_meta.get("name") or raw_meta.get("title") or "",
+        "business_summary": raw_meta.get("business_summary") or raw_meta.get("description") or raw_meta.get("summary") or "",
+        "analysis_goal": raw_meta.get("analysis_goal") or "",
+        "user_requirement": raw_meta.get("user_requirement") or "",
+    }
+    return meta, body
+
+
+def parse_template_markdown_file(
+    filename: str,
+    content: str | bytes,
+    *,
+    name: str | None = None,
+    business_summary: str | None = None,
+    analysis_goal: str | None = None,
+    user_requirement: str | None = None,
+) -> dict[str, Any]:
+    clean_name, stem = _normalize_template_filename(filename)
+    if isinstance(content, (bytes, bytearray)):
+        raw = bytes(content)
+        if len(raw) > MAX_TEMPLATE_FILE_BYTES:
+            raise Invalid(f"模板文件「{clean_name}」不能超过 2 MB")
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise Invalid(f"模板文件「{clean_name}」须为 UTF-8 编码的 Markdown 文本") from exc
+    elif isinstance(content, str):
+        text = content[1:] if content.startswith("\ufeff") else content
+        if len(text.encode("utf-8")) > MAX_TEMPLATE_FILE_BYTES:
+            raise Invalid(f"模板文件「{clean_name}」不能超过 2 MB")
+    else:
+        raise Invalid(f"模板文件「{clean_name}」内容须为文本")
+    if "\x00" in text:
+        raise Invalid(f"模板文件「{clean_name}」不能包含空字符")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise Invalid(f"模板文件「{clean_name}」内容不能为空")
+
+    if _legacy_template(text) is not None:
+        text = normalize_template_markdown(text)
+        fm: dict[str, str] = {}
+    else:
+        fm, text = _extract_template_frontmatter(text)
+
+    for field_name, val in (
+        ("name", name),
+        ("business_summary", business_summary),
+        ("analysis_goal", analysis_goal),
+        ("user_requirement", user_requirement),
+    ):
+        if val is not None and (not isinstance(val, str) or "\x00" in val):
+            raise Invalid(f"模板字段 {field_name} 须为有效文本")
+
+    summary = _template_summary(text, "")
+    resolved_name = (
+        (name or "").strip()
+        or fm.get("name", "").strip()
+        or summary["title"].strip()
+        or stem
+    )
+    if not resolved_name or "\x00" in resolved_name:
+        raise Invalid("模板名称不能为空")
+    if not summary["title"]:
+        summary["title"] = resolved_name
+
+    return {
+        "source_file": clean_name,
+        "name": resolved_name,
+        "markdown": text,
+        "business_summary": ((business_summary or "").strip() or fm.get("business_summary", "").strip()),
+        "analysis_goal": ((analysis_goal or "").strip() or fm.get("analysis_goal", "").strip()),
+        "user_requirement": ((user_requirement or "").strip() or fm.get("user_requirement", "").strip()),
+        "summary": summary,
+    }
+
+
+def _validate_template_data(data: dict) -> str:
     md = data.get("markdown")
     if not isinstance(md, str) or not md.strip() or "\x00" in md:
         raise Invalid("请提供有效的 Markdown 正文")
@@ -904,51 +1035,164 @@ def save_template(data: dict, tpl_id: int | None = None, *, expected_version: in
             raise Invalid(f"模板字段 {field} 须为有效文本")
     if (dataset_id := data.get("dataset_id")) is not None and (type(dataset_id) is not int or dataset_id < 1):
         raise Invalid("dataset_id 须为正整数")
-    with db.conn() as c, c.transaction():
-        cur = _one(c.execute("SELECT * FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone(),
-                   "报告模板") if tpl_id is not None else None
-        if expected_version is not None and (not cur or cur["version"] != expected_version):
-            raise ReportConflict("报告模板已被修改，请读取最新版本后再提交")
-        summary = _template_summary(md, "")
-        name = (data.get("name") or summary["title"]).strip()
-        if not name:
-            raise Invalid("模板名称不能为空")
-        if not summary["title"]:
-            summary["title"] = name
-        if cur:
-            # 版本锁覆盖指南和场景关联，历史表保存每个版本的 Markdown。
-            updates = {
-                "name": name, "dataset_id": data.get("dataset_id", cur["dataset_id"]),
-                "user_requirement": data.get("user_requirement", cur["user_requirement"]) or "",
-                "analysis_goal": data.get("analysis_goal", cur["analysis_goal"]) or "",
-                "business_summary": (data.get("business_summary", cur["business_summary"]) or "").strip(),
-                "markdown": md,
-            }
-            version = cur["version"] + int(any(cur[key] != value for key, value in updates.items()))
-            c.execute(
-                "UPDATE report_template.report_template SET name=%s, dataset_id=%s, user_requirement=%s, "
-                "analysis_goal=%s, business_summary=%s, markdown=%s, summary=%s, version=%s, "
-                "template_type='business', updated_at=now() WHERE id=%s",
-                (updates["name"], updates["dataset_id"], updates["user_requirement"], updates["analysis_goal"],
-                 updates["business_summary"], md, db.jsonb(summary), version, tpl_id),
-            )
-        else:
-            version = 1
-            tpl_id = c.execute(
-                "INSERT INTO report_template.report_template(name, dataset_id, user_requirement, analysis_goal, business_summary, "
-                "markdown, summary, created_by, template_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (name, data.get("dataset_id"), data.get("user_requirement") or "",
-                 data.get("analysis_goal") or "",
-                 (data.get("business_summary") or "").strip(), md, db.jsonb(summary),
-                 data.get("created_by"), "business"),
-            ).fetchone()["id"]
+    return md
+
+
+def _save_template_in_tx(c, data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
+    md = data["markdown"]
+    cur = _one(c.execute("SELECT * FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone(),
+               "报告模板") if tpl_id is not None else None
+    if expected_version is not None and (not cur or cur["version"] != expected_version):
+        raise ReportConflict("报告模板已被修改，请读取最新版本后再提交")
+    summary = _template_summary(md, "")
+    name = (data.get("name") or summary["title"]).strip()
+    if not name:
+        raise Invalid("模板名称不能为空")
+    if not summary["title"]:
+        summary["title"] = name
+    if cur:
+        # 版本锁覆盖指南和场景关联，历史表保存每个版本的 Markdown。
+        updates = {
+            "name": name, "dataset_id": data.get("dataset_id", cur["dataset_id"]),
+            "user_requirement": data.get("user_requirement", cur["user_requirement"]) or "",
+            "analysis_goal": data.get("analysis_goal", cur["analysis_goal"]) or "",
+            "business_summary": (data.get("business_summary", cur["business_summary"]) or "").strip(),
+            "markdown": md,
+        }
+        version = cur["version"] + int(any(cur[key] != value for key, value in updates.items()))
         c.execute(
-            "INSERT INTO report_template.report_template_version(template_id, version, markdown) VALUES (%s,%s,%s) "
-            "ON CONFLICT DO NOTHING",
-            (tpl_id, version, md),
+            "UPDATE report_template.report_template SET name=%s, dataset_id=%s, user_requirement=%s, "
+            "analysis_goal=%s, business_summary=%s, markdown=%s, summary=%s, version=%s, "
+            "template_type='business', updated_at=now() WHERE id=%s",
+            (updates["name"], updates["dataset_id"], updates["user_requirement"], updates["analysis_goal"],
+             updates["business_summary"], md, db.jsonb(summary), version, tpl_id),
         )
-        # 在锁释放前读取此次保存的版本，避免 agent 并行更新时拿到其他版本号。
-        return _template_view(c.execute(TPL_DETAIL, (tpl_id,)).fetchone())
+    else:
+        version = 1
+        tpl_id = c.execute(
+            "INSERT INTO report_template.report_template(name, dataset_id, user_requirement, analysis_goal, business_summary, "
+            "markdown, summary, created_by, template_type) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (name, data.get("dataset_id"), data.get("user_requirement") or "",
+             data.get("analysis_goal") or "",
+             (data.get("business_summary") or "").strip(), md, db.jsonb(summary),
+             data.get("created_by"), "business"),
+        ).fetchone()["id"]
+    c.execute(
+        "INSERT INTO report_template.report_template_version(template_id, version, markdown) VALUES (%s,%s,%s) "
+        "ON CONFLICT DO NOTHING",
+        (tpl_id, version, md),
+    )
+    # 在锁释放前读取此次保存的版本，避免 agent 并行更新时拿到其他版本号。
+    return _template_view(c.execute(TPL_DETAIL, (tpl_id,)).fetchone())
+
+
+def save_template(data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
+    _validate_template_data(data)
+    with db.conn() as c, c.transaction():
+        return _save_template_in_tx(c, data, tpl_id, expected_version=expected_version)
+
+
+def import_templates(
+    dataset_id: Any,
+    items: list[dict[str, Any]],
+    principal: Principal,
+    *,
+    mode: str = "upsert",
+) -> dict[str, Any]:
+    """一键导入一个或多个报告模板文件，并强制关联到指定的业务场景。"""
+    if mode not in ("upsert", "create"):
+        raise Invalid("导入模式须为 upsert 或 create")
+    if type(dataset_id) is not int or dataset_id < 1:
+        raise Invalid("请选择关联的业务场景")
+    if not principal.is_admin:
+        from .permission import access_for
+
+        if not access_for(principal).can_dataset(dataset_id):
+            raise PermissionDenied("无权使用该业务场景（数据集）")
+    _one(db.fetchone("SELECT id, business_scenario, enabled FROM dataset.dataset WHERE id=%s", (dataset_id,)), "业务场景")
+
+    if not isinstance(items, list) or not items:
+        raise Invalid("请选择要导入的 .md 模板文件")
+    if len(items) > MAX_TEMPLATE_IMPORT_FILES:
+        raise Invalid(f"单次最多导入 {MAX_TEMPLATE_IMPORT_FILES} 个报告模板文件")
+
+    parsed_items: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise Invalid("模板导入项格式无效")
+        parsed = parse_template_markdown_file(
+            item.get("filename"),
+            item.get("content"),
+            name=item.get("name"),
+            business_summary=item.get("business_summary"),
+            analysis_goal=item.get("analysis_goal"),
+            user_requirement=item.get("user_requirement"),
+        )
+        if mode == "upsert":
+            if parsed["name"] in seen_names:
+                raise Invalid(f"单次导入存在同名模板「{parsed['name']}」，请修改模板名称或切换为始终新建模板")
+            seen_names.add(parsed["name"])
+        parsed_items.append(parsed)
+
+    saved_list: list[dict[str, Any]] = []
+    create_count = 0
+    update_count = 0
+    with db.conn() as c, c.transaction():
+        ds_locked = _one(
+            c.execute("SELECT id, business_scenario FROM dataset.dataset WHERE id=%s FOR KEY SHARE", (dataset_id,)).fetchone(),
+            "业务场景",
+        )
+        for item in parsed_items:
+            existing = None
+            if mode == "upsert" and principal.emp_no:
+                existing = c.execute(
+                    "SELECT id FROM report_template.report_template "
+                    "WHERE dataset_id=%s AND name=%s AND created_by=%s "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1 FOR UPDATE",
+                    (dataset_id, item["name"], principal.emp_no),
+                ).fetchone()
+            if existing is not None:
+                payload: dict[str, Any] = {
+                    "name": item["name"],
+                    "dataset_id": dataset_id,
+                    "markdown": item["markdown"],
+                }
+                for opt_key in ("business_summary", "analysis_goal", "user_requirement"):
+                    if item[opt_key]:
+                        payload[opt_key] = item[opt_key]
+                _validate_template_data(payload)
+                saved = _save_template_in_tx(c, payload, tpl_id=existing["id"])
+                action = "update"
+                update_count += 1
+            else:
+                payload = {
+                    "name": item["name"],
+                    "dataset_id": dataset_id,
+                    "markdown": item["markdown"],
+                    "business_summary": item["business_summary"],
+                    "analysis_goal": item["analysis_goal"],
+                    "user_requirement": item["user_requirement"],
+                    "created_by": principal.emp_no,
+                }
+                _validate_template_data(payload)
+                saved = _save_template_in_tx(c, payload)
+                action = "create"
+                create_count += 1
+            saved_list.append({**saved, "action": action, "source_file": item["source_file"]})
+
+    return {
+        "ok": True,
+        "dataset_id": ds_locked["id"],
+        "business_scenario": ds_locked["business_scenario"],
+        "mode": mode,
+        "summary": {
+            "total": len(saved_list),
+            "create_count": create_count,
+            "update_count": update_count,
+        },
+        "templates": saved_list,
+    }
 
 
 def delete_template(tpl_id: int) -> None:

@@ -14,7 +14,7 @@ from typing import Literal
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
-from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.openapi.utils import get_openapi
@@ -174,7 +174,7 @@ USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("GET", r"^/api/style-tokens$"), ("GET", r"^/api/style-rules(/resolve|/\d+)?$"),
     ("POST", r"^/api/style-rules(/effective|/preview)?$"), ("PUT", r"^/api/style-rules/\d+$"),
     ("DELETE", r"^/api/style-rules/\d+$"),
-    ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates$"),
+    ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates(/import)?$"),
     ("PUT", r"^/api/templates/\d+$"), ("DELETE", r"^/api/templates/\d+$"),
     ("GET", r"^/api/reports(/\d+(/shares|/share-recipients|/versions)?)?$"), ("PUT", r"^/api/reports/\d+(/selection)?$"),
     ("GET", r"^/api/report-drafts$"), ("POST", r"^/api/reports/(merge|\d+/shares)$"), ("DELETE", r"^/api/reports/\d+(/shares/[^/]+)?$"),
@@ -914,10 +914,73 @@ def tpl_create(request: Request, data: dict = Body(...)):
     return J(repo.save_template({**data, "created_by": _p(request).emp_no}))
 
 
+@app.post("/api/templates/import")
+async def tpl_import(
+    request: Request,
+    files: list[UploadFile] | None = File(default=None),
+    file: UploadFile | None = File(default=None),
+    dataset_id: str | None = Form(default=None),
+    mode: str | None = Form(default=None),
+    items_meta: str | None = Form(default=None),
+    name: str | None = Form(default=None),
+    business_summary: str | None = Form(default=None),
+    analysis_goal: str | None = Form(default=None),
+    user_requirement: str | None = Form(default=None),
+):
+    raw_dataset_id = dataset_id if dataset_id is not None else request.query_params.get("dataset_id")
+    ds_text = (raw_dataset_id or "").strip()
+    if not ds_text.isdigit() or int(ds_text) < 1:
+        raise repo.Invalid("请选择关联的业务场景")
+    parsed_dataset_id = int(ds_text)
+
+    resolved_mode = (mode if mode is not None else request.query_params.get("mode")) or "upsert"
+    resolved_mode = resolved_mode.strip()
+
+    meta_list: list[dict] = []
+    if items_meta is not None and items_meta.strip():
+        try:
+            parsed_meta = json.loads(items_meta)
+        except ValueError as exc:
+            raise repo.Invalid("items_meta 须为 JSON 对象数组") from exc
+        if not isinstance(parsed_meta, list) or any(not isinstance(m, dict) for m in parsed_meta):
+            raise repo.Invalid("items_meta 须为 JSON 对象数组")
+        meta_list = parsed_meta
+
+    uploaded = [f for f in (*(files or []), file) if f is not None]
+    if not uploaded:
+        raise repo.Invalid("请选择要导入的 .md 模板文件")
+    if len(uploaded) > repo.MAX_TEMPLATE_IMPORT_FILES:
+        raise repo.Invalid(f"单次最多导入 {repo.MAX_TEMPLATE_IMPORT_FILES} 个报告模板文件")
+
+    items = []
+    single = len(uploaded) == 1
+    for idx, f in enumerate(uploaded):
+        raw = await f.read(repo.MAX_TEMPLATE_FILE_BYTES + 1)
+        meta = meta_list[idx] if idx < len(meta_list) else {}
+        items.append({
+            "filename": f.filename or "",
+            "content": raw,
+            "name": meta.get("name") if "name" in meta else (name if single else None),
+            "business_summary": meta.get("business_summary") if "business_summary" in meta else (business_summary if single else None),
+            "analysis_goal": meta.get("analysis_goal") if "analysis_goal" in meta else (analysis_goal if single else None),
+            "user_requirement": meta.get("user_requirement") if "user_requirement" in meta else (user_requirement if single else None),
+        })
+
+    res = await run_in_threadpool(
+        repo.import_templates, parsed_dataset_id, items, _p(request), mode=resolved_mode
+    )
+    return J(res)
+
+
 @app.get("/api/templates/{tpl_id}")
-def tpl_get(request: Request, tpl_id: int):
+def tpl_get(request: Request, tpl_id: int, download: bool = Query(False), version: int | None = Query(default=None, ge=1)):
     template = repo.get_template(tpl_id)
     repo.require_template_access(template, _access(request))
+    if download:
+        markdown = repo.get_template_version(tpl_id, version)["markdown"] if version is not None else template["markdown"]
+        safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", template["name"]).strip(" .") or f"template-{tpl_id}"
+        suffix = f"-v{version}" if version is not None else ""
+        return _markdown_attachment(markdown, f"{safe_name}{suffix}.md")
     template["versions"] = repo.template_versions(tpl_id)
     return J(template)
 

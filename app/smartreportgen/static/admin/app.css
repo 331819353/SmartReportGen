@@ -1018,6 +1018,41 @@ pre.block + .actions { margin-top: 14px; }
   max-height: 62vh;
   overflow: auto;
 }
+.tpl-import-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 14px 18px;
+  margin-bottom: 14px;
+}
+.tpl-import-top .field { margin: 0; }
+.tpl-import-top .field-help { margin: 4px 0 0; }
+.tpl-import-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  padding: 22px 18px;
+  border-radius: var(--radius);
+  border: 1.5px dashed var(--control-edge);
+  background: var(--surface-2);
+  box-shadow: var(--nm-inset-sm);
+  transition: border-color var(--motion), background var(--motion), box-shadow var(--motion);
+}
+.tpl-import-dropzone:hover,
+.tpl-import-dropzone.is-dragging {
+  border-color: var(--primary);
+  background: var(--primary-weak);
+}
+.tpl-import-drop-title { margin: 0; font-weight: 600; color: var(--text); }
+.tpl-import-dropzone .field-help { margin: 0; max-width: 56ch; }
+.tpl-import-dropzone .actions { justify-content: center; margin-top: 4px; }
+.tpl-import-table td { vertical-align: middle; }
+.tpl-import-table td:first-child { min-width: 170px; max-width: 240px; overflow-wrap: anywhere; }
+.tpl-import-table .in { min-height: 36px; padding: 6px 10px; font-size: 13px; }
+@media (max-width: 720px) {
+  .tpl-import-top { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* 阅读与编辑共享文档宽度，目录根据屏幕宽度从左栏移到正文上方。 */
 .template-workhead { align-items: center; margin-bottom: 18px; }

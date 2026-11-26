@@ -1,5 +1,5 @@
 /* SmartReportGen 管理台（Vue 3，无构建） */
-const { createApp, reactive, ref, computed, onMounted, onBeforeUnmount, watch, nextTick } = Vue;
+const { createApp, reactive, ref, computed, markRaw, onMounted, onBeforeUnmount, watch, nextTick } = Vue;
 
 // ------------------------------------------------------------ 工具
 const BASE_PATH = (window.__SRG_BASE_PATH__ || '').replace(/\/$/, '');
@@ -45,7 +45,7 @@ async function run(fn, okMsg) {
 const fmtTime = s => s ? String(s).replace('T', ' ').slice(0, 16) : '';
 const isAdmin = () => !!(state.me && state.me.is_admin);
 const creator = x => x.created_by ? `${x.creator_name || ''}${x.creator_name ? '（' + x.created_by + '）' : x.created_by}` : '系统';
-const fmtSize = n => n == null ? '' : n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : (n / 1024).toFixed(0) + ' KB';
+const fmtSize = n => n == null ? '' : n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n < 1024 ? n + ' B' : (n / 1024).toFixed(0) + ' KB';
 const DS_LABEL = { mysql: 'MySQL', postgresql: 'PostgreSQL', oracle: 'Oracle', starrocks: 'StarRocks', api: 'HTTP API' };
 const OBJECT_LABEL = { table: '表', view: '视图', materialized_view: '物化视图' };
 const DEFAULT_PORT = { mysql: 3306, postgresql: 5432, oracle: 1521, starrocks: 9030 };
@@ -130,7 +130,7 @@ const Drawer = {
   emits: ['close'],
   template: `<dialog ref="dialog" class="drawer" :class="{wide, compact, 'confirm-drawer': confirm}" :aria-label="title"
     :role="confirm ? 'alertdialog' : null" :aria-describedby="confirm ? 'confirm-dialog-message' : null" :aria-busy="busy"
-    @cancel.prevent="close" @pointerdown="onPointerDown" @pointercancel="clearBackdropPress" @click.self="backdrop" @close="onDialogClose">
+    @cancel.self.prevent="close" @pointerdown="onPointerDown" @pointercancel="clearBackdropPress" @click.self="backdrop" @close="onDialogClose">
     <div class="drawer-head"><h2>{{title}}</h2><button class="btn x" type="button" aria-label="关闭" :disabled="busy" @click="close" v-html="icon('close')"></button></div>
     <div class="msgs dialog-feedback" aria-live="polite"><div v-for="t in feedback" :key="t.id" class="msg" :class="t.kind">{{t.msg}}</div></div>
     <div class="drawer-body"><slot/></div>
@@ -1667,12 +1667,101 @@ const TemplateGuideEditor = {
   }
 };
 
+const MAX_TEMPLATE_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_TEMPLATE_IMPORT_FILES = 50;
+const FRONTMATTER_KNOWN_KEYS = new Set([
+  'name', 'title', 'business_summary', 'description', 'summary', 'analysis_goal', 'user_requirement',
+]);
+
+function stripInlineMarkdown(text) {
+  return String(text || '')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[`*_~]/g, '')
+    .trim();
+}
+
+function inspectTemplateMarkdown(fileName, rawText) {
+  let text = String(rawText || '');
+  if (text.startsWith('\ufeff')) text = text.slice(1);
+  text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  const base = fileName.replace(/\\/g, '/').split('/').pop().trim();
+  const stem = base.toLowerCase().endsWith('.markdown')
+    ? base.slice(0, -9).trim()
+    : base.toLowerCase().endsWith('.md')
+      ? base.slice(0, -3).trim()
+      : base;
+
+  const meta = {};
+  let body = text;
+  if (text.startsWith('---\n')) {
+    const endPos = text.indexOf('\n---\n', 3);
+    if (endPos !== -1 && endPos < 4000) {
+      const header = text.slice(4, endPos);
+      const rest = text.slice(endPos + 5).replace(/^\n+/, '');
+      const lines = header.split('\n');
+      if (header.trim() && rest.trim() && lines.length <= 30) {
+        const parsed = {};
+        let valid = true;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const m = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/.exec(trimmed);
+          if (!m) { valid = false; break; }
+          let val = m[2].trim();
+          if (val.length >= 2 && val[0] === val[val.length - 1] && (val[0] === "'" || val[0] === '"')) {
+            val = val.slice(1, -1).trim();
+          }
+          parsed[m[1].toLowerCase()] = val;
+        }
+        if (valid && Object.keys(parsed).some(k => FRONTMATTER_KNOWN_KEYS.has(k))) {
+          meta.name = parsed.name || parsed.title || '';
+          meta.businessSummary = parsed.business_summary || parsed.description || parsed.summary || '';
+          body = rest;
+        }
+      }
+    }
+  }
+
+  let h1 = '';
+  let sectionCount = 0;
+  let fence = null;
+  for (const line of body.split('\n')) {
+    const trimmed = line.trim();
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (fenceMatch) {
+      const marker = fenceMatch[1];
+      if (!fence) fence = marker[0];
+      else if (marker[0] === fence) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const hMatch = /^(#{1,2})\s+(.+?)\s*#*\s*$/.exec(trimmed);
+    if (!hMatch) continue;
+    if (hMatch[1] === '#' && !h1) h1 = stripInlineMarkdown(hMatch[2]);
+    else if (hMatch[1] === '##') sectionCount += 1;
+  }
+
+  return {
+    name: (meta.name || h1 || stem || '未命名模板').trim(),
+    businessSummary: (meta.businessSummary || '').trim(),
+    sectionCount,
+    empty: !text.trim(),
+  };
+}
+
 const Templates = {
-  components: { TemplateDocument, TemplateGuidePreview, TemplateGuideEditor },
+  components: { Drawer, TemplateDocument, TemplateGuidePreview, TemplateGuideEditor },
   template: `<div>
     <template v-if="!form">
-      <div class="page-head"><h1 ref="templateHeading" tabindex="-1">报告模板</h1>
-        <button type="button" class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button></div>
+      <div class="page-head">
+        <div><h1 ref="templateHeading" tabindex="-1">报告模板</h1><p>管理各业务场景的分析思路、指标口径与报告结构指南。</p></div>
+        <div class="actions">
+          <button type="button" class="btn" @click="openImport"><span class="ico" v-html="icon('upload')"></span>一键导入</button>
+          <button type="button" class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button>
+        </div>
+      </div>
       <section class="card list-panel" aria-label="模板列表" :aria-busy="loading">
         <div class="list-tools">
           <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索模板名称、场景或用途" aria-label="搜索模板"></label>
@@ -1683,9 +1772,12 @@ const Templates = {
         <div v-else-if="!shown.length" class="collection-state">
           <span class="empty-icon" v-html="icon(kw.trim() ? 'search' : 'tpl')"></span>
           <h2>{{kw.trim() ? '未找到匹配的模板' : '还没有报告模板'}}</h2>
-          <p>{{kw.trim() ? '试试其他关键词。' : '可以新建模板，也可以在已接入的 AI 助手中提交分析需求，由助手保存模板。'}}</p>
+          <p>{{kw.trim() ? '试试其他关键词。' : '可以一键导入 .md 模板文件并关联业务场景，也可以新建模板。'}}</p>
           <button type="button" v-if="kw.trim()" class="btn" @click="kw=''">清除搜索</button>
-          <button type="button" v-else class="btn" @click="edit()">新建模板</button>
+          <div v-else class="actions">
+            <button type="button" class="btn primary" @click="openImport"><span class="ico" v-html="icon('upload')"></span>一键导入</button>
+            <button type="button" class="btn" @click="edit()">新建模板</button>
+          </div>
         </div>
         <div v-else class="scroll-x" tabindex="0" aria-label="模板表格"><table class="tbl record-table report-table" role="table">
           <thead><tr><th scope="col">模板名称</th><th scope="col">业务场景</th><th scope="col" v-if="admin">创建人</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead>
@@ -1713,6 +1805,9 @@ const Templates = {
               <option v-for="v in form.versions" :key="v.version" :value="v.version">v{{v.version}} · {{fmtTime(v.created_at)}}</option>
             </select>
             <span v-else class="template-reading-version">v{{viewVersion}}</span>
+            <button type="button" class="btn" @click="downloadTemplateMd(form, viewVersion)">
+              <span class="ico" v-html="icon('download')"></span>下载 .md
+            </button>
             <button type="button" class="btn template-reading-width" :aria-pressed="wideReading" @click="wideReading=!wideReading">宽页</button>
             <button type="button" v-if="canEdit(form)" class="btn primary" @click="edit(form)">
               <span class="ico" v-html="icon('pencil')"></span>编辑模板
@@ -1769,6 +1864,73 @@ const Templates = {
         </div>
       </section>
     </template>
+    <Drawer v-if="imp.open" title="一键导入报告模板" wide :busy="imp.busy" :backdrop-close="false" @close="closeImport">
+      <div class="tpl-import-top">
+        <div class="field">
+          <label for="tpl-import-scenario">关联业务场景 <small>必选</small></label>
+          <select id="tpl-import-scenario" class="in" v-model="imp.datasetId" :disabled="imp.busy">
+            <option :value="null" disabled>请选择关联的业务场景（必选）</option>
+            <option v-for="d in importScenarios" :key="d.id" :value="d.id" :disabled="d._disabled">
+              {{d.business_scenario}}{{d._reason ? '（' + d._reason + '）' : ''}}
+            </option>
+          </select>
+          <p class="field-help">导入的报告模板将直接绑定到所选业务场景；后续基于该模板生成报告时会自动校验场景一致性。</p>
+        </div>
+        <div class="field">
+          <label>重名处理</label>
+          <div class="seg" role="group" aria-label="重名处理">
+            <button type="button" class="btn toggle" :disabled="imp.busy" :aria-pressed="imp.mode === 'upsert'" @click="imp.mode = 'upsert'">同名更新版本</button>
+            <button type="button" class="btn toggle" :disabled="imp.busy" :aria-pressed="imp.mode === 'create'" @click="imp.mode = 'create'">始终新建模板</button>
+          </div>
+          <p class="field-help">“同名更新版本”仅对当前场景下本人创建的同名模板追加版本，不会覆盖他人模板。</p>
+        </div>
+      </div>
+      <div v-if="!selectableScenarios.length" class="msg warn" role="status">
+        当前没有可用的业务场景。请先在「<a href="#datasets" @click="closeImport">业务场景</a>」中新建场景，或联系管理员为您授权数据表权限。
+      </div>
+      <div class="tpl-import-dropzone" :class="{'is-dragging': imp.dragging}"
+        @dragover.prevent="imp.dragging = true"
+        @dragleave.prevent="onImportDragLeave"
+        @drop.prevent="onImportDrop">
+        <input ref="importFileInput" type="file" accept=".md,.markdown,text/markdown" multiple class="sr-only-file" @change="onImportFileChange">
+        <p class="tpl-import-drop-title">选择或拖拽 <span class="mono">.md</span> / <span class="mono">.markdown</span> 报告模板文件到此区域</p>
+        <p class="field-help">支持一次导入 1–50 个文件（单文件上限 2 MB，UTF-8 编码）；自动识别正文一级标题或 Frontmatter 作为模板名称，无标题时使用文件名。</p>
+        <div class="actions">
+          <button type="button" class="btn" :disabled="imp.busy" @click="pickImportFiles">
+            <span class="ico" v-html="icon('upload')"></span>选择 .md 文件（可多选）
+          </button>
+          <button v-if="imp.items.length" type="button" class="btn link danger" :disabled="imp.busy" @click="clearImportFiles">清空列表</button>
+        </div>
+      </div>
+      <div v-if="imp.error" class="msg err" role="alert" style="margin-top:12px">{{imp.error}}</div>
+      <div v-if="imp.items.length" class="scene-import-preview" aria-live="polite">
+        <div v-if="!imp.datasetId" class="msg warn" role="status">请先在上方选择关联的业务场景后再确认导入。</div>
+        <div class="scroll-x table-well" tabindex="0" aria-label="待导入模板清单">
+          <table class="tbl tpl-import-table">
+            <thead><tr><th scope="col">源文件</th><th scope="col">模板名称</th><th scope="col">业务说明（选填）</th><th scope="col">预计操作</th><th scope="col">操作</th></tr></thead>
+            <tbody>
+              <tr v-for="item in imp.items" :key="item.id">
+                <td class="small">
+                  <b class="mono">{{item.fileName}}</b>
+                  <div class="muted">{{fmtSize(item.fileSize)}}<span v-if="item.sectionCount"> · {{item.sectionCount}} 个章节</span></div>
+                  <div v-if="item.error" class="scene-import-err">{{item.error}}</div>
+                </td>
+                <td><input class="in" v-model="item.name" :disabled="imp.busy" aria-label="模板名称" placeholder="请输入模板名称"></td>
+                <td><input class="in" v-model="item.businessSummary" :disabled="imp.busy" aria-label="业务说明" placeholder="选填，留空沿用或自动提取"></td>
+                <td><span class="badge" :class="importActionInfo(item).cls">{{importActionInfo(item).label}}</span></td>
+                <td><button type="button" class="btn link danger" :disabled="imp.busy" @click="removeImportItem(item.id)">移除</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <template #foot>
+        <button type="button" class="btn" :disabled="imp.busy" @click="closeImport">取消</button>
+        <button type="button" class="btn primary" :disabled="imp.busy || !canConfirmImport" @click="confirmImport">
+          {{imp.busy ? '正在导入…' : imp.items.length > 1 ? '一键导入（' + imp.items.length + ' 个）' : '确认导入'}}
+        </button>
+      </template>
+    </Drawer>
   </div>`,
   setup() {
     const templates = useCollection('/api/templates');
@@ -1886,9 +2048,151 @@ const Templates = {
     }
     onBeforeUnmount(stopVersionRequest);
     const admin = computed(isAdmin);
+
+    const importFileInput = ref(null);
+    let importItemSeq = 0;
+    const imp = reactive({ open: false, busy: false, datasetId: null, mode: 'upsert', items: [], dragging: false, error: '' });
+    const importScenarios = computed(() => datasets.value.map(d => {
+      if (admin.value) return { ...d, _disabled: false, _reason: d.enabled ? '' : '已停用' };
+      if (!d.enabled) return { ...d, _disabled: true, _reason: '已停用' };
+      if (!d.table_count) return { ...d, _disabled: true, _reason: '无授权表' };
+      return { ...d, _disabled: false, _reason: '' };
+    }));
+    const selectableScenarios = computed(() => importScenarios.value.filter(d => !d._disabled));
+    const duplicateImportNames = computed(() => {
+      if (imp.mode !== 'upsert') return new Set();
+      const counts = new Map();
+      for (const item of imp.items) {
+        const key = (item.name || '').trim();
+        if (key) counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      return new Set([...counts.entries()].filter(([, c]) => c > 1).map(([k]) => k));
+    });
+    const canConfirmImport = computed(() => (
+      !!imp.datasetId
+      && imp.items.length > 0
+      && imp.items.every(it => !it.error && !!(it.name || '').trim())
+      && duplicateImportNames.value.size === 0
+    ));
+    function importActionInfo(item) {
+      if (item.error) return { label: '错误', cls: 'red' };
+      const name = (item.name || '').trim();
+      if (!name) return { label: '待填名称', cls: 'amber' };
+      if (imp.mode === 'upsert' && duplicateImportNames.value.has(name)) return { label: '重名冲突', cls: 'red' };
+      if (!imp.datasetId) return { label: '待选场景', cls: '' };
+      if (imp.mode === 'upsert') {
+        const meNo = state.me?.emp_no;
+        const existing = templates.list.value.find(
+          t => t.dataset_id === imp.datasetId && t.name === name && meNo && t.created_by === meNo
+        );
+        if (existing) return { label: `更新 v${existing.version + 1}`, cls: 'blue' };
+      }
+      return { label: '新增 v1', cls: 'green' };
+    }
+    async function openImport() {
+      Object.assign(imp, { open: true, busy: false, datasetId: null, mode: 'upsert', items: [], dragging: false, error: '' });
+      try { datasets.value = await api('/api/datasets'); } catch { /* 沿用已加载的场景列表 */ }
+    }
+    function closeImport() {
+      if (!imp.busy) imp.open = false;
+    }
+    function pickImportFiles() { importFileInput.value?.click(); }
+    function clearImportFiles() { imp.items = []; imp.error = ''; }
+    function removeImportItem(id) { imp.items = imp.items.filter(x => x.id !== id); imp.error = ''; }
+    function onImportDragLeave(event) {
+      if (!event.currentTarget.contains(event.relatedTarget)) imp.dragging = false;
+    }
+    function onImportDrop(event) {
+      imp.dragging = false;
+      const files = [...(event.dataTransfer?.files || [])];
+      if (files.length) addImportFiles(files);
+    }
+    function onImportFileChange(event) {
+      const files = [...(event.target?.files || [])];
+      if (event.target) event.target.value = '';
+      if (files.length) addImportFiles(files);
+    }
+    async function addImportFiles(files) {
+      if (imp.busy) return;
+      imp.error = '';
+      const remaining = MAX_TEMPLATE_IMPORT_FILES - imp.items.length;
+      if (remaining <= 0) {
+        imp.error = `单次最多导入 ${MAX_TEMPLATE_IMPORT_FILES} 个报告模板文件。`;
+        return;
+      }
+      const batch = files.slice(0, remaining);
+      if (files.length > remaining) imp.error = `超出单次 ${MAX_TEMPLATE_IMPORT_FILES} 个文件上限，已截取前 ${remaining} 个文件。`;
+      for (const file of batch) {
+        const rawName = (file.name || '').trim();
+        const low = rawName.toLowerCase();
+        let error = '';
+        let parsed = { name: rawName.replace(/\.(md|markdown)$/i, '') || '未命名模板', businessSummary: '', sectionCount: 0 };
+        if ((!low.endsWith('.md') && !low.endsWith('.markdown')) || parsed.name.length === 0) {
+          error = '仅支持 .md 或 .markdown 文件';
+        } else if (!file.size) {
+          error = '文件内容不能为空';
+        } else if (file.size > MAX_TEMPLATE_FILE_BYTES) {
+          error = '文件不能超过 2 MB';
+        } else {
+          try {
+            const text = await file.text();
+            parsed = inspectTemplateMarkdown(rawName, text);
+            if (parsed.empty) error = '文件内容不能为空';
+          } catch {
+            error = '无法读取文件文本';
+          }
+        }
+        imp.items.push({
+          id: ++importItemSeq,
+          file: markRaw(file),
+          fileName: rawName || file.name,
+          fileSize: file.size,
+          name: parsed.name,
+          businessSummary: parsed.businessSummary,
+          sectionCount: parsed.sectionCount,
+          error,
+        });
+      }
+    }
+    async function confirmImport() {
+      if (!canConfirmImport.value || imp.busy) return;
+      imp.busy = true;
+      imp.error = '';
+      try {
+        const body = new FormData();
+        body.append('dataset_id', String(imp.datasetId));
+        body.append('mode', imp.mode);
+        const meta = imp.items.map(it => ({
+          name: it.name.trim(),
+          business_summary: (it.businessSummary || '').trim(),
+        }));
+        body.append('items_meta', JSON.stringify(meta));
+        for (const it of imp.items) body.append('files', it.file);
+        const res = await api('/api/templates/import', { method: 'POST', body });
+        const s = res.summary;
+        toast(`已导入 ${s.total} 个模板到「${res.business_scenario}」（新增 ${s.create_count}，更新 ${s.update_count}）`, 'ok');
+        imp.open = false;
+        load();
+      } catch (e) {
+        imp.error = e.message;
+      } finally {
+        imp.busy = false;
+      }
+    }
+    async function downloadTemplateMd(t, version) {
+      const hasVer = version && version !== t.version;
+      const query = hasVer ? `?download=true&version=${version}` : '?download=true';
+      const blob = await run(() => api(`/api/templates/${t.id}${query}`, { download: true }));
+      const safe = (t.name || `template-${t.id}`).replace(/[\\/:*?"<>|]+/g, '_').trim() || `template-${t.id}`;
+      triggerDownload(blob, `${safe}${hasVer ? `-v${version}` : ''}.md`);
+    }
+
     return { ...templates, admin, creator, shown, form, datasets, busy, kw, editing, templateHeading,
       viewVersion, viewDate, viewMarkdown, versionLoading, historyVersion, wideReading, readVersion, canEdit, view, closeDetail,
-      edit, cancelEdit, save, del, loadVer, fmtTime, icon };
+      edit, cancelEdit, save, del, loadVer, fmtTime, fmtSize, icon,
+      importFileInput, imp, importScenarios, selectableScenarios, canConfirmImport, importActionInfo,
+      openImport, closeImport, pickImportFiles, clearImportFiles, removeImportItem, onImportDragLeave, onImportDrop,
+      onImportFileChange, confirmImport, downloadTemplateMd };
   }
 };
 

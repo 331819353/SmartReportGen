@@ -412,7 +412,8 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 |---|---|---|
 | `GET /api/templates` | 登录 | 可用 `q` 与 `dataset_id` 筛选。返回本人及授权场景的模板，管理员可查看全部 |
 | `POST /api/templates` | 登录 | 提交 Markdown、名称或正文一级标题，以及可选业务字段。返回 `version:1` |
-| `GET /api/templates/{tpl_id}` | 本人或有场景权限 | 返回指南正文、概要及 `versions` |
+| `POST /api/templates/import` | 登录 | `multipart/form-data` 一键导入 1–50 个 `.md` / `.markdown` 文件（单文件最大 2 MB）。必填 `dataset_id`（正整数，普通用户须具备该场景权限）；可选 `mode`（`upsert` 同名更新本人模板版本 / `create` 始终新建，默认 `upsert`）、`items_meta`（JSON 对象数组，按文件顺序指定 `name`、`business_summary`、`analysis_goal`、`user_requirement`）。缺省名称时依次取 Frontmatter `name`/`title`、正文一级标题或文件名。单批任一文件校验失败则整批不写入并返回 `400` |
+| `GET /api/templates/{tpl_id}` | 本人或有场景权限 | 返回指南正文、概要及 `versions`。传 `download=true`（及可选 `version`）时以 `text/markdown` 附件下载 `.md` 文件 |
 | `PUT /api/templates/{tpl_id}` | 创建人或管理员 | 提交 Markdown 与待更新字段。可传 `expected_version`，冲突返回 `409` |
 | `GET /api/templates/{tpl_id}/versions/{version}` | 本人或有场景权限 | 返回 `version`、`markdown`、`created_at` |
 | `DELETE /api/templates/{tpl_id}` | 创建人或管理员 | 删除模板及其历史版本；若仍有报告关联该模板则返回 `400` 拒绝删除 |
