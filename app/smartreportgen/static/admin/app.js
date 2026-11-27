@@ -56,8 +56,38 @@ function jsonOrThrow(txt, what) {
 }
 const pretty = v => JSON.stringify(v || {}, null, 2);
 
-const state = reactive({ page: location.hash.slice(1) || 'home', meta: null, needLogin: false, me: null, authCfg: null });
-window.addEventListener('hashchange', () => { state.page = location.hash.slice(1) || 'home'; });
+function adminRoute() {
+  const hash = location.hash.slice(1);
+  const claim = /^claim\/([A-Za-z0-9_-]{43})$/.exec(hash);
+  if (claim) return { page: 'claim', resourceId: null, claimToken: claim[1] };
+  const resource = /^(datasets|templates)\/([1-9]\d*)$/.exec(hash);
+  return { page: resource?.[1] || hash || 'home', resourceId: resource?.[2] || null, claimToken: null };
+}
+const state = reactive({ ...adminRoute(), meta: null, needLogin: false, me: null, authCfg: null });
+window.addEventListener('hashchange', () => Object.assign(state, adminRoute()));
+
+// 分享链接复用列表中的预览入口，列表加载失败时仍可独立打开资源。
+function useResourceLink(page, open) {
+  const linkError = ref('');
+  let request;
+  async function openLink() {
+    if (state.page !== page || !state.resourceId) return;
+    request?.abort();
+    request = new AbortController();
+    linkError.value = '';
+    try { await open(await api(`/api/${page}/${state.resourceId}`, { signal: request.signal })); }
+    catch (e) { if (e.name !== 'AbortError') linkError.value = e.message; }
+  }
+  function closeLink() {
+    if (state.page === page && state.resourceId) {
+      history.replaceState(null, '', '#' + page);
+      state.resourceId = null;
+    }
+  }
+  onMounted(openLink);
+  onBeforeUnmount(() => request?.abort());
+  return { linkError, openLink, closeLink };
+}
 
 // 报告版本变动后刷新管理总览与报告库。
 const reportRevision = ref(0);
@@ -661,6 +691,7 @@ const Datasets = {
   template: `<div>
     <div class="page-head"><div><h1>业务场景</h1><p>按业务主题找数据，查看每个场景可用于分析的数据表。</p></div>
       <div class="actions"><button type="button" v-if="admin" class="btn" @click="reindex">重建检索索引</button><button type="button" class="btn" @click="exportExcel"><span class="ico" v-html="icon('download')"></span>导出 Excel</button><button type="button" class="btn" @click="openImport"><span class="ico" v-html="icon('upload')"></span>Excel 批量导入</button><button type="button" class="btn primary" @click="edit()">新建业务场景</button></div></div>
+    <div v-if="linkError" class="msg err" role="alert">无法打开分享的业务场景。{{linkError}} <button type="button" class="btn link" @click="openLink">重试</button></div>
     <section class="card list-panel" aria-label="业务场景列表" :aria-busy="loading">
       <div class="list-tools">
         <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索业务场景、描述或标签" aria-label="搜索业务场景"></label>
@@ -680,7 +711,11 @@ const Datasets = {
             <td><b>{{d.business_scenario}}</b><div class="small muted">{{(d.tags||[]).join(' · ')}}</div><div class="small muted mono" v-if="d.analysis_file_name">{{d.analysis_file_name}}</div></td>
             <td class="scene-description"><div class="clip">{{d.business_description || '—'}}</div></td><td data-label="数据表">{{d.table_count}} 张</td>
             <td v-if="admin" data-label="状态"><span class="badge" :class="!d.enabled ? '' : d.vectorized ? 'green' : 'amber'">{{!d.enabled ? '停用' : d.vectorized ? '可用' : '索引待更新'}}</span></td>
-            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(d)">查看场景</button><button v-if="admin || d.read_only === false || d.analysis_file_name" type="button" class="btn link" @click="openAnalysisFile(d)">{{d.analysis_file_name ? '分析思路文件' : '添加分析思路'}}</button><template v-if="admin || d.read_only === false"><button type="button" class="btn link" @click="edit(d)">编辑</button><button type="button" class="btn link danger" @click="del(d)">删除</button></template></div></td>
+            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(d)">查看场景</button>
+              <button v-if="canEdit(d) || d.analysis_file_name" type="button" class="btn link" @click="openAnalysisFile(d)">{{d.analysis_file_name ? '分析思路文件' : '添加分析思路'}}</button>
+              <button v-if="canEdit(d)" type="button" class="btn link" @click="edit(d)">编辑</button>
+              <template v-if="d.access_level === 'manage'"><button type="button" class="btn link" @click="sharing=d">分享</button><button type="button" class="btn link danger" @click="del(d)">删除</button></template>
+            </div></td>
           </tr></tbody>
         </table>
       </div>
@@ -705,7 +740,7 @@ const Datasets = {
       </div>
     </details>
     <p class="small muted legacy-link" v-if="!admin"><a class="btn link" href="#datasources">查看这些场景使用的数据源</a></p>
-    <Drawer v-if="detail" :title="detail.business_scenario" @close="detail=null">
+    <Drawer v-if="detail" :title="detail.business_scenario" @close="closeDetail">
       <dl class="kv"><dt>业务描述</dt><dd class="business-copy">{{detail.business_description}}</dd>
         <dt>分析思路</dt><dd class="business-copy">{{detail.analysis_approach || '暂未填写'}}</dd>
         <dt v-if="detail.analysis_file_name">分析思路文件</dt><dd v-if="detail.analysis_file_name"><span class="mono">{{detail.analysis_file_name}}</span> <button type="button" class="btn link" @click="openAnalysisFile(detail)">预览文件</button></dd>
@@ -718,16 +753,22 @@ const Datasets = {
           <div v-for="r in t.source_row_filters" :key="'source-' + r.column" class="scene-filter-summary"><b>数据源 · {{r.column}}</b>：{{r.values.map(filterValueLabel).join('、')}}</div>
           <span v-if="!t.row_filters?.length && !t.source_row_filters?.length" class="muted">不限制</span></td></tr>
         <tr v-if="!detail.tables.length"><td colspan="3" class="empty">无</td></tr></tbody></table></div>
+      <template #foot>
+        <button type="button" class="btn" @click="closeDetail">关闭</button>
+        <button v-if="canEdit(detail)" type="button" class="btn primary" @click="edit(detail)">编辑业务场景</button>
+      </template>
     </Drawer>
+    <ResourceSharing v-if="sharing" kind="datasets" :resource="sharing" @close="sharing=null"/>
     <Drawer v-if="form" :title="form.id ? '编辑业务场景' : '新建业务场景'" wide :busy="busy" :backdrop-close="false" @close="closeForm">
       <div class="row2"><div class="field"><label for="scene-name">业务场景</label><input id="scene-name" class="in" v-model="form.business_scenario" placeholder="如：零售销售经营分析"></div>
         <div class="field"><label for="scene-source">数据源</label>
-          <select id="scene-source" class="in" v-model="form.datasource_id" @change="changeSource">
+          <input v-if="form.access_level === 'edit'" class="in" id="scene-source" :value="form.datasource_name" readonly>
+          <select v-else id="scene-source" class="in" v-model="form.datasource_id" @change="changeSource">
             <option :value="null" disabled>请选择</option>
             <option v-if="form.datasource_id && !sources.some(s => s.id === form.datasource_id)" :value="form.datasource_id" disabled>原数据源当前不可引用</option>
             <option v-for="s in sources" :key="s.id" :value="s.id">{{s.name}}（{{DS_LABEL[s.type]}}）</option>
           </select>
-          <p v-if="!sources.length" class="field-help">暂无可引用的数据源。请联系管理员配置数据源及可引用的表。</p></div></div>
+          <p v-if="form.access_level !== 'edit' && !sources.length" class="field-help">暂无可引用的数据源。请联系管理员配置数据源及可引用的表。</p></div></div>
       <div class="field"><label for="scene-description">业务描述 <small>说明数据范围、指标及适用的分析问题</small></label><textarea id="scene-description" class="in" v-model="form.business_description" rows="4"></textarea></div>
       <div class="field"><label for="scene-approach">分析思路 <small>选填</small></label>
         <p class="field-help" id="scene-approach-help">说明先看什么、怎么比较、需要验证哪些假设。也可补充报告应回答的问题、适合的图表和需要切换的筛选条件。</p>
@@ -783,7 +824,7 @@ const Datasets = {
           <div style="margin-top:8px"><a class="btn link" :href="appPath('/api-guide')" target="_blank" rel="noopener">查看配置字段</a></div>
         </div>
       </div>
-      <section class="field" aria-labelledby="scene-tables-label"><h3 id="scene-tables-label" class="scene-tables-label">表和视图 <small class="muted">{{form.tables.length}} 项</small></h3>
+      <section v-if="form.access_level !== 'edit'" class="field" aria-labelledby="scene-tables-label"><h3 id="scene-tables-label" class="scene-tables-label">表和视图 <small class="muted">{{form.tables.length}} 项</small></h3>
         <p class="field-help">按需设置各表的取值范围。场景取数时自动应用这些条件。</p>
         <div v-for="(t,i) in form.tables" :key="t.key" class="scene-table-entry">
           <div class="scene-table-fields">
@@ -825,7 +866,8 @@ const Datasets = {
           <div v-else-if="!pickShown.length" class="small muted" role="status">{{pickLoading ? '正在加载…' : pickKw ? '没有匹配的表或视图' : '数据源没有可选的表或视图'}}</div>
         </div>
       </section>
-      <label class="check"><input type="checkbox" v-model="form.enabled"> 启用（停用后不参与检索）</label>
+      <label v-if="form.access_level !== 'edit'" class="check"><input type="checkbox" v-model="form.enabled"> 启用（停用后不参与检索）</label>
+      <p v-else class="field-help">数据源、表和取值范围由场景创建人或管理员维护。</p>
       <div v-if="saveError" class="msg err" role="alert">{{saveError}}</div>
       <template #foot><button class="btn" type="button" @click="closeForm" :disabled="busy">取消</button><button class="btn primary" type="button" @click="save" :disabled="busy">{{busy ? '正在保存…' : '保存业务场景'}}</button></template>
     </Drawer>
@@ -936,12 +978,19 @@ const Datasets = {
     const { load } = scenes;
     const sources = ref([]), form = ref(null), busy = ref(false), q = ref(''), sr = ref(null), picker = ref(null), pickKw = ref(''), detail = ref(null);
     const kw = ref(''), searching = ref(false), searchError = ref(''), saveError = ref('');
+    const sharing = ref(null);
     const pickLoading = ref(false), pickError = ref('');
     const initialSnapshot = ref('');
     const formDirty = computed(() => !!form.value && sceneFormSnapshot(form.value) !== initialSnapshot.value);
     const shown = computed(() => scenes.list.value.filter(d => matches(kw.value, d.business_scenario, d.business_description, d.analysis_file_name, ...(d.tags || []))));
     const admin = computed(isAdmin);
-    async function view(d) { detail.value = await run(() => api('/api/datasets/' + d.id)); }
+    const canEdit = d => ['manage', 'edit'].includes(d.access_level);
+    const resourceLink = useResourceLink('datasets', d => { detail.value = d; });
+    function closeDetail() { detail.value = null; resourceLink.closeLink(); }
+    async function view(d) {
+      try { detail.value = await run(() => api('/api/datasets/' + d.id)); }
+      catch { /* 失败时保留列表，错误由通知显示。 */ }
+    }
     onMounted(async () => {
       const available = await run(() => api('/api/datasources'));
       sources.value = available.filter(source => admin.value || source.can_build_scene);
@@ -989,18 +1038,24 @@ const Datasets = {
       busy.value = true; saveError.value = '';
       const f = form.value;
       try {
-        const tables = f.tables.map(t => {
-          if (!t.table_name.trim()) throw new Error('请为每个表或视图填写名称，或移除空白项。');
-          const row_filters = t.row_filters.map(r => {
-            if (!r.column || !r.values.length) throw new Error(`${t.table_name}：请选择字段并勾选保留值，或移除这条条件。`);
-            return { column: r.column, values: r.values };
-          });
-          return { table_name: t.table_name, table_description: t.table_description, row_filters };
-        });
         const semantic_metrics = f.metricsMode === 'visual' ? draftsToMetrics(f.metricDrafts) : jsonOrThrow(f.metricsTxt, '官方指标');
-        const body = { business_scenario: f.business_scenario, business_description: f.business_description, analysis_approach: f.analysis_approach,
-          datasource_id: f.datasource_id, tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), enabled: f.enabled, tables, semantic_metrics };
-        await api(f.id ? `/api/datasets/${f.id}` : '/api/datasets', { method: f.id ? 'PUT' : 'POST', body });
+        const body = { business_scenario: f.business_scenario, business_description: f.business_description,
+          analysis_approach: f.analysis_approach, tags: f.tagsTxt.split(/[,，]/).map(s => s.trim()).filter(Boolean), semantic_metrics };
+        // 协作者只提交可维护的业务字段，避免覆盖管理者同时更新的表范围。
+        if (f.access_level !== 'edit') {
+          body.datasource_id = f.datasource_id;
+          body.enabled = f.enabled;
+          body.tables = f.tables.map(t => {
+            if (!t.table_name.trim()) throw new Error('请为每个表或视图填写名称，或移除空白项。');
+            const row_filters = t.row_filters.map(r => {
+              if (!r.column || !r.values.length) throw new Error(`${t.table_name}：请选择字段并勾选保留值，或移除这条条件。`);
+              return { column: r.column, values: r.values };
+            });
+            return { table_name: t.table_name, table_description: t.table_description, row_filters };
+          });
+        }
+        const saved = await api(f.id ? `/api/datasets/${f.id}` : '/api/datasets', { method: f.id ? 'PUT' : 'POST', body });
+        if (detail.value?.id === saved.id) detail.value = saved;
         toast('已保存', 'ok'); form.value = null; load();
       } catch (e) { saveError.value = e.message; }
       finally { busy.value = false; }
@@ -1247,7 +1302,7 @@ const Datasets = {
         analysisDoc.busy = false;
       }
     }
-    return { ...scenes, admin, detail, view, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
+    return { ...scenes, ...resourceLink, admin, detail, view, closeDetail, sharing, canEdit, shown, kw, sources, form, busy, q, sr, searching, searchError, saveError,
       picker, pickKw, pickShown, pickLoading, pickError, edit, closeForm, save, del, search, reindex, pick, has, togglePick,
       addTable, changeSource, changeTable, loadColumns, toggleFilters, changeRuleColumn, addRule,
       switchMetricsMode, onMetricOpChange, addMetric, METRIC_OPS, BINARY_METRIC_OPS, RATIO_METRIC_OPS,
@@ -1762,6 +1817,7 @@ const Templates = {
           <button type="button" class="btn primary" @click="edit()"><span class="ico" v-html="icon('plus')"></span>新建模板</button>
         </div>
       </div>
+      <div v-if="linkError" class="msg err" role="alert">无法打开分享的报告模板。{{linkError}} <button type="button" class="btn link" @click="openLink">重试</button></div>
       <section class="card list-panel" aria-label="模板列表" :aria-busy="loading">
         <div class="list-tools">
           <label class="search-field"><span class="ico" v-html="icon('search')"></span><input type="search" v-model="kw" placeholder="搜索模板名称、场景或用途" aria-label="搜索模板"></label>
@@ -1784,8 +1840,11 @@ const Templates = {
           <tbody><tr v-for="t in shown" :key="t.id">
             <td><b>{{t.name}}</b> <span class="badge">v{{t.version}}</span><div class="small muted clip">{{t.business_summary || t.analysis_goal || t.user_requirement}}</div></td>
             <td data-label="业务场景">{{t.business_scenario || '—'}}</td><td v-if="admin" data-label="创建人">{{creator(t)}}</td><td data-label="更新时间"><time :datetime="t.updated_at">{{fmtTime(t.updated_at)}}</time></td>
-            <td class="record-actions"><div class="links"><button type="button" class="btn link" @click="view(t)">查看</button>
-              <button type="button" v-if="canEdit(t)" class="btn link danger" @click="del(t)">删除</button></div></td>
+            <td class="record-actions"><div class="links">
+              <button type="button" class="btn link" @click="view(t)">查看</button>
+              <button type="button" v-if="canEdit(t)" class="btn link" @click="view(t, true)">编辑</button>
+              <template v-if="t.access_level === 'manage'"><button type="button" class="btn link" @click="sharing=t">分享</button><button type="button" class="btn link danger" @click="del(t)">删除</button></template>
+            </div></td>
           </tr></tbody>
         </table></div>
       </section>
@@ -1809,6 +1868,7 @@ const Templates = {
               <span class="ico" v-html="icon('download')"></span>下载 .md
             </button>
             <button type="button" class="btn template-reading-width" :aria-pressed="wideReading" @click="wideReading=!wideReading">宽页</button>
+            <button type="button" v-if="form.access_level === 'manage'" class="btn" @click="sharing=form">分享</button>
             <button type="button" v-if="canEdit(form)" class="btn primary" @click="edit(form)">
               <span class="ico" v-html="icon('pencil')"></span>编辑模板
             </button>
@@ -1840,7 +1900,8 @@ const Templates = {
             <fieldset class="template-meta" aria-label="模板信息" :disabled="busy">
               <div class="field"><label for="template-name">模板名称</label><input id="template-name" class="in" v-model="form.name" placeholder="留空时使用正文标题"></div>
               <div class="field"><label for="template-scenario">业务场景</label>
-                <select id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">不关联业务场景</option>
+                <input v-if="form.access_level === 'edit'" id="template-scenario" class="in" :value="form.business_scenario || '未关联'" readonly>
+                <select v-else id="template-scenario" class="in" v-model="form.dataset_id"><option :value="null">不关联业务场景</option>
                   <option v-if="form.dataset_id && !datasets.some(d => d.id === form.dataset_id)" :value="form.dataset_id">原场景（当前不可选）</option>
                   <option v-for="d in datasets" :key="d.id" :value="d.id">{{d.business_scenario}}</option></select></div>
               <details class="template-extra">
@@ -1864,6 +1925,7 @@ const Templates = {
         </div>
       </section>
     </template>
+    <ResourceSharing v-if="sharing" kind="templates" :resource="sharing" @close="sharing=null"/>
     <Drawer v-if="imp.open" title="一键导入报告模板" wide :busy="imp.busy" :backdrop-close="false" @close="closeImport">
       <div class="tpl-import-top">
         <div class="field">
@@ -1936,6 +1998,8 @@ const Templates = {
     const templates = useCollection('/api/templates');
     const { load } = templates;
     const form = ref(null), datasets = ref([]), busy = ref(false), kw = ref('');
+    const sharing = ref(null);
+    const resourceLink = useResourceLink('templates', showDetail);
     const editing = ref(false), templateHeading = ref(null), viewVersion = ref(null), viewMarkdown = ref('');
     const versionLoading = ref(false), historyVersion = ref(null), wideReading = ref(false);
     const viewDate = computed(() => form.value?.versions?.find(v => v.version === viewVersion.value)?.created_at
@@ -1943,8 +2007,12 @@ const Templates = {
     let savedTemplate = null, loadedMarkdown = '', versionRequest = null;
     const shown = computed(() => templates.list.value.filter(t => matches(kw.value, t.name, t.business_scenario, t.business_summary, t.analysis_goal, t.user_requirement)));
     onMounted(async () => { datasets.value = await run(() => api('/api/datasets')); });
-    async function view(t) {
-      try { await showDetail(await run(() => api(`/api/templates/${t.id}`))); }
+    async function view(t, openEditor = false) {
+      try {
+        const full = await run(() => api(`/api/templates/${t.id}`));
+        if (openEditor && canEdit(full)) await edit(full);
+        else await showDetail(full);
+      }
       catch { /* 请求错误由通知显示，列表可继续使用。 */ }
     }
     async function showDetail(t) {
@@ -1964,6 +2032,7 @@ const Templates = {
     async function closeDetail() {
       stopVersionRequest();
       form.value = null;
+      resourceLink.closeLink();
       await nextTick();
       window.scrollTo(0, 0);
       templateHeading.value?.focus({ preventScroll: true });
@@ -1987,7 +2056,7 @@ const Templates = {
         if (versionRequest === request) stopVersionRequest();
       }
     }
-    const canEdit = t => isAdmin() || t.created_by === state.me?.emp_no;
+    const canEdit = t => ['manage', 'edit'].includes(t.access_level);
     async function edit(t) {
       // 从最新版建立编辑副本。需要恢复历史内容时，可在编辑器内载入所选正文。
       stopVersionRequest();
@@ -2006,8 +2075,9 @@ const Templates = {
     }
     async function save() {
       busy.value = true;
-      const f = form.value, body = { name: f.name, markdown: f.markdown, dataset_id: f.dataset_id,
+      const f = form.value, body = { name: f.name, markdown: f.markdown,
         user_requirement: f.user_requirement, analysis_goal: f.analysis_goal, business_summary: f.business_summary };
+      if (f.access_level !== 'edit') body.dataset_id = f.dataset_id;
       // 带上开始编辑时的版本，避免覆盖别人刚保存的正文。
       if (f.id) body.expected_version = f.version;
       try {
@@ -2187,7 +2257,7 @@ const Templates = {
       triggerDownload(blob, `${safe}${hasVer ? `-v${version}` : ''}.md`);
     }
 
-    return { ...templates, admin, creator, shown, form, datasets, busy, kw, editing, templateHeading,
+    return { ...templates, ...resourceLink, admin, creator, shown, form, datasets, busy, kw, editing, templateHeading, sharing,
       viewVersion, viewDate, viewMarkdown, versionLoading, historyVersion, wideReading, readVersion, canEdit, view, closeDetail,
       edit, cancelEdit, save, del, loadVer, fmtTime, fmtSize, icon,
       importFileInput, imp, importScenarios, selectableScenarios, canConfirmImport, importActionInfo,
@@ -2197,10 +2267,15 @@ const Templates = {
 };
 
 // ------------------------------------------------------------ 报告
-const ReportSharing = {
-  components: { Drawer }, props: ['report'], emits: ['close'],
-  template: `<Drawer title="分享报告" compact :busy="busy" @close="$emit('close')">
-    <p class="report-dialog-name">{{report.name}}</p>
+const ResourceSharing = {
+  components: { Drawer }, props: ['resource', 'kind'], emits: ['close'],
+  template: `<Drawer :title="'分享' + label" compact :busy="busy" @close="$emit('close')">
+    <p class="report-dialog-name">{{resource.name || resource.business_scenario}}</p>
+    <div class="seg share-methods" role="group" aria-label="分享方式">
+      <button type="button" class="btn toggle" :aria-pressed="mode === 'people'" :disabled="busy" @click="mode='people'">指定用户</button>
+      <button type="button" class="btn toggle" :aria-pressed="mode === 'links'" :disabled="busy" @click="showClaimLinks">24 小时领取链接</button>
+    </div>
+    <template v-if="mode === 'people'">
     <div v-if="!manual && !selectedRecipient" class="report-recipient-picker">
       <div class="field">
         <label for="share-recipient-search">选择接收人</label>
@@ -2228,7 +2303,7 @@ const ReportSharing = {
           <input id="share-emp-no" class="in" ref="recipient" v-model.trim="empNo" maxlength="256" :disabled="busy" :readonly="!manual" required>
           <button type="button" class="btn link report-recipient-switch" :disabled="busy" @click="useDirectory">{{manual ? '选择已有用户' : '更换'}}</button>
         </div>
-        <p v-if="manual" class="field-help">请输入已登记并具备报告数据权限的工号。</p>
+        <p v-if="manual" class="field-help">请输入已登记并启用的工号。</p>
         <p v-else-if="selectedRecipient.name" class="field-help">{{selectedRecipient.name}}</p>
       </div>
       <template v-if="manual || selectedRecipient">
@@ -2237,7 +2312,7 @@ const ReportSharing = {
         <button class="btn primary" :disabled="busy || loading || loadFailed || !empNo">{{busy ? '处理中…' : '保存权限'}}</button>
       </template>
     </form>
-    <p class="field-help">接收人需用获授权的工号登录海尔 IAM 后打开链接。</p>
+    <p class="field-help">{{hint}}接收人使用获授权的工号登录海尔 IAM 后可打开链接。</p>
     <p v-if="error" class="msg err" role="alert">{{error}}</p>
     <section class="report-share-people" aria-labelledby="share-people-title" :aria-busy="loading || busy">
       <h3 id="share-people-title">已分享的用户</h3>
@@ -2253,20 +2328,63 @@ const ReportSharing = {
         </li>
       </ul>
     </section>
-    <div v-if="url" class="field"><label for="share-url">报告链接</label>
+    <div v-if="url" class="field"><label for="share-url">{{label}}链接</label>
       <input id="share-url" class="in" ref="link" :value="url" readonly @focus="$event.target.select()"></div>
+    </template>
+    <template v-else>
+      <p class="field-help">持有链接的员工可在 24 小时内登录海尔 IAM 并领取。领取后的权限可在「指定用户」中管理。</p>
+      <p class="field-help">{{hint}}</p>
+      <form class="report-share-form" @submit.prevent="createClaimLink">
+        <div class="field"><label for="claim-access">领取权限</label>
+          <select id="claim-access" class="in" v-model="claimLevel" :disabled="busy">
+            <option value="view">可查看</option><option value="edit">可编辑</option>
+          </select>
+        </div>
+        <button class="btn primary" :disabled="busy || linksLoading">{{busy ? '处理中…' : '生成领取链接'}}</button>
+      </form>
+      <p v-if="claimError" class="msg err" role="alert">{{claimError}}</p>
+      <section class="report-share-people" aria-labelledby="claim-links-title" :aria-busy="linksLoading || busy">
+        <h3 id="claim-links-title">有效链接</h3>
+        <p v-if="linksLoading" class="muted" role="status">正在加载…</p>
+        <button v-else-if="linksFailed" class="btn link" type="button" @click="loadClaimLinks">重试加载</button>
+        <p v-else-if="!claimLinks.length" class="muted">尚无有效链接。</p>
+        <ul v-else>
+          <li v-for="entry in claimLinks" :key="entry.id">
+            <div><b>{{entry.access_level === 'edit' ? '可编辑' : '可查看'}}<template v-if="entry.version"> · 版本 {{entry.version}}</template></b>
+              <div class="small muted">{{expiryText(entry.expires_at)}} 到期</div></div>
+            <div class="links">
+              <button class="btn link" type="button" :disabled="busy" @click="copyClaimLink(entry)">复制领取链接</button>
+              <button class="btn link danger" type="button" :disabled="busy" @click="revokeClaimLink(entry)">停用链接</button>
+            </div>
+          </li>
+        </ul>
+      </section>
+      <div v-if="chosenLink" class="field"><label for="claim-url">领取链接</label>
+        <input id="claim-url" class="in" ref="claimInput" :value="chosenLink.url" readonly @focus="$event.target.select()"></div>
+    </template>
     <template #foot>
       <button type="button" class="btn" :disabled="busy" @click="$emit('close')">关闭</button>
-      <button type="button" class="btn" :disabled="!url || busy" @click="copyLink">复制链接</button>
+      <button v-if="mode === 'people'" type="button" class="btn" :disabled="!url || busy" @click="copyLink">复制预览链接</button>
+      <button v-else-if="chosenLink" type="button" class="btn" :disabled="busy" @click="sendClaimLink">{{nativeShare ? '发送链接' : '复制当前链接'}}</button>
     </template>
   </Drawer>`,
   setup(props) {
-    const path = '/api/reports/' + props.report.id;
+    // 三种资源共用分享操作。报告继续分享所选版本，场景和模板链接打开当前内容。
+    const { kind, resource } = props;
+    const label = { reports: '报告', datasets: '业务场景', templates: '报告模板' }[kind];
+    const hint = { reports: '接收人需具备报告数据权限。', datasets: '分享同时授予场景内的数据权限，取数应用配置的行范围。',
+      templates: '模板关联业务场景时，接收人需有该场景权限。' }[kind];
+    const path = '/api/' + kind + '/' + resource.id;
+    const linksPath = '/api/share-links/' + kind + '/' + resource.id;
     const shares = ref([]), empNo = ref(''), level = ref('view'), url = ref('');
     const busy = ref(false), loading = ref(true), loadFailed = ref(false), error = ref('');
     const recipient = ref(null), link = ref(null), searchInput = ref(null);
     const manual = ref(false), selectedRecipient = ref(null), query = ref('');
     const candidates = ref([]), searching = ref(true), searchError = ref(false);
+    const mode = ref('people'), claimLevel = ref('view'), claimLinks = ref([]), chosenLink = ref(null);
+    const claimInput = ref(null), claimError = ref(''), linksLoading = ref(false), linksFailed = ref(false);
+    const nativeShare = typeof navigator.share === 'function';
+    const expiryText = value => new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
     let searchTimer, searchRevision = 0;
     // 较慢的旧请求不能覆盖新关键词的结果，手动输入也不依赖目录请求成功。
     async function search(term, revision = ++searchRevision) {
@@ -2293,8 +2411,11 @@ const ReportSharing = {
       error.value = '';
       loadFailed.value = false;
       try {
-        const [info, people] = await Promise.all([api(path + '?version=' + props.report.revision), api(path + '/shares')]);
-        url.value = info.url;
+        const [people, report] = await Promise.all([
+          api(path + '/shares'),
+          kind === 'reports' ? api(path + '?version=' + resource.revision) : null,
+        ]);
+        url.value = report?.url || new URL(appPath('/#' + kind + '/' + resource.id), location.origin).href;
         shares.value = people;
       } catch (e) { loadFailed.value = true; error.value = e.message; }
       finally { loading.value = false; }
@@ -2335,7 +2456,7 @@ const ReportSharing = {
       finally { busy.value = false; }
     }
     async function revoke(share) {
-      if (busy.value || !await askConfirm({ title: '撤销报告权限', message: '确认撤销 ' + share.emp_no + ' 的报告权限？', confirmText: '撤销' })) return;
+      if (busy.value || !await askConfirm({ title: '撤销' + label + '分享', message: '确认撤销 ' + share.emp_no + ' 的' + label + '分享吗？', confirmText: '撤销' })) return;
       busy.value = true;
       error.value = '';
       try {
@@ -2350,8 +2471,75 @@ const ReportSharing = {
       try { await navigator.clipboard.writeText(url.value); toast('链接已复制', 'ok'); }
       catch { link.value?.focus(); link.value?.select(); toast('链接已选中，可以手动复制'); }
     }
-    return { shares, empNo, level, url, busy, loading, loadFailed, error, recipient, link, load, choose, save, revoke, copyLink,
-      searchInput, manual, selectedRecipient, query, candidates, searching, searchError, search, useManual, useDirectory };
+    async function loadClaimLinks() {
+      linksLoading.value = true;
+      linksFailed.value = false;
+      claimError.value = '';
+      try {
+        claimLinks.value = await api(linksPath);
+        chosenLink.value = claimLinks.value.find(entry => entry.id === chosenLink.value?.id) || claimLinks.value[0] || null;
+      } catch (e) { linksFailed.value = true; claimError.value = e.message; }
+      finally { linksLoading.value = false; }
+    }
+    function showClaimLinks() {
+      if (mode.value === 'links') return;
+      mode.value = 'links';
+      loadClaimLinks();
+    }
+    async function createClaimLink() {
+      if (busy.value || linksLoading.value) return;
+      busy.value = true;
+      claimError.value = '';
+      try {
+        const body = { access_level: claimLevel.value };
+        // 报告领取后打开生成链接时选中的版本。
+        if (kind === 'reports') body.version = resource.revision;
+        const created = await api(linksPath, { method: 'POST', body });
+        claimLinks.value = [created, ...claimLinks.value];
+        chosenLink.value = created;
+        toast('领取链接已生成', 'ok');
+      } catch (e) { claimError.value = e.message; }
+      finally { busy.value = false; }
+    }
+    async function copyClaimLink(entry) {
+      chosenLink.value = entry;
+      try { await navigator.clipboard.writeText(entry.url); toast('领取链接已复制', 'ok'); }
+      catch {
+        await nextTick();
+        claimInput.value?.focus();
+        claimInput.value?.select();
+        toast('链接已选中，可以手动复制');
+      }
+    }
+    async function sendClaimLink() {
+      const entry = chosenLink.value;
+      if (nativeShare) {
+        try {
+          await navigator.share({ title: '分享' + label, url: entry.url });
+          return;
+        } catch (e) {
+          if (e.name === 'AbortError') return;
+        }
+      }
+      await copyClaimLink(entry);
+    }
+    async function revokeClaimLink(entry) {
+      if (busy.value || !await askConfirm({ title: '停用领取链接',
+        message: '停用后此链接无法再次领取，已领取用户的权限可在「指定用户」中管理。', confirmText: '停用' })) return;
+      busy.value = true;
+      claimError.value = '';
+      try {
+        await api(linksPath + '/' + entry.id, { method: 'DELETE' });
+        claimLinks.value = claimLinks.value.filter(item => item.id !== entry.id);
+        if (chosenLink.value?.id === entry.id) chosenLink.value = claimLinks.value[0] || null;
+        toast('领取链接已停用', 'ok');
+      } catch (e) { claimError.value = e.message; }
+      finally { busy.value = false; }
+    }
+    return { label, hint, shares, empNo, level, url, busy, loading, loadFailed, error, recipient, link, load, choose, save, revoke, copyLink,
+      searchInput, manual, selectedRecipient, query, candidates, searching, searchError, search, useManual, useDirectory,
+      mode, claimLevel, claimLinks, chosenLink, claimInput, claimError, linksLoading, linksFailed, expiryText,
+      loadClaimLinks, showClaimLinks, createClaimLink, copyClaimLink, revokeClaimLink, nativeShare, sendClaimLink };
   }
 };
 
@@ -2531,7 +2719,7 @@ const ReportMerge = {
 };
 
 const Reports = {
-  components: { ReportSharing, ReportEditor, ReportVersions, ReportMerge },
+  components: { ReportEditor, ReportVersions, ReportMerge },
   template: `<div>
     <div class="page-head"><div><h1>报告库</h1><p>{{admin ? '查看所有用户已生成的报告。' : '查看自己生成的报告和他人分享给你的报告。'}}</p></div>
       <div class="actions">
@@ -2577,7 +2765,7 @@ const Reports = {
         </tr></tbody>
       </table></div>
     </section>
-    <ReportSharing v-if="sharing" :report="sharing" @close="sharing=null"/>
+    <ResourceSharing v-if="sharing" kind="reports" :resource="sharing" @close="sharing=null"/>
     <ReportEditor v-if="editing" :report="editing" @close="editing=null" @saved="saved"/>
     <ReportVersions v-if="versions" :report="versions" @close="versions=null" @selected="selected"/>
     <ReportMerge v-if="merging" v-model:reports="picked" @close="merging=false" @downloaded="merged"/>
@@ -3212,14 +3400,59 @@ const Login = {
   template: `<main class="login-shell">
     <div class="card login">
       <a class="brand" :href="appPath('/')"><span class="brand-icon" v-html="icon('rep')"></span><span>报告管理台<small>SmartReportGen</small></span></a>
-      <h1>登录报告管理台</h1><p class="login-intro">登录后可查看报告、模板及已授权的业务数据。</p>
+      <h1>{{claimToken ? '登录后领取分享' : '登录报告管理台'}}</h1>
+      <p class="login-intro">{{claimToken ? '请用海尔账号登录，在链接到期前领取。' : '登录后可查看报告、模板及已授权的业务数据。'}}</p>
       <template v-if="cfg">
-        <a v-if="cfg.iam_configured" class="btn primary big" :href="appPath('/auth/iam/login?next=' + encodeURIComponent(BASE_PATH ? BASE_PATH + '/' : '/'))">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
+        <form v-if="cfg.iam_configured && claimToken" :action="cfg.share_login_url || appPath('/auth/iam/share-login')" method="post">
+          <input type="hidden" name="token" :value="claimToken">
+          <button class="btn primary big" type="submit">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></button>
+        </form>
+        <a v-else-if="cfg.iam_configured" class="btn primary big" :href="loginUrl">使用海尔账号登录 <span class="ico" v-html="icon('arrow')"></span></a>
         <div v-else class="msg warn" role="status">海尔单点登录暂不可用，请联系系统管理员。</div>
       </template>
     </div>
   </main>`,
-  setup() { return { cfg: computed(() => state.authCfg), icon, appPath, BASE_PATH }; }
+  setup() {
+    // IAM 回跳保留分享链接的页面与资源 ID，登录后直接预览。
+    const loginUrl = computed(() => {
+      const hash = '#' + state.page + (state.resourceId ? '/' + state.resourceId : '');
+      return appPath('/auth/iam/login?next=' + encodeURIComponent(location.pathname + location.search + hash));
+    });
+    return { cfg: computed(() => state.authCfg), claimToken: computed(() => state.claimToken), icon, appPath, loginUrl };
+  }
+};
+
+const ShareClaim = {
+  props: { token: String },
+  template: `<main class="login-shell">
+    <div class="card login">
+      <a class="brand" :href="appPath('/')"><span class="brand-icon" v-html="icon('rep')"></span><span>报告管理台<small>SmartReportGen</small></span></a>
+      <h1>领取分享</h1>
+      <p class="login-intro">当前账号 {{account}}。领取成功后将打开对应的业务场景、报告模板或报告。</p>
+      <p v-if="error" class="msg err" role="alert">{{error}}</p>
+      <div class="actions">
+        <button type="button" class="btn primary big" :disabled="busy || expired" @click="claim">{{busy ? '正在领取…' : '领取并打开'}}</button>
+        <a class="btn" :href="appPath('/')">返回管理台</a>
+      </div>
+    </div>
+  </main>`,
+  setup(props) {
+    const busy = ref(false), error = ref(''), expired = ref(false);
+    const account = computed(() => state.me?.name ? `${state.me.name}（${state.me.emp_no}）` : state.me?.emp_no);
+    async function claim() {
+      busy.value = true;
+      error.value = '';
+      try {
+        // 只有用户确认后才提交授权，预览链接的客户端和扫描器不会产生领取记录。
+        const result = await api('/api/share-links/claim', { method: 'POST', body: { token: props.token } });
+        location.replace(result.url);
+      } catch (e) {
+        expired.value = e.status === 410;
+        error.value = e.message;
+      } finally { busy.value = false; }
+    }
+    return { account, appPath, icon, busy, error, expired, claim };
+  }
 };
 
 // ------------------------------------------------------------ 我的权限与接入（所有登录员工）
@@ -3276,8 +3509,9 @@ const appRoot = document.getElementById('app');
 if (appRoot.dataset.reportId) {
   createApp(ReportViewer, { reportId: appRoot.dataset.reportId, initialVersion: appRoot.dataset.reportVersion }).mount(appRoot);
 } else createApp({
-  components: { Login, ConfirmDialog },
+  components: { Login, ShareClaim, ConfirmDialog },
   template: `<Login v-if="state.needLogin"/>
+  <ShareClaim v-else-if="state.me && state.claimToken" :key="state.claimToken" :token="state.claimToken"/>
   <div class="shell" v-else-if="state.me">
     <a class="btn skip-link" href="#main-content" @click.prevent="main?.focus()">跳到主内容</a>
     <aside class="side">
@@ -3325,7 +3559,8 @@ if (appRoot.dataset.reportId) {
     const current = computed(() => currentGroup.value.items.find(n => n[0] === state.page) || groups.value[0].items[0]);
     const page = computed(() => PAGES[current.value[0]]);
     // 身份变化后重新查询当前用户的权限详情，其他页面保留原有编辑状态。
-    const pageKey = computed(() => current.value[0] === 'mine' ? `mine:${isAdmin()}:${state.me?.registered}` : current.value[0]);
+    const pageKey = computed(() => current.value[0] === 'mine' ? `mine:${isAdmin()}:${state.me?.registered}`
+      : (state.resourceId ? `${current.value[0]}:${state.resourceId}` : current.value[0]));
     const person = computed(() => state.me?.name || state.me?.emp_no || '管理员');
     watch(() => current.value[0], async () => {
       menuOpen.value = false;
@@ -3364,4 +3599,4 @@ if (appRoot.dataset.reportId) {
     onBeforeUnmount(() => window.removeEventListener('focus', refreshIdentity));
     return { state, page, pageKey, groups, currentGroup, current, person, menuOpen, main, bootError, init, icon, toasts, logout };
   }
-}).mount('#app');
+}).component('ResourceSharing', ResourceSharing).mount('#app');

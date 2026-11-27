@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -107,6 +108,22 @@ class ScenarioAnalysisFileTest(unittest.TestCase):
         self.enterContext(patch.object(repo, "get_dataset", side_effect=self.store.get_dataset))
         self.enterContext(patch.object(repo.db, "execute", side_effect=self.store.execute))
         self.enterContext(patch.object(repo, "reindex_dataset", side_effect=self.store.reindex_dataset))
+        # 文件更新和权限变更共用场景行锁，测试用内存记录模拟行锁与提交。
+        class Connection:
+            transaction = staticmethod(nullcontext)
+
+            def execute(conn, sql, params):
+                if sql.startswith("SELECT id, owner_emp_no"):
+                    ds = self.store.get_dataset(params[0])
+                    return type("Row", (), {"fetchone": lambda _: ds})()
+                self.store.execute(sql, params)
+
+        @contextmanager
+        def fake_conn():
+            yield Connection()
+
+        self.enterContext(patch.object(repo.db, "conn", side_effect=fake_conn))
+        self.enterContext(patch.object(api.permission, "access_for", side_effect=lambda p, **_: Access(p, all=p.is_admin)))
 
     def test_repo_validation_replace_and_delete(self):
         # UTF-8 BOM、Windows 换行符和目录前缀都会被规范化
@@ -171,7 +188,7 @@ class ScenarioAnalysisFileTest(unittest.TestCase):
                 "Bearer other-tok": self.other,
             }.get(token) or (_ for _ in ()).throw(auth.AuthError("无效令牌"))
 
-        def _fake_access(principal):
+        def _fake_access(principal, **_):
             if principal.is_admin:
                 return Access(principal, all=True)
             if principal.emp_no == "E200":

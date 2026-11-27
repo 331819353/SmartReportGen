@@ -72,6 +72,8 @@ class _FakeCursor:
 
     def _run(self, sql: str, params):
         norm = " ".join(sql.split())
+        if norm.startswith("SELECT access_level FROM report_template.report_template_share"):
+            return
         if norm.startswith("SELECT id, business_scenario") and "FROM dataset.dataset WHERE id=%s" in norm:
             ds_id = int(params[0])
             ds = self.store.datasets.get(ds_id)
@@ -196,7 +198,7 @@ class TemplateImportTest(unittest.TestCase):
             rows.sort(key=lambda r: r["version"], reverse=True)
             return rows
 
-        def _fake_access(principal: Principal):
+        def _fake_access(principal: Principal, **_):
             if principal.is_admin:
                 return Access(principal, all=True)
             if principal.emp_no == "E200":
@@ -456,10 +458,11 @@ class TemplateImportTest(unittest.TestCase):
                 return self.user
             raise auth.AuthError("无效令牌")
 
-        def _fake_list_templates(q=None, owner=None, dataset_id=None, *, allowed_datasets=None):
+        def _fake_list_templates(q=None, owner=None, dataset_id=None, *, allowed_datasets=None, share_only_datasets=None):
             rows = [self.store._template_row(tid) for tid in sorted(self.store.templates, reverse=True)]
             for r in rows:
                 r["template_type"] = "business"
+                r["access_level"] = "manage" if r["created_by"] == owner else "view"
             return rows
 
         def _fake_list_datasets(q=None):

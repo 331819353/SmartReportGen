@@ -100,7 +100,7 @@ curl -fsS "$BASE_URL/reports/$REPORT_ID/download?version=$VERSION" \
 | 连接失败、TLS 报错，或 `/healthz` 返回网关错误 | 在实际发起请求的机器检查域名、端口、证书和内网或 VPN。确认用的是部署方给出的 `BASE_URL` |
 | `/healthz` 正常，`/api/me` 返回 `401` | 检查是否发送了 `Authorization: Bearer <IAM access token>`，并通过 IAM 重新取得有效令牌。Postman 的 Bearer Token 框只填令牌本身 |
 | `/api/me` 返回 `200`，但 `registered:false` | IAM 已识别该工号。请管理员检查 SmartReportGen 的员工登记和启用状态 |
-| `403`、场景列表为空，或校验结果提示无权访问表 | 用 `/api/me/permissions` 核对授权。管理员接口要求管理员身份，模板修改要求创建人权限，报告操作按报告分享级别校验 |
+| `403`、场景列表为空，或校验结果提示无权访问表 | 用 `/api/me/permissions` 核对表授权。业务场景、模板和报告的编辑操作也会校验资源分享权限 |
 | `404` | 对照接口的 HTTP 方法与路径，使用列表或创建响应中的真实 ID。数据源或场景对该账号不可见时也可能返回 `404` |
 | `422` 或 `400` | 查看 `detail`，核对路径和查询参数类型、JSON 字段及 `Content-Type` |
 | 报告编辑返回 `409` | 重新读取报告及其最新版本号，对照冲突前的基准版本后再保存 |
@@ -325,11 +325,11 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 | `GET /api/datasets` | 登录 | 可选查询参数 `q`，按场景名、业务描述或标签做不区分大小写的包含搜索 | 场景摘要数组，按 ID 升序。普通用户可见本人创建的场景及另行获授权的启用场景 |
 | `POST /api/datasets` | 登录 | JSON 场景配置。必填 `business_scenario`、`business_description`、`datasource_id`，可选 `analysis_approach`、`tags`、`enabled`、`tables`、`semantic_metrics`。普通用户至少选一张已开放的表 | 场景详情。缺字段、空表名或重复表名返回 `400`，重名或引用冲突返回 `409` |
 | `GET /api/datasets/{dataset_id}` | 登录 | 路径 `dataset_id` | 场景详情。普通用户仅见获授权的表。不存在或不可见返回 `404` |
-| `PUT /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`。JSON 传要修改的字段，传入 `tables` 时整体替换，个人场景至少保留一张可引用的表 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
+| `PUT /api/datasets/{dataset_id}` | 创建人、管理员或获编辑授权 | JSON 传要修改的字段。创建人和管理员可维护数据源、表、取值范围和启用状态；传入 `tables` 时整体替换 | 更新后的场景详情。不存在返回 `404`，参数校验失败返回 `400`，重名或引用冲突返回 `409` |
 | `DELETE /api/datasets/{dataset_id}` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true}`，删除场景及其表清单和授权，已关联的模板解除场景关联 |
 | `GET /api/datasets/{dataset_id}/analysis-file` | 登录 | 路径 `dataset_id`，可选查询参数 `download=true` | 读取场景绑定的 `.md` 分析思路文件元数据与正文（含 `analysis_file_name`、`analysis_file_markdown`、`analysis_file_updated_at`、`read_only`）；`download=true` 时以 `text/markdown` 附件下载，未绑定文件或不可见返回 `404` |
-| `PUT /api/datasets/{dataset_id}/analysis-file` | 本人或管理员 | `multipart/form-data` 上传 `file`（仅限 `.md` 后缀、UTF-8 编码、最大 1 MB；重新上传直接替换） | 更新后的场景详情（含 `.md` 分析思路文件），同步刷新检索索引 |
-| `DELETE /api/datasets/{dataset_id}/analysis-file` | 本人或管理员 | 路径 `dataset_id`，无请求体 | `{"ok":true,"dataset_id":...}`，移除已绑定的 `.md` 分析思路文件并刷新检索索引 |
+| `PUT /api/datasets/{dataset_id}/analysis-file` | 创建人、管理员或获编辑授权 | `multipart/form-data` 上传 `file`（仅限 `.md` 后缀、UTF-8 编码、最大 1 MB；重新上传直接替换） | 更新后的场景详情（含 `.md` 分析思路文件），同步刷新检索索引 |
+| `DELETE /api/datasets/{dataset_id}/analysis-file` | 创建人、管理员或获编辑授权 | 路径 `dataset_id`，无请求体 | `{"ok":true,"dataset_id":...}`，移除已绑定的 `.md` 分析思路文件并刷新检索索引 |
 | `GET /api/datasets/search` | 登录 | 必填查询参数 `q` 为业务需求，可选整数 `top_k`，默认 5 | 混合检索结果，见下方。仅检索启用场景，普通用户限已授权场景 |
 | `GET /api/datasets/template` | 登录 | 无 | 下载 `.xlsx` 批量导入模板（含 `业务场景`、`场景数据表`、`官方指标` 表头及当前账号可用数据源清单） |
 | `GET /api/datasets/export` | 登录 | 可选查询参数 `q`、`ids`（逗号分隔正整数） | 下载 `.xlsx` 场景导出文件。管理员导出全部匹配场景，普通用户导出本人创建的个人场景 |
@@ -370,7 +370,7 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 }
 ```
 
-场景摘要以 `table_count` 替代 `analysis_approach`、`analysis_file_markdown` 和 `tables`（摘要保留 `analysis_file_name`、`analysis_file_updated_at`）。每个业务场景最多可绑定 1 份 `.md` 分析思路文件（`analysis_file_name`、`analysis_file_markdown`、`analysis_file_updated_at`），通过 `/api/datasets/{dataset_id}/analysis-file` 独立维护，普通编辑与 Excel 批量导入不会覆盖该文件。个人场景返回 `owner_emp_no`。普通用户查看本人场景时返回 `read_only:false`，表的 `source_row_filters` 表示只读的源范围。管理员详情不含 `table_count`。
+场景摘要以 `table_count` 替代 `analysis_approach`、`analysis_file_markdown` 和 `tables`（摘要保留 `analysis_file_name`、`analysis_file_updated_at`）。每个业务场景最多可绑定 1 份 `.md` 分析思路文件（`analysis_file_name`、`analysis_file_markdown`、`analysis_file_updated_at`），通过 `/api/datasets/{dataset_id}/analysis-file` 独立维护，普通编辑与 Excel 批量导入不会覆盖该文件。个人场景返回 `owner_emp_no`。普通用户具备管理或编辑权限时返回 `read_only:false`，表的 `source_row_filters` 表示只读的源范围。管理员详情不含 `table_count`。
 
 **混合检索结果**
 
@@ -410,15 +410,43 @@ SQL 只接受单条只读 `SELECT` 或 `WITH` 查询，HTTP API 数据源使用 
 
 | 方法与路径 | 权限 | 请求与响应 |
 |---|---|---|
-| `GET /api/templates` | 登录 | 可用 `q` 与 `dataset_id` 筛选。返回本人及授权场景的模板，管理员可查看全部 |
+| `GET /api/templates` | 登录 | 可用 `q` 与 `dataset_id` 筛选。返回本人创建、明确获分享及已有场景授权可读取的模板，管理员可查看全部 |
 | `POST /api/templates` | 登录 | 提交 Markdown、名称或正文一级标题，以及可选业务字段。返回 `version:1` |
 | `POST /api/templates/import` | 登录 | `multipart/form-data` 一键导入 1–50 个 `.md` / `.markdown` 文件（单文件最大 2 MB）。必填 `dataset_id`（正整数，普通用户须具备该场景权限）；可选 `mode`（`upsert` 同名更新本人模板版本 / `create` 始终新建，默认 `upsert`）、`items_meta`（JSON 对象数组，按文件顺序指定 `name`、`business_summary`、`analysis_goal`、`user_requirement`）。缺省名称时依次取 Frontmatter `name`/`title`、正文一级标题或文件名。单批任一文件校验失败则整批不写入并返回 `400` |
-| `GET /api/templates/{tpl_id}` | 本人或有场景权限 | 返回指南正文、概要及 `versions`。传 `download=true`（及可选 `version`）时以 `text/markdown` 附件下载 `.md` 文件 |
-| `PUT /api/templates/{tpl_id}` | 创建人或管理员 | 提交 Markdown 与待更新字段。可传 `expected_version`，冲突返回 `409` |
-| `GET /api/templates/{tpl_id}/versions/{version}` | 本人或有场景权限 | 返回 `version`、`markdown`、`created_at` |
+| `GET /api/templates/{tpl_id}` | 具备查看权限 | 返回指南正文、概要及 `versions`。传 `download=true`（及可选 `version`）时以 `text/markdown` 附件下载 `.md` 文件 |
+| `PUT /api/templates/{tpl_id}` | 创建人、管理员或获编辑授权 | 提交 Markdown 与待更新字段。可传 `expected_version`，冲突返回 `409`。关联场景由创建人或管理员维护 |
+| `GET /api/templates/{tpl_id}/versions/{version}` | 具备查看权限 | 返回 `version`、`markdown`、`created_at` |
 | `DELETE /api/templates/{tpl_id}` | 创建人或管理员 | 删除模板及其历史版本；若仍有报告关联该模板则返回 `400` 拒绝删除 |
 
+### 业务场景与报告模板分享
+
+以下接口的 `{resource}` 为 `datasets` 或 `templates`。仅创建人和管理员可管理分享，资源列表和详情的 `access_level` 返回当前账号的有效权限（`manage`、`edit` 或 `view`）。
+
+| 接口 | 参数 | 返回 |
+| --- | --- | --- |
+| `GET /api/{resource}/{id}/shares` | 无 | 已分享的员工及权限 |
+| `GET /api/{resource}/{id}/share-recipients` | 可选查询参数 `q`（姓名或工号，最多 100 个字符） | 最多 20 个启用员工的 `emp_no`、`name` |
+| `POST /api/{resource}/{id}/shares` | JSON 对象，如 `{"emp_no":"E123","access_level":"edit"}`，权限可用 `view` 或 `edit` | 保存或更新分享。工号未登记或停用返回 `400`，缺少分享所需的关联数据权限返回 `403` |
+| `DELETE /api/{resource}/{id}/shares/{emp_no}` | 路径 `emp_no` | `{"ok":true}`，撤销分享及随该分享授予的场景数据权限。独立表授权继续生效 |
+
+分享业务场景时自动授予场景内的表权限，取数仍应用场景与数据源的行范围。个人场景依赖创建人当前有效的来源表权限。仅获场景分享的员工需要单独获分享关联模板才能查看。关联场景的模板会持续校验接收人的场景权限，独立模板可以直接分享给已启用员工。
+
+管理台分享链接采用 `/#datasets/{id}` 或 `/#templates/{id}`，登录后打开当前内容。模板的查看权限涵盖历史版本。
+
 写入字段包括 `name`、`markdown`、`dataset_id`、`user_requirement`、`analysis_goal`、`business_summary`。`markdown` 必填。更新时省略可选业务字段会沿用原值，`dataset_id:null` 可解除关联。正文或模板业务字段变化时追加版本。载入历史版本的 `markdown` 再提交更新即可恢复正文。摘要包含 `title`、`sections` 和 `format:"markdown"`。
+
+### 24 小时领取链接
+
+业务场景、报告模板和报告的创建人及管理员可生成领取链接。链接自生成起 24 小时内允许多位员工登录海尔 IAM 后各领取一次。领取成功后，权限列入该资源的已分享用户名单。链接到期或停用只关闭领取入口。撤销个人分享后，同一链接无法再次授予该员工权限。
+
+| 接口 | 请求 | 响应 |
+| --- | --- | --- |
+| `GET /api/share-links/{kind}/{resource_id}` | `kind` 为 `datasets`、`templates` 或 `reports` | 有效链接数组，含 `id`、`url`、`access_level`、`expires_at` 及报告版本 `version` |
+| `POST /api/share-links/{kind}/{resource_id}` | `access_level` 默认 `view`，可选 `edit`。报告可指定 `version`，默认最新版 | `201` 与生成的链接 |
+| `DELETE /api/share-links/{kind}/{resource_id}/{link_id}` | 无请求体 | `{"ok":true}`，停用领取链接 |
+| `POST /api/share-links/claim` | IAM 身份及 JSON `{"token":"..."}`，凭证取自链接的 `#claim/` 片段 | 返回 `kind`、`access_level`、站内 `url`。到期、停用或无效返回 `410`，数据权限不足返回 `403` |
+
+领取场景时获得场景内数据权限。领取关联模板或报告时校验已有数据权限。报告领取后打开链接指定的版本，访问其他版本时分别校验来源数据。
 
 ## 报告草稿
 

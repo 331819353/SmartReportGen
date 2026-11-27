@@ -235,11 +235,12 @@ def scope_for(dataset_id: int, dataset: dict, source: dict, tables: list[str]) -
             "scope_sha256": sha256(policy.encode()).hexdigest()}
 
 
-def validate_scopes(scopes: list[dict], principal) -> None:
+def validate_scopes(scopes: list[dict], principal, *, connection=None) -> None:
     """交付前验证当前表授权、物理来源指纹及场景行范围，改密码或无关配置不影响历史报告。"""
     from . import repo
 
-    acc = access_for(principal)
+    opts = {"connection": connection} if connection is not None else {}
+    acc = access_for(principal, **opts)
     datasets, sources = {}, {}
     for recorded in scopes:
         ds_id = recorded["dataset_id"]
@@ -247,13 +248,13 @@ def validate_scopes(scopes: list[dict], principal) -> None:
             raise PermissionDenied("当前账号无权访问该报告版本包含的数据表")
         try:
             if ds_id not in datasets:
-                datasets[ds_id] = repo.get_dataset(ds_id)
+                datasets[ds_id] = repo.get_dataset(ds_id, **opts)
             dataset = datasets[ds_id]
             ds_source = dataset.get("datasource_id")
             if ds_source != recorded["source_id"] or not dataset["enabled"]:
                 raise PermissionDenied("报告来源已变化，请按当前数据权限重新取数")
             if ds_source not in sources:
-                sources[ds_source] = repo.get_datasource(ds_source)
+                sources[ds_source] = repo.get_datasource(ds_source, **opts)
             source = sources[ds_source]
             current = scope_for(ds_id, dataset, source, recorded["tables"])
             # 没有历史指纹时只能核实同一数据源修订，不能用今天的地址替历史快照作证。

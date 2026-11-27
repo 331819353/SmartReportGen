@@ -266,7 +266,7 @@ class ToolConcurrencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("css", res["style"]["builtin_style"])
         self.assertIn("SRG.rows", res["html_assembly_hint"])
         self.assertEqual(res["templates"], [])
-        templates.assert_called_once_with(owner="context-reader", dataset_id=1, allowed_datasets=[1])
+        templates.assert_called_once_with(owner="context-reader", dataset_id=1, allowed_datasets=[1], share_only_datasets=set())
 
     def test_list_scene_datasources_and_save_business_scenario(self):
         reader = Access(Principal("E100", roles=["analyst"]), tables={})

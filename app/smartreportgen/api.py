@@ -157,8 +157,8 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse({"detail": "工号未登记或已停用"}, status_code=403)
     if principal.is_admin or path.startswith("/reports/") or _user_allowed(request.method, path):
         response = await call_next(request)
-        # 每次打开报告都重新校验分享权限，避免撤销后浏览器继续使用缓存。
-        if path.startswith(("/reports/", "/api/reports", "/api/report-drafts", "/api/templates")):
+        # 每次打开可分享资源都重新校验权限，避免撤销后浏览器继续使用缓存。
+        if path.startswith(("/reports/", "/api/reports", "/api/report-drafts", "/api/templates", "/api/datasets", "/api/share-links")):
             response.headers["Cache-Control"] = "no-store"
         return response
     return JSONResponse({"detail": "需要管理员权限；如需开通请联系管理员"}, status_code=403)
@@ -176,6 +176,12 @@ USER_ALLOW = [(m, re.compile(rx)) for m, rx in [
     ("DELETE", r"^/api/style-rules/\d+$"),
     ("GET", r"^/api/templates(/\d+(/versions/\d+)?)?$"), ("POST", r"^/api/templates(/import)?$"),
     ("PUT", r"^/api/templates/\d+$"), ("DELETE", r"^/api/templates/\d+$"),
+    ("GET", r"^/api/(datasets|templates)/\d+/(shares|share-recipients)$"),
+    ("POST", r"^/api/(datasets|templates)/\d+/shares$"),
+    ("DELETE", r"^/api/(datasets|templates)/\d+/shares/[^/]+$"),
+    ("GET", r"^/api/share-links/(datasets|templates|reports)/\d+$"),
+    ("POST", r"^/api/share-links/(claim|(datasets|templates|reports)/\d+)$"),
+    ("DELETE", r"^/api/share-links/(datasets|templates|reports)/\d+/[\da-f-]+$"),
     ("GET", r"^/api/reports(/\d+(/shares|/share-recipients|/versions)?)?$"), ("PUT", r"^/api/reports/\d+(/selection)?$"),
     ("GET", r"^/api/report-drafts$"), ("POST", r"^/api/reports/(merge|\d+/shares)$"), ("DELETE", r"^/api/reports/\d+(/shares/[^/]+)?$"),
 ]]
@@ -188,6 +194,11 @@ def _user_allowed(method: str, path: str) -> bool:
 @app.exception_handler(repo.NotFound)
 async def _nf(_r, e):
     return JSONResponse({"detail": str(e)}, status_code=404)
+
+
+@app.exception_handler(repo.ShareLinkExpired)
+async def _share_link_expired(_r, exc):
+    return JSONResponse({"detail": str(exc)}, status_code=410)
 
 
 for _exc in (repo.Invalid, ConnectorError, RuntimeError, auth.AuthError,
@@ -317,7 +328,9 @@ def _me(p: auth.Principal | None) -> dict:
 
 @app.get("/api/auth/config")
 def auth_config(request: Request):
-    return {"mode": "iam", "iam_configured": iam.configured(), "me": _me(request.state.principal)}
+    callback = urlsplit(iam.redirect_uri())
+    return {"mode": "iam", "iam_configured": iam.configured(), "me": _me(request.state.principal),
+            "share_login_url": f"{callback.scheme}://{callback.netloc}{settings.public_path('/auth/iam/share-login')}"}
 
 
 @app.get("/api/auth/check")
@@ -345,6 +358,22 @@ def iam_login(request: Request, next: str = ""):
     response = RedirectResponse(iam.authorize_url(state), status_code=302, headers=IAM_BROWSER_HEADERS)
     response.set_cookie(auth.LOGIN_COOKIE, browser, path=auth.cookie_path("/auth/iam/callback"), httponly=True,
                         samesite="lax", secure=_cookie_secure(), max_age=600)
+    return response
+
+
+SHARE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+
+
+@app.post("/auth/iam/share-login", include_in_schema=False)
+def iam_share_login(request: Request, token: str = Form(..., pattern=SHARE_TOKEN_PATTERN)):
+    # 表单正文携带领取凭证，避免出现在应用访问日志的请求地址中。
+    callback = urlsplit(iam.redirect_uri())
+    if callback.hostname and request.url.hostname != callback.hostname:
+        return HTMLResponse(_auth_page("无法从此地址登录", "请重新打开分享人提供的原链接。"),
+                            status_code=400, headers=IAM_BROWSER_HEADERS)
+    response = iam_login(request, next=settings.public_path(f"/#claim/{token}"))
+    if response.status_code == 302:
+        response.status_code = 303
     return response
 
 
@@ -463,7 +492,9 @@ def meta(request: Request):
         me_no = _p(request).emp_no or ""
         ds = [d for d in repo.list_datasets() if d["enabled"] and acc.can_dataset(d["id"])]
         stats = {"datasources": len({d["datasource_id"] for d in ds}), "datasets": len(ds),
-                 "templates": len(repo.list_templates(owner=me_no, allowed_datasets=acc.dataset_ids())), "reports": len(repo.list_reports(_p(request))),
+                 "templates": len(repo.list_templates(owner=me_no, allowed_datasets=acc.dataset_ids(),
+                                                       share_only_datasets=acc.share_only_datasets)),
+                 "reports": len(repo.list_reports(_p(request))),
                  "style_rules": len(repo.list_rules(owner=me_no, all_owners=False)), "employees": 0}
     return J({
         "datasource_types": [
@@ -610,48 +641,48 @@ def ds_query(request: Request, ds_id: int, data: dict = Body(...)):
     return J(services.run_query(repo.get_datasource(ds_id, with_secret=True), data.get("sql", ""), data.get("limit", 200)))
 
 
-# ------------------------------------------------------------------ 数据集（普通用户管理本人创建的场景）
-def _scoped_dataset(request: Request, ds: dict) -> dict:
-    if _is_admin(request):
-        return ds
-    principal = _p(request)
-    own = ds["owner_emp_no"] == principal.emp_no
-    acc = _access(request)
-    if own:
+# ------------------------------------------------------------------ 业务场景
+def _scoped_dataset(ds: dict, acc: permission.Access) -> dict:
+    level = repo.dataset_access_level(ds, acc)
+    if level is None:
+        raise repo.NotFound("数据集不存在")
+    if acc.all:
+        return {**ds, "access_level": level}
+    if level == "manage":
         # 已停用的个人场景仍可编辑，表选择器只展示当前仍有来源授权的元数据。
         source = repo.get_datasource(ds["datasource_id"])
-        eligible = permission.source_scene_tables(source, principal)
+        eligible = permission.source_scene_tables(source, acc.principal)
         tables = [table for table in ds["tables"] if table["table_name"] in eligible]
     else:
         tables = [table for table in ds["tables"] if acc.can_table(ds["id"], table["table_name"])]
     names = {table["table_name"] for table in tables}
     metrics = {key: metric for key, metric in ds.get("semantic_metrics", {}).items() if metric["table"] in names}
-    return {**ds, "tables": tables, "semantic_metrics": metrics, "table_count": len(tables), "read_only": not own}
+    return {**ds, "tables": tables, "semantic_metrics": metrics, "table_count": len(tables),
+            "access_level": level, "read_only": level == "view"}
 
 
 @app.get("/api/datasets")
 def dataset_list(request: Request, q: str | None = None):
     rows = repo.list_datasets(q=q)
     if _is_admin(request):
-        return J(rows)
+        return J([{**d, "access_level": "manage"} for d in rows])
     acc = _access(request)
-    employee = _p(request).emp_no
-    return J([{**d, "table_count": len(acc.tables.get(d["id"], ())), "read_only": d["owner_emp_no"] != employee}
-              for d in rows if d["owner_emp_no"] == employee or (d["enabled"] and acc.can_dataset(d["id"]))])
+    return J([{**d, "table_count": len(acc.tables.get(d["id"], ())),
+               "access_level": level, "read_only": level == "view"}
+              for d in rows if (level := repo.dataset_access_level(d, acc)) is not None])
 
 
 @app.post("/api/datasets")
 def dataset_create(request: Request, data: dict = Body(...)):
     ds = repo.create_dataset(data, _p(request))
-    return J(_scoped_dataset(request, ds))
+    return J(_scoped_dataset(ds, _access(request)))
 
 
 @app.get("/api/datasets/search")
 def dataset_search(request: Request, q: str, top_k: int = 5):
-    if _is_admin(request):
-        return J(repo.search_datasets(q, top_k))
-    res = repo.search_datasets(q, top_k, dataset_ids=_access(request).dataset_ids())
-    res["hits"] = [{**h, "dataset": _scoped_dataset(request, h["dataset"])} for h in res["hits"]]
+    acc = _access(request)
+    res = repo.search_datasets(q, top_k, dataset_ids=acc.dataset_ids())
+    res["hits"] = [{**h, "dataset": _scoped_dataset(h["dataset"], acc)} for h in res["hits"]]
     return J(res)
 
 
@@ -736,16 +767,14 @@ def _markdown_attachment(content: str, filename: str) -> Response:
 
 @app.get("/api/datasets/{dataset_id}")
 def dataset_get(request: Request, dataset_id: int):
-    dataset = repo.get_dataset(dataset_id)
-    if not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no and not _access(request).can_dataset(dataset_id):
-        raise repo.NotFound("数据集不存在")
-    return J(_scoped_dataset(request, dataset))
+    return J(_scoped_dataset(repo.get_dataset(dataset_id), _access(request)))
 
 
 @app.get("/api/datasets/{dataset_id}/analysis-file")
 def dataset_get_analysis_file(request: Request, dataset_id: int, download: bool = Query(False)):
     dataset = repo.get_dataset(dataset_id)
-    if not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no and not _access(request).can_dataset(dataset_id):
+    level = repo.dataset_access_level(dataset, _access(request))
+    if level is None:
         raise repo.NotFound("数据集不存在")
     if download:
         markdown = dataset.get("analysis_file_markdown")
@@ -761,7 +790,7 @@ def dataset_get_analysis_file(request: Request, dataset_id: int, download: bool 
         "analysis_file_name": dataset.get("analysis_file_name"),
         "analysis_file_markdown": dataset.get("analysis_file_markdown"),
         "analysis_file_updated_at": dataset.get("analysis_file_updated_at"),
-        "read_only": (not _is_admin(request) and dataset["owner_emp_no"] != _p(request).emp_no),
+        "read_only": level == "view",
     })
 
 
@@ -771,7 +800,7 @@ async def dataset_upload_analysis_file(request: Request, dataset_id: int, file: 
     saved = await run_in_threadpool(
         repo.save_dataset_analysis_file, dataset_id, file.filename or "", raw, _p(request)
     )
-    return J(_scoped_dataset(request, saved))
+    return J(_scoped_dataset(saved, _access(request)))
 
 
 @app.delete("/api/datasets/{dataset_id}/analysis-file")
@@ -782,7 +811,7 @@ async def dataset_delete_analysis_file(request: Request, dataset_id: int):
 
 @app.put("/api/datasets/{dataset_id}")
 def dataset_update(request: Request, dataset_id: int, data: dict = Body(...)):
-    return J(_scoped_dataset(request, repo.update_dataset(dataset_id, data, _p(request))))
+    return J(_scoped_dataset(repo.update_dataset(dataset_id, data, _p(request)), _access(request)))
 
 
 @app.delete("/api/datasets/{dataset_id}")
@@ -905,13 +934,13 @@ def rule_delete(request: Request, rule_id: int):
 def tpl_list(request: Request, q: str | None = None, dataset_id: int | None = None):
     acc = _access(request)
     return J(repo.list_templates(q, owner=_owner_filter(request), dataset_id=dataset_id,
-                                 allowed_datasets=acc.dataset_ids()))
+                                 allowed_datasets=acc.dataset_ids(), share_only_datasets=acc.share_only_datasets))
 
 
 @app.post("/api/templates")
 def tpl_create(request: Request, data: dict = Body(...)):
     _require_dataset(request, data.get("dataset_id"))
-    return J(repo.save_template({**data, "created_by": _p(request).emp_no}))
+    return J({**repo.save_template({**data, "created_by": _p(request).emp_no}), "access_level": "manage"})
 
 
 @app.post("/api/templates/import")
@@ -975,7 +1004,7 @@ async def tpl_import(
 @app.get("/api/templates/{tpl_id}")
 def tpl_get(request: Request, tpl_id: int, download: bool = Query(False), version: int | None = Query(default=None, ge=1)):
     template = repo.get_template(tpl_id)
-    repo.require_template_access(template, _access(request))
+    template["access_level"] = repo.require_template_access(template, _access(request))
     if download:
         markdown = repo.get_template_version(tpl_id, version)["markdown"] if version is not None else template["markdown"]
         safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", template["name"]).strip(" .") or f"template-{tpl_id}"
@@ -987,16 +1016,14 @@ def tpl_get(request: Request, tpl_id: int, download: bool = Query(False), versio
 
 @app.put("/api/templates/{tpl_id}")
 def tpl_update(request: Request, tpl_id: int, data: dict = Body(...)):
-    tpl = repo.get_template(tpl_id)
-    _check_owner(request, tpl.get("created_by"), "报告模板")
-    _require_dataset(request, data.get("dataset_id", tpl["dataset_id"]))
     expected_version = data.get("expected_version")
     if expected_version is not None and (type(expected_version) is not int or expected_version < 1):
         raise repo.Invalid("expected_version 须为正整数")
-    return J(repo.save_template(
+    saved = repo.save_template(
         {key: value for key, value in data.items() if key not in ("created_by", "expected_version")},
-        tpl_id, expected_version=expected_version,
-    ))
+        tpl_id, expected_version=expected_version, principal=_p(request),
+    )
+    return J(saved)
 
 
 @app.delete("/api/templates/{tpl_id}")
@@ -1040,9 +1067,85 @@ class ReportSelection(BaseModel):
     version: int | None = Field(ge=1, strict=True)
 
 
-class ReportShare(BaseModel):
+class ResourceShare(BaseModel):
     emp_no: str = Field(min_length=1, max_length=256)
     access_level: Literal["view", "edit"]
+
+
+ShareLinkKind = Literal["datasets", "templates", "reports"]
+
+
+class ShareLinkRequest(BaseModel):
+    access_level: Literal["view", "edit"] = "view"
+    version: int | None = Field(default=None, ge=1, strict=True)
+
+
+class ShareLinkClaim(BaseModel):
+    token: str = Field(pattern=SHARE_TOKEN_PATTERN)
+
+
+@app.get("/api/share-links/{kind}/{resource_id}")
+def share_links(request: Request, kind: ShareLinkKind, resource_id: int):
+    return J(repo.list_share_links(kind, resource_id, _p(request)))
+
+
+@app.post("/api/share-links/{kind}/{resource_id}", status_code=201)
+def create_share_link(request: Request, kind: ShareLinkKind, resource_id: int, data: ShareLinkRequest):
+    return JSONResponse(jsonable_encoder(repo.create_share_link(kind, resource_id, _p(request), data.access_level, data.version)),
+                        status_code=201)
+
+
+@app.delete("/api/share-links/{kind}/{resource_id}/{link_id}")
+def revoke_share_link(request: Request, kind: ShareLinkKind, resource_id: int, link_id: UUID):
+    repo.revoke_share_link(kind, resource_id, link_id, _p(request))
+    return {"ok": True}
+
+
+@app.post("/api/share-links/claim")
+def claim_share_link(request: Request, data: ShareLinkClaim):
+    return J(repo.claim_share_link(data.token, _p(request)))
+
+
+@app.get("/api/datasets/{dataset_id}/shares")
+def dataset_shares(request: Request, dataset_id: int):
+    return J(repo.list_resource_shares("dataset", dataset_id, _p(request)))
+
+
+@app.get("/api/datasets/{dataset_id}/share-recipients")
+def dataset_share_recipients(request: Request, dataset_id: int, q: str = Query(default="", max_length=100)):
+    return J(repo.search_resource_recipients("dataset", dataset_id, _p(request), q))
+
+
+@app.post("/api/datasets/{dataset_id}/shares")
+def dataset_share(request: Request, dataset_id: int, data: ResourceShare):
+    return J(repo.set_resource_share("dataset", dataset_id, _p(request), data.emp_no, data.access_level))
+
+
+@app.delete("/api/datasets/{dataset_id}/shares/{emp_no}")
+def dataset_unshare(request: Request, dataset_id: int, emp_no: str):
+    repo.revoke_resource_share("dataset", dataset_id, _p(request), emp_no)
+    return {"ok": True}
+
+
+@app.get("/api/templates/{tpl_id}/shares")
+def tpl_shares(request: Request, tpl_id: int):
+    return J(repo.list_resource_shares("template", tpl_id, _p(request)))
+
+
+@app.get("/api/templates/{tpl_id}/share-recipients")
+def tpl_share_recipients(request: Request, tpl_id: int, q: str = Query(default="", max_length=100)):
+    return J(repo.search_resource_recipients("template", tpl_id, _p(request), q))
+
+
+@app.post("/api/templates/{tpl_id}/shares")
+def tpl_share(request: Request, tpl_id: int, data: ResourceShare):
+    return J(repo.set_resource_share("template", tpl_id, _p(request), data.emp_no, data.access_level))
+
+
+@app.delete("/api/templates/{tpl_id}/shares/{emp_no}")
+def tpl_unshare(request: Request, tpl_id: int, emp_no: str):
+    repo.revoke_resource_share("template", tpl_id, _p(request), emp_no)
+    return {"ok": True}
 
 
 class ReportMergeSource(BaseModel):
@@ -1114,7 +1217,7 @@ def report_share_recipients(request: Request, report_id: int, q: str = Query(def
 
 
 @app.post("/api/reports/{report_id}/shares")
-def report_share(request: Request, report_id: int, data: ReportShare):
+def report_share(request: Request, report_id: int, data: ResourceShare):
     return J(repo.set_report_share(report_id, _p(request), data.emp_no, data.access_level))
 
 

@@ -4,20 +4,23 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
+from hashlib import sha256
 from html import escape
 from typing import Any
+from uuid import UUID, uuid4
 
 from markdown_it import MarkdownIt
 
-from . import crypto, db, report_data
+from . import crypto, db, permission, report_data
 from .auth import Principal
 from .config import settings
 from .connectors import SUPPORTED_TYPES, ConnectorError, drop_connector, get_connector
 from .connectors.sql import oracle_schema
 from .embedding import EmbeddingError, embed_many, to_pgvector
-from .permission import PermissionDenied, source_scene_tables
+from .permission import Access, PermissionDenied, source_scene_tables
 from .report_document import report_document_error
-from .scenario_filters import table_filters, table_sql
+from .scenario_filters import effective_filters, table_filters, table_sql
 from .textproc import add_words, scenario_tokens, tokenize
 
 log = logging.getLogger(__name__)
@@ -45,9 +48,11 @@ def list_datasources() -> list[dict]:
     return db.fetchall(f"SELECT {DS_COLS} FROM datasource.datasource ORDER BY id")
 
 
-def get_datasource(ds_id: int, with_secret: bool = False) -> dict:
+def get_datasource(ds_id: int, with_secret: bool = False, *, connection=None) -> dict:
     cols = "*" if with_secret else DS_COLS
-    return _one(db.fetchone(f"SELECT {cols} FROM datasource.datasource WHERE id=%s", (ds_id,)), "数据源")
+    sql = f"SELECT {cols} FROM datasource.datasource WHERE id=%s"
+    row = connection.execute(sql, (ds_id,)).fetchone() if connection is not None else db.fetchone(sql, (ds_id,))
+    return _one(row, "数据源")
 
 
 def find_datasource(ref: Any) -> dict:
@@ -304,24 +309,22 @@ def list_datasets(q: str | None = None) -> list[dict]:
     return rows
 
 
-def get_dataset(dataset_id: int) -> dict:
-    ds = _one(
-        db.fetchone(
-            "SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, "
+def get_dataset(dataset_id: int, *, connection=None) -> dict:
+    sql = ("SELECT d.id, d.business_scenario, d.business_description, d.analysis_approach, "
             "d.analysis_file_name, d.analysis_file_markdown, d.analysis_file_updated_at, "
             "d.semantic_metrics, d.datasource_id, d.tags, d.enabled, d.owner_emp_no, "
             "s.config AS source_config, s.enabled AS source_enabled, d.created_at, d.updated_at, (d.embedding IS NOT NULL) AS vectorized, s.name AS datasource_name, "
             "s.type AS datasource_type FROM dataset.dataset d LEFT JOIN datasource.datasource s "
-            "ON s.id=d.datasource_id WHERE d.id=%s",
-            (dataset_id,),
-        ),
-        "数据集",
-    )
-    ds["tables"] = db.fetchall(
-        "SELECT id, table_name, table_description, sort, row_filters "
-        "FROM dataset.dataset_table WHERE dataset_id=%s ORDER BY sort, id",
-        (dataset_id,),
-    )
+            "ON s.id=d.datasource_id WHERE d.id=%s")
+    table_sql = ("SELECT id, table_name, table_description, sort, row_filters "
+                 "FROM dataset.dataset_table WHERE dataset_id=%s ORDER BY sort, id")
+    params = (dataset_id,)
+    if connection is None:
+        ds = _one(db.fetchone(sql, params), "数据集")
+        ds["tables"] = db.fetchall(table_sql, params)
+    else:
+        ds = _one(connection.execute(sql, params).fetchone(), "数据集")
+        ds["tables"] = connection.execute(table_sql, params).fetchall()
     source = {"config": ds.pop("source_config"), "enabled": ds.pop("source_enabled")}
     if ds["owner_emp_no"] is not None:
         catalog = source_scene_tables(source)
@@ -331,8 +334,9 @@ def get_dataset(dataset_id: int) -> dict:
     return ds
 
 
-def _authorize_personal_scene(data: dict, principal: Principal | None) -> None:
-    source = get_datasource(data["datasource_id"])
+def _authorize_personal_scene(data: dict, principal: Principal | None, *, connection=None) -> None:
+    source = (get_datasource(data["datasource_id"], connection=connection) if connection is not None
+              else get_datasource(data["datasource_id"]))
     catalog = source_scene_tables(source, principal)
     tables = {table["table_name"].strip() for table in data["tables"]}
     if not tables:
@@ -365,7 +369,7 @@ def _validate_dataset(data: dict) -> None:
         raise Invalid("数据表名重复")
 
 
-def _prepare_tables(data: dict, current: dict | None = None) -> list[dict]:
+def _prepare_tables(data: dict, current: dict | None = None, *, connection=None) -> list[dict]:
     # 局部更新、改描述或调顺序不依赖数据源在线；只有新增/修改条件或切换数据源时查字段。
     same_source = current is not None and current["datasource_id"] == data["datasource_id"]
     old_rules = {t["table_name"]: t["row_filters"] for t in current["tables"]} if same_source else {}
@@ -378,7 +382,10 @@ def _prepare_tables(data: dict, current: dict | None = None) -> list[dict]:
         # 比较 JSON 的实际类型，避免 Python 把 true 与 1 视为相同而跳过校验。
         if rules and json.dumps(rules, sort_keys=True) != json.dumps(old_rules.get(name), sort_keys=True):
             try:
-                conn = conn or get_connector(get_datasource(data["datasource_id"], with_secret=True))
+                if conn is None:
+                    source = (get_datasource(data["datasource_id"], with_secret=True, connection=connection)
+                              if connection is not None else get_datasource(data["datasource_id"], with_secret=True))
+                    conn = get_connector(source)
                 rules = table_filters(rules, name, conn.columns(name))
             except ConnectorError as e:
                 raise Invalid(f"无法保存数据过滤：{e}") from e
@@ -421,15 +428,31 @@ def create_dataset(data: dict, principal: Principal | None = None) -> dict:
 def update_dataset(dataset_id: int, data: dict, principal: Principal | None = None) -> dict:
     from .report_queries import validate_metrics
 
-    cur = get_dataset(dataset_id)
-    _require_scene_manager(cur, principal)
-    merged = {**cur, **data}
-    _validate_dataset(merged)
-    if cur["owner_emp_no"] is not None:
-        _authorize_personal_scene(merged, principal)
-    tables = _prepare_tables(merged, cur) if "tables" in data or cur["datasource_id"] != merged["datasource_id"] else None
-    metrics = validate_metrics(merged["semantic_metrics"], tables if tables is not None else cur["tables"])
     with db.conn() as c, c.transaction():
+        level = _lock_scene_editor(c, dataset_id, principal)
+        cur = get_dataset(dataset_id, connection=c)
+        merged = {**cur, **data}
+        _validate_dataset(merged)
+        if level == "edit":
+            # MCP 读取时会合并源范围，回传原始或合并后的配置均可，实际写入仅更新业务字段。
+            def table_config(items, *, include_source=False):
+                return json.dumps([
+                    {"table_name": t["table_name"].strip(), "table_description": t.get("table_description") or "",
+                     "row_filters": effective_filters(t) if include_source else t.get("row_filters", [])}
+                    for t in items
+                ], sort_keys=True)
+
+            if (merged["datasource_id"] != cur["datasource_id"] or merged["enabled"] != cur["enabled"]
+                    or ("tables" in data and table_config(data["tables"]) not in (
+                        table_config(cur["tables"]), table_config(cur["tables"], include_source=True)))):
+                raise PermissionDenied("只有场景管理者可以修改数据源、表、取值范围和启用状态")
+            tables = None
+        else:
+            if cur["owner_emp_no"] is not None:
+                _authorize_personal_scene(merged, principal, connection=c)
+            tables = (_prepare_tables(merged, cur, connection=c)
+                      if "tables" in data or cur["datasource_id"] != merged["datasource_id"] else None)
+        metrics = validate_metrics(merged["semantic_metrics"], tables if tables is not None else cur["tables"])
         c.execute(
             "UPDATE dataset.dataset SET business_scenario=%s, business_description=%s, analysis_approach=%s, datasource_id=%s, tags=%s, "
             "enabled=%s, semantic_metrics=%s, updated_at=now() WHERE id=%s",
@@ -439,48 +462,64 @@ def update_dataset(dataset_id: int, data: dict, principal: Principal | None = No
         )
         if tables is not None:
             _save_tables(c, dataset_id, tables)
-    if cur["business_scenario"] != merged["business_scenario"]:
-        db.execute("UPDATE style_rule.style_rule SET business_scenario=%s WHERE business_scenario=%s",
-                   (merged["business_scenario"], cur["business_scenario"]))
+        if cur["business_scenario"] != merged["business_scenario"]:
+            c.execute("UPDATE style_rule.style_rule SET business_scenario=%s WHERE business_scenario=%s",
+                      (merged["business_scenario"], cur["business_scenario"]))
     reindex_dataset(dataset_id)
     return get_dataset(dataset_id)
 
 
-def _require_scene_manager(dataset: dict, principal: Principal | None) -> None:
-    if principal is not None and not principal.is_admin and dataset["owner_emp_no"] != principal.emp_no:
-        raise PermissionDenied("只能管理本人创建的业务场景")
+def _manages(principal: Principal, owner: str | None) -> bool:
+    return principal.registered and (principal.is_admin or principal.emp_no == owner)
+
+
+def dataset_access_level(dataset: dict, access: Access) -> str | None:
+    if _manages(access.principal, dataset["owner_emp_no"]):
+        return "manage"
+    return access.scene_shares.get(dataset["id"]) or ("view" if access.can_dataset(dataset["id"]) else None)
+
+
+def _lock_scene_editor(connection, dataset_id: int, principal: Principal | None) -> str:
+    # 写入与分享撤销使用同一行锁。撤销先提交时，协作者的写入会按最新权限重新校验。
+    dataset = _one(connection.execute("SELECT id, owner_emp_no FROM dataset.dataset WHERE id=%s FOR UPDATE",
+                                      (dataset_id,)).fetchone(), "业务场景")
+    if principal is None or _manages(principal, dataset["owner_emp_no"]):
+        return "manage"
+    if permission.access_for(principal, connection=connection).scene_shares.get(dataset_id) != "edit":
+        raise PermissionDenied("无权编辑该业务场景")
+    return "edit"
 
 
 def delete_dataset(dataset_id: int, principal: Principal | None = None) -> None:
-    if principal is not None and not principal.is_admin:
-        _require_scene_manager(get_dataset(dataset_id), principal)
+    if principal is not None and not _manages(principal, get_dataset(dataset_id)["owner_emp_no"]):
+        raise PermissionDenied("只有场景创建人和管理员可以删除业务场景")
     db.execute("DELETE FROM dataset.dataset WHERE id=%s", (dataset_id,))
 
 
 def save_dataset_analysis_file(
     dataset_id: int, filename: str, content: str | bytes, principal: Principal | None = None
 ) -> dict:
-    cur = get_dataset(dataset_id)
-    _require_scene_manager(cur, principal)
     clean_name = _normalize_md_filename(filename)
     markdown = _normalize_analysis_markdown(content)
-    db.execute(
-        "UPDATE dataset.dataset SET analysis_file_name=%s, analysis_file_markdown=%s, "
-        "analysis_file_updated_at=now(), updated_at=now() WHERE id=%s",
-        (clean_name, markdown, dataset_id),
-    )
+    with db.conn() as c, c.transaction():
+        _lock_scene_editor(c, dataset_id, principal)
+        c.execute(
+            "UPDATE dataset.dataset SET analysis_file_name=%s, analysis_file_markdown=%s, "
+            "analysis_file_updated_at=now(), updated_at=now() WHERE id=%s",
+            (clean_name, markdown, dataset_id),
+        )
     reindex_dataset(dataset_id)
     return get_dataset(dataset_id)
 
 
 def delete_dataset_analysis_file(dataset_id: int, principal: Principal | None = None) -> dict:
-    cur = get_dataset(dataset_id)
-    _require_scene_manager(cur, principal)
-    db.execute(
-        "UPDATE dataset.dataset SET analysis_file_name=NULL, analysis_file_markdown=NULL, "
-        "analysis_file_updated_at=NULL, updated_at=now() WHERE id=%s",
-        (dataset_id,),
-    )
+    with db.conn() as c, c.transaction():
+        _lock_scene_editor(c, dataset_id, principal)
+        c.execute(
+            "UPDATE dataset.dataset SET analysis_file_name=NULL, analysis_file_markdown=NULL, "
+            "analysis_file_updated_at=NULL, updated_at=now() WHERE id=%s",
+            (dataset_id,),
+        )
     reindex_dataset(dataset_id)
     return get_dataset(dataset_id)
 
@@ -840,33 +879,58 @@ def _template_view(row: dict) -> dict:
     return result
 
 
-def require_template_access(template: dict, access) -> None:
+def template_access_level(template: dict, access: Access, *, connection=None) -> str | None:
     principal = access.principal
+    if _manages(principal, template["created_by"]):
+        return "manage"
     dataset_id = template.get("dataset_id")
-    if (access.all or template["created_by"] == principal.emp_no
-            or (dataset_id is not None and access.can_dataset(dataset_id))):
-        return
-    raise PermissionDenied("无权读取该报告模板指南")
+    if not principal.registered or (dataset_id is not None and not access.can_dataset(dataset_id)):
+        return None
+    sql = ("SELECT access_level FROM report_template.report_template_share "
+           "WHERE template_id=%s AND emp_no=%s")
+    params = (template["id"], principal.emp_no)
+    share = connection.execute(sql, params).fetchone() if connection is not None else db.fetchone(sql, params)
+    # 保留已有场景授权的隐式读权限。独立模板仅向创建人、管理员及明确获分享的员工开放。
+    return share["access_level"] if share else (
+        "view" if dataset_id is not None and dataset_id not in access.share_only_datasets else None)
+
+
+def require_template_access(template: dict, access: Access, *, connection=None) -> str:
+    level = template_access_level(template, access, connection=connection)
+    if level is None:
+        raise PermissionDenied("无权读取该报告模板指南")
+    return level
 
 
 def list_templates(q: str | None = None, owner: str | None = None, dataset_id: int | None = None,
-                   *, allowed_datasets: list[int] | None = None) -> list[dict]:
-    """管理员看全部，普通员工可读取本人模板和已授权场景的共享模板。"""
+                   *, allowed_datasets: list[int] | None = None,
+                   share_only_datasets: set[int] | None = None) -> list[dict]:
+    """管理员看全部，普通员工可读取本人模板、已授权场景模板和明确获分享的独立模板。"""
     conds, params = [], []
     if q and q.strip():
         conds.append("(t.name ILIKE %s OR t.user_requirement ILIKE %s OR t.business_summary ILIKE %s "
                      "OR t.analysis_goal ILIKE %s OR d.business_scenario ILIKE %s)")
         params += [_contains_pattern(q)] * 5
     if owner is not None:
-        conds.append("(t.created_by = %s OR t.dataset_id = ANY(%s))")
-        params += [owner, allowed_datasets or []]
+        # 新增的仅分享场景权限不能隐式公开其他人创建的关联模板。
+        datasets = allowed_datasets or []
+        implicit_datasets = [item for item in datasets if item not in (share_only_datasets or ())]
+        conds.append("(t.created_by=%s OR t.dataset_id=ANY(%s) "
+                     "OR (sh.emp_no IS NOT NULL AND (t.dataset_id IS NULL OR t.dataset_id=ANY(%s))))")
+        params += [owner, implicit_datasets, datasets]
     if dataset_id is not None:
         conds.append("t.dataset_id = %s")
         params.append(dataset_id)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    # 列表先筛选可访问的模板，再计算可显示的操作，避免按条读取授权。
+    level_sql, share_join = "'manage' AS access_level", ""
+    if owner is not None:
+        level_sql = "CASE WHEN t.created_by=%s THEN 'manage' ELSE COALESCE(sh.access_level, 'view') END AS access_level"
+        share_join = "LEFT JOIN report_template.report_template_share sh ON sh.template_id=t.id AND sh.emp_no=%s "
+        params = [owner, owner, *params]
     rows = db.fetchall(
-        f"SELECT {TPL_COLS} FROM report_template.report_template t LEFT JOIN dataset.dataset d ON d.id=t.dataset_id "
-        f"{where} ORDER BY t.updated_at DESC", params)
+        f"SELECT {TPL_COLS}, {level_sql} FROM report_template.report_template t "
+        f"LEFT JOIN dataset.dataset d ON d.id=t.dataset_id {share_join}{where} ORDER BY t.updated_at DESC", params)
     for row in rows:
         summary = row["summary"]
         if summary.get("format") != "markdown":
@@ -1038,10 +1102,23 @@ def _validate_template_data(data: dict) -> str:
     return md
 
 
-def _save_template_in_tx(c, data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
+def _save_template_in_tx(c, data: dict, tpl_id: int | None = None, *, expected_version: int | None = None,
+                         principal: Principal | None = None) -> dict:
     md = data["markdown"]
     cur = _one(c.execute("SELECT * FROM report_template.report_template WHERE id=%s FOR UPDATE", (tpl_id,)).fetchone(),
                "报告模板") if tpl_id is not None else None
+    level = None
+    if cur is not None and principal is not None:
+        # 与分享变更共用模板行锁，避免在已撤销编辑权限后提交模板版本。
+        acc = permission.access_for(principal, connection=c)
+        level = template_access_level(cur, acc, connection=c)
+        if level not in ("manage", "edit"):
+            raise PermissionDenied("无权编辑该报告模板")
+        dataset_id = data.get("dataset_id", cur["dataset_id"])
+        if level == "edit" and dataset_id != cur["dataset_id"]:
+            raise PermissionDenied("只有模板管理者可以更改关联业务场景")
+        if dataset_id is not None and not acc.can_dataset(dataset_id):
+            raise PermissionDenied("无权使用该业务场景（数据集）")
     if expected_version is not None and (not cur or cur["version"] != expected_version):
         raise ReportConflict("报告模板已被修改，请读取最新版本后再提交")
     summary = _template_summary(md, "")
@@ -1083,13 +1160,17 @@ def _save_template_in_tx(c, data: dict, tpl_id: int | None = None, *, expected_v
         (tpl_id, version, md),
     )
     # 在锁释放前读取此次保存的版本，避免 agent 并行更新时拿到其他版本号。
-    return _template_view(c.execute(TPL_DETAIL, (tpl_id,)).fetchone())
+    saved = _template_view(c.execute(TPL_DETAIL, (tpl_id,)).fetchone())
+    if level is not None:
+        saved["access_level"] = level
+    return saved
 
 
-def save_template(data: dict, tpl_id: int | None = None, *, expected_version: int | None = None) -> dict:
+def save_template(data: dict, tpl_id: int | None = None, *, expected_version: int | None = None,
+                  principal: Principal | None = None) -> dict:
     _validate_template_data(data)
     with db.conn() as c, c.transaction():
-        return _save_template_in_tx(c, data, tpl_id, expected_version=expected_version)
+        return _save_template_in_tx(c, data, tpl_id, expected_version=expected_version, principal=principal)
 
 
 def import_templates(
@@ -1105,9 +1186,7 @@ def import_templates(
     if type(dataset_id) is not int or dataset_id < 1:
         raise Invalid("请选择关联的业务场景")
     if not principal.is_admin:
-        from .permission import access_for
-
-        if not access_for(principal).can_dataset(dataset_id):
+        if not permission.access_for(principal).can_dataset(dataset_id):
             raise PermissionDenied("无权使用该业务场景（数据集）")
     _one(db.fetchone("SELECT id, business_scenario, enabled FROM dataset.dataset WHERE id=%s", (dataset_id,)), "业务场景")
 
@@ -1243,9 +1322,7 @@ def require_report_template(principal: Principal | None, template_id: int | None
     if not ver:
         raise NotFound(f"报告模板 #{template_id} 不存在版本 v{template_version}")
     if principal is not None:
-        from .permission import access_for
-
-        require_template_access(tpl, access_for(principal))
+        require_template_access(tpl, permission.access_for(principal, connection=connection), connection=connection)
     if dataset_id is not None:
         if tpl["dataset_id"] is None:
             raise Invalid(f"报告模板 #{template_id} 未关联业务场景，请先在模板中关联业务场景（dataset_id={dataset_id}）")
@@ -1335,12 +1412,12 @@ def list_reports(principal: Principal, template_id: int | None = None, q: str | 
     return visible
 
 
-def _require_report_data(row: dict, principal: Principal) -> None:
+def _require_report_data(row: dict, principal: Principal, *, connection=None) -> None:
     from .report_queries import validate_scopes
 
     scopes = row["meta"].get("scopes")
     if scopes:
-        validate_scopes(scopes, principal)
+        validate_scopes(scopes, principal, **({"connection": connection} if connection is not None else {}))
     elif not principal.is_admin and row["created_by"] != principal.emp_no:
         raise PermissionDenied("此历史报告缺少数据来源，需按当前权限重新生成后才能共享")
 
@@ -1709,15 +1786,23 @@ def delete_report(report_id: int, principal: Principal) -> None:
 def list_report_shares(report_id: int, principal: Principal) -> list[dict]:
     report = get_report(report_id, principal, with_html=False)
     _require_report_manager(principal, report)
+    return _list_shares("report.report_share", "report_id", report["id"])
+
+
+def _list_shares(table: str, key: str, resource_id: int) -> list[dict]:
     return db.fetchall(
         "SELECT s.emp_no, COALESCE(e.name,'') AS name, COALESCE(e.enabled,false) AS enabled, "
-        "(e.emp_no IS NOT NULL) AS registered, s.access_level FROM report.report_share s "
-        "LEFT JOIN permission.employee e ON e.emp_no=s.emp_no WHERE s.report_id=%s ORDER BY s.emp_no", (report["id"],))
+        f"(e.emp_no IS NOT NULL) AS registered, s.access_level FROM {table} s "
+        f"LEFT JOIN permission.employee e ON e.emp_no=s.emp_no WHERE s.{key}=%s ORDER BY s.emp_no", (resource_id,))
 
 
 def search_report_recipients(report_id: int, principal: Principal, q: str) -> list[dict]:
     report = get_report(report_id, principal, with_html=False)
     _require_report_manager(principal, report)
+    return _search_share_recipients(report["created_by"], q)
+
+
+def _search_share_recipients(owner: str | None, q: str) -> list[dict]:
     if "\x00" in q:
         raise Invalid("请输入有效的姓名或工号")
     # 仅提供分享所需的目录字段，工号精确匹配优先，其余结果可继续缩小搜索范围。
@@ -1726,13 +1811,18 @@ def search_report_recipients(report_id: int, principal: Principal, q: str) -> li
         "SELECT emp_no, name FROM permission.employee WHERE enabled AND emp_no IS DISTINCT FROM %s "
         "AND (emp_no ILIKE %s OR name ILIKE %s) "
         "ORDER BY (emp_no = %s) DESC, name, emp_no LIMIT 20",
-        (report["created_by"], pattern, pattern, q.strip()))
+        (owner, pattern, pattern, q.strip()))
 
 
-def set_report_share(report_id: int, principal: Principal, emp_no: str, access_level: str) -> dict:
+def _share_emp_no(emp_no: str) -> str:
     emp_no = emp_no.strip()
     if not emp_no or emp_no in (".", "..") or re.search(r"[\x00-\x1f\x7f/\\]", emp_no):
         raise Invalid("请输入有效的员工工号")
+    return emp_no
+
+
+def set_report_share(report_id: int, principal: Principal, emp_no: str, access_level: str) -> dict:
+    emp_no = _share_emp_no(emp_no)
     with db.conn() as c, c.transaction():
         report = _lock_report(c, report_id)
         _require_report_manager(principal, report)
@@ -1742,12 +1832,8 @@ def set_report_share(report_id: int, principal: Principal, emp_no: str, access_l
                              (emp_no,)).fetchone()
         if not employee or not employee["enabled"]:
             raise Invalid("接收人需先登记并启用，才能核实报告数据权限")
-        current = c.execute("SELECT meta FROM report.report_version WHERE report_id=%s AND version=%s",
-                            (report_id, report["revision"])).fetchone()
-        if not current or not current["meta"].get("scopes"):
-            raise Invalid("报告缺少可验证来源，请重新取数并生成报告后分享")
-        _require_report_data({**report, **current},
-                             Principal(emp_no, is_admin=employee["is_admin"], roles=employee["roles"]))
+        _require_report_share_data(c, report, report["revision"],
+                                   Principal(emp_no, is_admin=employee["is_admin"], roles=employee["roles"]))
         c.execute(
             "INSERT INTO report.report_share(report_id, emp_no, access_level) VALUES (%s,%s,%s) "
             "ON CONFLICT (report_id, emp_no) DO UPDATE SET access_level=EXCLUDED.access_level",
@@ -1756,10 +1842,222 @@ def set_report_share(report_id: int, principal: Principal, emp_no: str, access_l
                 "registered": bool(employee), "access_level": access_level}
 
 
+def _require_report_share_data(connection, report: dict, version: int, principal: Principal) -> None:
+    current = _one(connection.execute(
+        "SELECT meta FROM report.report_version WHERE report_id=%s AND version=%s", (report["id"], version),
+    ).fetchone(), "报告版本")
+    if not current["meta"].get("scopes"):
+        raise Invalid("报告缺少可验证来源，请重新取数并生成报告后分享")
+    _require_report_data({**report, **current}, principal, connection=connection)
+
+
 def revoke_report_share(report_id: int, principal: Principal, emp_no: str) -> None:
     with db.conn() as c, c.transaction():
         _require_report_manager(principal, _lock_report(c, report_id))
         c.execute("DELETE FROM report.report_share WHERE report_id=%s AND emp_no=%s", (report_id, emp_no.strip()))
+
+
+# ============================ 场景和模板分享 ============================
+# SQL 标识符只从固定资源配置取值。两种资源共用目录查找和权限维护。
+_RESOURCE_SHARES = {
+    "dataset": ("dataset.dataset", "dataset.dataset_share", "dataset_id", "owner_emp_no", "业务场景"),
+    "template": ("report_template.report_template", "report_template.report_template_share",
+                 "template_id", "created_by", "报告模板"),
+}
+
+
+def _share_resource(kind: str, resource_id: int, principal: Principal | None, *, connection=None) -> dict:
+    table, _, _, owner_key, label = _RESOURCE_SHARES[kind]
+    cols = f"{owner_key} AS owner, datasource_id, enabled" if kind == "dataset" else f"{owner_key} AS owner, dataset_id"
+    sql = f"SELECT {cols} FROM {table} WHERE id=%s"
+    params = (resource_id,)
+    row = (connection.execute(sql + " FOR UPDATE", params).fetchone() if connection is not None
+           else db.fetchone(sql, params))
+    resource = _one(row, label)
+    if principal is not None and not _manages(principal, resource["owner"]):
+        raise PermissionDenied(f"只有{label}创建人和管理员可以管理分享")
+    return resource
+
+
+def list_resource_shares(kind: str, resource_id: int, principal: Principal) -> list[dict]:
+    _share_resource(kind, resource_id, principal)
+    _, table, key, _, _ = _RESOURCE_SHARES[kind]
+    return _list_shares(table, key, resource_id)
+
+
+def search_resource_recipients(kind: str, resource_id: int, principal: Principal, q: str) -> list[dict]:
+    resource = _share_resource(kind, resource_id, principal)
+    return _search_share_recipients(resource["owner"], q)
+
+
+def _require_share_data(connection, kind: str, resource_id: int, resource: dict, recipient: Principal) -> None:
+    if kind == "template":
+        dataset_id = resource["dataset_id"]
+        if dataset_id is not None and not permission.access_for(recipient, connection=connection).can_dataset(dataset_id):
+            raise PermissionDenied("接收人无权访问该模板关联的业务场景")
+        return
+
+    source = get_datasource(resource["datasource_id"], connection=connection) if resource["datasource_id"] else None
+    if not resource["enabled"] or not source or not source["enabled"]:
+        raise Invalid("请先启用业务场景及其数据源")
+    tables = {row["table_name"] for row in connection.execute(
+        "SELECT table_name FROM dataset.dataset_table WHERE dataset_id=%s", (resource_id,)).fetchall()}
+    if not tables:
+        raise Invalid("该业务场景尚未配置数据表")
+    # 场景管理者授予本场景内的表权限。个人场景的授权以创建人仍能引用这些来源表为前提。
+    if resource["owner"] is not None:
+        owner = connection.execute("SELECT emp_no, enabled, is_admin, roles FROM permission.employee WHERE emp_no=%s",
+                                   (resource["owner"],)).fetchone()
+        if not tables.issubset(permission.personal_scene_share_tables(source, owner)):
+            raise PermissionDenied("该个人场景的创建人缺少当前来源表权限，请先恢复来源授权")
+
+
+def set_resource_share(kind: str, resource_id: int, principal: Principal, emp_no: str, access_level: str) -> dict:
+    emp_no = _share_emp_no(emp_no)
+    _, table, key, _, label = _RESOURCE_SHARES[kind]
+    with db.conn() as c, c.transaction():
+        resource = _share_resource(kind, resource_id, principal, connection=c)
+        if emp_no == resource["owner"]:
+            raise Invalid(f"{label}创建人已拥有管理权限")
+        employee = c.execute("SELECT name, enabled, roles, is_admin FROM permission.employee WHERE emp_no=%s FOR SHARE",
+                             (emp_no,)).fetchone()
+        if not employee or not employee["enabled"]:
+            raise Invalid("接收人须为已登记并启用的员工")
+        _require_share_data(c, kind, resource_id, resource,
+                            Principal(emp_no, is_admin=employee["is_admin"], roles=employee["roles"]))
+        c.execute(
+            f"INSERT INTO {table}({key}, emp_no, access_level) VALUES (%s,%s,%s) "
+            f"ON CONFLICT ({key}, emp_no) DO UPDATE SET access_level=EXCLUDED.access_level",
+            (resource_id, emp_no, access_level),
+        )
+    return {"emp_no": emp_no, "name": employee["name"], "enabled": True, "registered": True, "access_level": access_level}
+
+
+def revoke_resource_share(kind: str, resource_id: int, principal: Principal, emp_no: str) -> None:
+    emp_no = _share_emp_no(emp_no)
+    _, table, key, _, _ = _RESOURCE_SHARES[kind]
+    with db.conn() as c, c.transaction():
+        _share_resource(kind, resource_id, principal, connection=c)
+        c.execute(f"DELETE FROM {table} WHERE {key}=%s AND emp_no=%s", (resource_id, emp_no))
+
+
+# ============================ 24 小时领取链接 ============================
+_SHARE_LINK_KEYS = {"datasets": "dataset_id", "templates": "template_id", "reports": "report_id"}
+_LINK_RESOURCE_KINDS = {"datasets": "dataset", "templates": "template"}
+
+
+class ShareLinkExpired(LookupError):
+    pass
+
+
+def _link_resource(connection, kind: str, resource_id: int, manager: Principal | None = None) -> dict:
+    if kind == "reports":
+        report = _lock_report(connection, resource_id)
+        if manager is not None:
+            _require_report_manager(manager, report)
+        return {**report, "owner": report["created_by"]}
+    return _share_resource(_LINK_RESOURCE_KINDS[kind], resource_id, manager, connection=connection)
+
+
+def _share_link_info(row: dict) -> dict:
+    return {"id": row["id"], "access_level": row["access_level"], "expires_at": row["expires_at"],
+            "version": row["report_version"], "url": f"{settings.public_base_url}/#claim/{crypto.decrypt(row['token_cipher'])}"}
+
+
+def list_share_links(kind: str, resource_id: int, principal: Principal) -> list[dict]:
+    key = _SHARE_LINK_KEYS[kind]
+    with db.conn() as c, c.transaction():
+        _link_resource(c, kind, resource_id, principal)
+        rows = c.execute(f"SELECT id, token_cipher, report_version, access_level, expires_at FROM permission.share_link "
+                         f"WHERE {key}=%s AND expires_at > clock_timestamp() ORDER BY expires_at DESC", (resource_id,)).fetchall()
+    return [_share_link_info(row) for row in rows]
+
+
+def create_share_link(kind: str, resource_id: int, principal: Principal, level: str, version: int | None) -> dict:
+    if version is not None and kind != "reports":
+        raise Invalid("领取链接仅可指定报告版本")
+    token = secrets.token_urlsafe(32)
+    cipher = crypto.encrypt(token)
+    key = _SHARE_LINK_KEYS[kind]
+    with db.conn() as c, c.transaction():
+        resource = _link_resource(c, kind, resource_id, principal)
+        if kind == "reports":
+            version = version if version is not None else resource["revision"]
+            _require_report_share_data(c, resource, version, principal)
+        else:
+            _require_share_data(c, _LINK_RESOURCE_KINDS[kind], resource_id, resource, principal)
+        # 过期链接的领取记录可随链接清理，已领取的资源授权存放在原有分享表中。
+        c.execute(f"DELETE FROM permission.share_link WHERE {key}=%s AND expires_at <= clock_timestamp()", (resource_id,))
+        row = c.execute(
+            f"INSERT INTO permission.share_link(id, token_hash, token_cipher, {key}, report_version, access_level) "
+            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id, token_cipher, report_version, access_level, expires_at",
+            (uuid4(), sha256(token.encode()).hexdigest(), cipher, resource_id, version, level),
+        ).fetchone()
+    return _share_link_info(row)
+
+
+def revoke_share_link(kind: str, resource_id: int, link_id: UUID, principal: Principal) -> None:
+    key = _SHARE_LINK_KEYS[kind]
+    with db.conn() as c, c.transaction():
+        _link_resource(c, kind, resource_id, principal)
+        c.execute(f"DELETE FROM permission.share_link WHERE id=%s AND {key}=%s", (link_id, resource_id))
+
+
+def claim_share_link(token: str, principal: Principal) -> dict:
+    digest = sha256(token.encode()).hexdigest()
+    with db.conn() as c, c.transaction():
+        target = c.execute("SELECT id, dataset_id, template_id, report_id FROM permission.share_link "
+                           "WHERE token_hash=%s AND expires_at > clock_timestamp()", (digest,)).fetchone()
+        if not target:
+            raise ShareLinkExpired("领取链接已过期、已撤销或无效，请联系分享人获取新链接")
+        kind, key = next((kind, key) for kind, key in _SHARE_LINK_KEYS.items() if target[key] is not None)
+        resource_id = target[key]
+        # 获取资源锁后再读取链接，和撤销链接、撤销个人授权使用相同的加锁顺序。
+        try:
+            resource = _link_resource(c, kind, resource_id)
+        except NotFound as exc:
+            raise ShareLinkExpired("该分享资源已删除") from exc
+        link = c.execute("SELECT access_level, report_version FROM permission.share_link "
+                         "WHERE id=%s AND expires_at > clock_timestamp()",
+                         (target["id"],)).fetchone()
+        if not link:
+            raise ShareLinkExpired("领取链接已过期或已撤销，请联系分享人获取新链接")
+        employee = c.execute("SELECT enabled, is_admin, roles FROM permission.employee WHERE emp_no=%s FOR SHARE",
+                             (principal.emp_no,)).fetchone()
+        if not employee or not employee["enabled"]:
+            raise PermissionDenied("请使用已登记并启用的员工账号领取")
+        recipient = Principal(principal.emp_no, is_admin=employee["is_admin"], roles=employee["roles"])
+        version = link["report_version"]
+        if kind == "reports":
+            _require_report_share_data(c, resource, version, recipient)
+            table = "report.report_share"
+            path = f"/reports/{resource_id}?version={version}"
+        else:
+            resource_kind = _LINK_RESOURCE_KINDS[kind]
+            _require_share_data(c, resource_kind, resource_id, resource, recipient)
+            table = _RESOURCE_SHARES[resource_kind][1]
+            path = f"/#{kind}/{resource_id}"
+        level = "manage"
+        if not _manages(recipient, resource["owner"]):
+            claimed = c.execute("SELECT 1 FROM permission.share_link_claim WHERE link_id=%s AND emp_no=%s",
+                                (target["id"], recipient.emp_no)).fetchone()
+            if claimed:
+                share = c.execute(f"SELECT access_level FROM {table} WHERE {key}=%s AND emp_no=%s",
+                                  (resource_id, recipient.emp_no)).fetchone()
+                if not share:
+                    raise PermissionDenied("该链接已领取过，当前分享权限已撤销")
+            else:
+                # 领取查看链接时保留既有编辑权限，授权及领取记录在同一事务提交。
+                share = c.execute(
+                    f"INSERT INTO {table} AS s({key}, emp_no, access_level) VALUES (%s,%s,%s) "
+                    f"ON CONFLICT ({key}, emp_no) DO UPDATE SET access_level="
+                    "CASE WHEN s.access_level='edit' THEN 'edit' ELSE EXCLUDED.access_level END RETURNING access_level",
+                    (resource_id, recipient.emp_no, link["access_level"]),
+                ).fetchone()
+                c.execute("INSERT INTO permission.share_link_claim(link_id, emp_no) VALUES (%s,%s)",
+                          (target["id"], recipient.emp_no))
+            level = share["access_level"]
+    return {"kind": kind, "access_level": level, "url": settings.public_path(path)}
 
 
 # ============================ 其他 ============================

@@ -21,7 +21,7 @@ description: 按业务场景新建、重跑或修订经营与分析报告。通�
   - 仅当已有 Markdown 模板的取数口径、指标公式、章节结构、图表绑定与筛选联动完全匹配本次需求时，才通过 `get_report_template(template_id, version)` 读取并直接沿用该 `template_id` 与 `version`。
   - 若无匹配模板、需要基于旧模板调整分析/章节/口径，或基准是历史声明式/自由版式（`structured`）模板，**必须**先调用 `save_report_template`（传入 `dataset_id`）保存一份完整的 Markdown 指南并取得新的 `(template_id, version)`，再开始草稿与报告入库。禁止先保存报告再补模板，也不允许不绑定模板直接保存报告。
 - **修订报告（含修改报告正文、数据、章节、样式、筛选或口径）**：
-  - 修改报告正文时，**必须同步更新对应的报告模板**：先用 `get_report_template` 读取原模板（参考 `template_latest_version`），对照本次修改调用 `save_report_template(template_id=..., expected_version=..., dataset_id=...)` 保存新版模板；若基准报告未绑定模板，或当前账号无权修改原模板（非创建人），则基于本次修订后的完整分析思路与结构新建一份归属当前场景的模板。随后把新版 `(template_id, template_version)` 传入草稿或 `revise_report`。仅修改报告名称或 `change_note` 时沿用原模板。
+  - 修改报告正文时，**必须同步更新对应的报告模板**：先用 `get_report_template` 读取原模板（参考 `template_latest_version`）。当前账号有管理或编辑权限（`access_level` 为 `manage` 或 `edit`）时，调用 `save_report_template(template_id=..., expected_version=..., dataset_id=...)` 保存新版；若基准报告未绑定模板，或当前账号只有查看权限，则基于本次修订后的完整分析思路与结构新建一份归属当前场景的模板。随后把新版 `(template_id, template_version)` 传入草稿或 `revise_report`。仅修改报告名称或 `change_note` 时沿用原模板。
 - **模板正文要求**：按场景写清适用范围与账期参数、取数来源和粒度、指标公式与单位、章节各自回答的问题、图表及明细绑定、筛选联动和验收标准。有明确复用价值的 SQL 或版式片段可用代码块保留。旧版定义转换出的查询、绑定、HTML/CSS 可作为实现参考，取数和报告实现仍遵循当前授权、展示契约和离线验收。复杂场景可并行读取指南样式与翻页探查多张大表（`describe_tables` / `describe_table(mode="full")`）。
 
 用 `run_query(dataset_id, sql, snapshot=true, sample_rows=50)` 获取汇总与明细快照，确认粒度、范围、比较基准、单位和缺失。优先读取正式汇总值，按确认口径在源端派生。无交叉核对关系的独立模块可并发取数；需要相互勾稽的数据须用单条 SQL 或 `query_report_data` 同批取数。纯展示修订沿用基准快照，换账期或口径时重取相关数据。[事实取数契约](references/fact-contract.md)

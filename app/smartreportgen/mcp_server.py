@@ -135,11 +135,6 @@ def _owner(acc: Access) -> str | None:
     return None if acc.all else (acc.principal.emp_no or "")
 
 
-def _check_owner(acc: Access, created_by: str | None, what: str) -> None:
-    if not acc.all and created_by != acc.principal.emp_no:
-        raise PermissionDenied(f"无权操作他人创建的{what}")
-
-
 def _dataset_brief(ds: dict, acc: Access) -> dict:
     tables = [t for t in ds.get("tables", []) if acc.can_table(ds["id"], t["table_name"])]
     hidden = len(ds.get("tables", [])) - len(tables)
@@ -512,7 +507,8 @@ def prepare_report_context(dataset_id: int, ctx: Context, query: str = "",
             sample_rows=sample_rows, profile_rows=profile_rows,
         )
         style = _resolve_style(acc.principal, ds["business_scenario"], query=query, include_css=False)
-        templates = repo.list_templates(owner=_owner(acc), dataset_id=dataset_id, allowed_datasets=acc.dataset_ids())
+        templates = repo.list_templates(owner=_owner(acc), dataset_id=dataset_id, allowed_datasets=acc.dataset_ids(),
+                                        share_only_datasets=acc.share_only_datasets)
         return _ok({
             "ok": True,
             "scenario": _dataset_brief(ds, acc),
@@ -717,15 +713,16 @@ def _template_brief(row: dict) -> dict:
     return {"template_id": row["id"], "name": row["name"], "version": row["version"],
             "dataset_id": row["dataset_id"], "business_scenario": row["business_scenario"],
             "business_summary": row["business_summary"], "sections": row["summary"].get("sections", []),
-            "summary": row["summary"], "user_requirement": row["user_requirement"], "updated_at": row["updated_at"]}
+            "summary": row["summary"], "user_requirement": row["user_requirement"], "updated_at": row["updated_at"],
+            "access_level": row.get("access_level", "manage")}
 
 
 @_tool()
 def list_report_templates(ctx: Context, keyword: str = "", dataset_id: int | None = None) -> dict:
-    """按关键词或业务场景检索自己创建或已授权场景的 Markdown 报告模板指南。"""
+    """按关键词或业务场景检索自己创建、获分享或有权读取的 Markdown 报告模板指南。"""
     acc = _access(ctx)
     rows = repo.list_templates(keyword or None, owner=_owner(acc), dataset_id=dataset_id,
-                               allowed_datasets=acc.dataset_ids())
+                               allowed_datasets=acc.dataset_ids(), share_only_datasets=acc.share_only_datasets)
     return _ok({"ok": True, "templates": [_template_brief(row) for row in rows[:50]]})
 
 
@@ -734,7 +731,7 @@ def get_report_template(template_id: int, ctx: Context, version: int | None = No
     """读取用于编写 HTML 报告的完整指南。可指定历史版本获取当时的 Markdown 正文。"""
     acc = _access(ctx)
     tpl = repo.get_template(template_id)
-    repo.require_template_access(tpl, acc)
+    tpl["access_level"] = repo.require_template_access(tpl, acc)
     if version is not None:
         tpl = {**tpl, **repo.get_template_version(template_id, version)}
         tpl["summary"] = repo._template_summary(tpl["markdown"], tpl["name"])
@@ -746,25 +743,22 @@ def save_report_template(name: str, markdown: str, ctx: Context, dataset_id: int
                          user_requirement: str = "", analysis_goal: str = "", business_summary: str | None = None,
                          template_id: int | None = None, expected_version: int | None = None) -> dict:
     """新建或更新 Markdown 报告指南，记录可复用的取数、指标、章节、图表、联动及布局要求。
+    创建人、管理员和获编辑授权的员工可更新正文；关联场景由创建人或管理员维护。
     报告模板是生成和修订报告的必备产物：新建时请传入 dataset_id 关联业务场景，更新时可传 expected_version 检查并行修改。"""
     acc = _access(ctx)
     data = {"name": name, "markdown": markdown, "user_requirement": user_requirement, "analysis_goal": analysis_goal}
     if dataset_id is not None:
-        _require_dataset(acc, dataset_id)
+        if template_id is None:
+            _require_dataset(acc, dataset_id)
         data["dataset_id"] = dataset_id
     if template_id is not None:
-        current = repo.get_template(template_id)
-        _check_owner(acc, current["created_by"], "报告模板")
-        # 未传场景时沿用原关联；操作人的场景权限仍须有效。
-        if dataset_id is None and current["dataset_id"] is not None:
-            _require_dataset(acc, current["dataset_id"])
         data = {k: v for k, v in data.items() if k in ("markdown", "dataset_id") or v != ""}
     else:
         data["created_by"] = acc.principal.emp_no
     if business_summary is not None:
         data["business_summary"] = business_summary
     with measure("template.save"):
-        tpl = repo.save_template(data, template_id, expected_version=expected_version)
+        tpl = repo.save_template(data, template_id, expected_version=expected_version, principal=acc.principal)
     return _ok({"ok": True, **_template_brief(tpl), "template_type": "business"})
 
 

@@ -99,6 +99,8 @@ class ScenarioFiltersTest(unittest.TestCase):
         rows = [{"dataset_id": 11, "owner_emp_no": None, "datasource_id": 8, "table_name": "Lookup", "config": None},
                 {"dataset_id": 12, "owner_emp_no": "owner", "datasource_id": 8, "table_name": "Sales", "config": config},
                 {"dataset_id": 12, "owner_emp_no": "owner", "datasource_id": 8, "table_name": "Lookup", "config": config}]
+        for row in rows:
+            row.update(granted=True, access_level=None)
         with patch("smartreportgen.permission.db.fetchall", return_value=rows):
             self.assertEqual(access_for(principal).tables, {11: {"lookup"}, 12: {"sales"}})
             principal.roles.clear()

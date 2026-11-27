@@ -20,9 +20,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 
 from .config import settings
 
@@ -202,8 +203,15 @@ def _unb64(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def _share_state_cipher(browser: str) -> Fernet:
+    # 领取凭证跟随回跳地址，但 IAM 及其日志只接触与本次浏览器 Cookie 绑定的密文。
+    return Fernet(base64.urlsafe_b64encode(hmac.digest(browser.encode(), b"share-login", "sha256")))
+
+
 def pack_state(secret: str, next_path: str) -> str:
-    body = _b64(json.dumps({"n": next_path, "t": int(time.time()), "r": _b64(hashlib.sha256(
+    target = ({"s": _share_state_cipher(secret).encrypt(next_path.encode()).decode()}
+              if urlsplit(next_path).fragment.startswith("claim/") else {"n": next_path})
+    body = _b64(json.dumps({**target, "t": int(time.time()), "r": _b64(hashlib.sha256(
         str(time.time_ns()).encode()).digest()[:9])}).encode())
     mac = _b64(hmac.new(secret.encode(), body.encode(), hashlib.sha256).digest())
     return f"{body}.{mac}"
@@ -220,6 +228,11 @@ def unpack_state(secret: str, state: str) -> str:
     p = json.loads(_unb64(body))
     if not isinstance(p.get("t"), int) or time.time() - p["t"] > 600 or p["t"] > time.time() + 30:
         raise IamError("登录已超时，请重新发起")
+    if "s" in p:
+        try:
+            return safe_next(_share_state_cipher(secret).decrypt(p["s"].encode()).decode())
+        except InvalidToken as e:
+            raise IamError("无法恢复领取链接，请重新打开原链接") from e
     return safe_next(p.get("n"))
 
 

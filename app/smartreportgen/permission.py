@@ -26,6 +26,8 @@ class Access:
     principal: Principal
     all: bool = False
     tables: dict[int, set[str]] = field(default_factory=dict)  # dataset_id -> 表名（小写）
+    scene_shares: dict[int, str] = field(default_factory=dict)  # 已核实完整表范围的场景分享
+    share_only_datasets: set[int] = field(default_factory=set)  # 只有场景分享、无原有表授权
 
     def dataset_ids(self) -> list[int] | None:
         return None if self.all else sorted(self.tables)
@@ -55,39 +57,76 @@ def source_scene_tables(source: dict, principal: Principal | None = None) -> dic
             or set(principal.roles).intersection(item.get("roles", []))}
 
 
-def access_for(p: Principal) -> Access:
+def personal_scene_share_tables(source: dict, owner: dict | None) -> dict[str, dict]:
+    """个人场景的授权始终限定在创建人当前可引用的来源目录内。"""
+    if not owner or not owner["enabled"]:
+        return {}
+    return source_scene_tables(source, Principal(owner["emp_no"], is_admin=owner["is_admin"], roles=owner["roles"]))
+
+
+def access_for(p: Principal, *, connection=None) -> Access:
     if p.is_admin:
         return Access(principal=p, all=True)
     acc = Access(principal=p)
     if not p.registered or not p.emp_no:
         return acc
-    # 历史场景按原授权处理。个人场景的作者自动获得配置的表，受邀用户还须有场景授权。
-    # 每次仍与数据源当前开放表取交集，撤销源权限后既有个人场景不再授予数据访问。
-    rows = db.fetchall(
+    # 分享授予接收人场景内的表权限。原本的直接或角色授权仍独立计算。
+    sql = (
         """WITH grants AS (
                SELECT DISTINCT dataset_id, table_name FROM permission.table_grant
                WHERE (subject_type='employee' AND subject=%s) OR (subject_type='role' AND subject=ANY(%s))
+           ), shares AS (
+               SELECT sh.dataset_id, sh.access_level, count(*) AS share_table_count
+               FROM dataset.dataset_share sh JOIN dataset.dataset_table t ON t.dataset_id=sh.dataset_id
+               WHERE sh.emp_no=%s GROUP BY sh.dataset_id, sh.access_level
+           ), scoped AS (
+               SELECT d.id AS dataset_id, d.owner_emp_no, d.datasource_id, t.table_name,
+                      CASE WHEN d.owner_emp_no IS NOT NULL THEN s.config END AS config,
+                      sh.access_level, sh.share_table_count,
+                      CASE WHEN e.enabled THEN jsonb_build_object(
+                          'emp_no', e.emp_no, 'enabled', e.enabled, 'is_admin', e.is_admin, 'roles', e.roles
+                      ) END AS share_owner,
+                      COALESCE(d.owner_emp_no=%s, false) OR EXISTS (
+                          SELECT 1 FROM grants g WHERE g.dataset_id=d.id
+                          AND (g.table_name='*' OR lower(g.table_name)=lower(t.table_name))
+                      ) AS granted
+               FROM dataset.dataset d JOIN dataset.dataset_table t ON t.dataset_id=d.id
+               LEFT JOIN datasource.datasource s ON s.id=d.datasource_id
+               LEFT JOIN shares sh ON sh.dataset_id=d.id AND s.enabled
+               LEFT JOIN permission.employee e ON e.emp_no=d.owner_emp_no AND sh.dataset_id IS NOT NULL
+               WHERE d.enabled AND (d.owner_emp_no IS NULL OR s.enabled)
            )
-           SELECT d.id AS dataset_id, d.owner_emp_no, d.datasource_id, t.table_name,
-                  CASE WHEN d.owner_emp_no IS NOT NULL THEN s.config END AS config
-           FROM dataset.dataset d JOIN dataset.dataset_table t ON t.dataset_id=d.id
-           LEFT JOIN datasource.datasource s ON s.id=d.datasource_id
-           WHERE d.enabled AND (d.owner_emp_no IS NULL OR s.enabled)
-             AND (d.owner_emp_no=%s OR EXISTS (
-                 SELECT 1 FROM grants g WHERE g.dataset_id=d.id
-                 AND (g.table_name='*' OR lower(g.table_name)=lower(t.table_name))
-             ))""",
-        (p.emp_no, p.roles or [], p.emp_no),
+           SELECT * FROM scoped WHERE granted OR access_level IS NOT NULL"""
     )
-    permitted = {}
+    params = (p.emp_no, p.roles or [], p.emp_no, p.emp_no)
+    rows = connection.execute(sql, params).fetchall() if connection is not None else db.fetchall(sql, params)
+    permitted, owner_catalog, candidates = {}, {}, {}
     for row in rows:
-        if row["owner_emp_no"] is not None:
+        dataset_id, table = row["dataset_id"], row["table_name"]
+        granted = row["granted"]
+        owner = row["owner_emp_no"]
+        if granted and owner is not None:
             source_id = row["datasource_id"]
             if source_id not in permitted:
                 permitted[source_id] = source_scene_tables(row, p)
-            if row["table_name"] not in permitted[source_id]:
-                continue
-        acc.tables.setdefault(row["dataset_id"], set()).add(row["table_name"].lower())
+            granted = table in permitted[source_id]
+        if granted:
+            acc.tables.setdefault(dataset_id, set()).add(table.lower())
+        if row["access_level"]:
+            if owner is not None:
+                key = (owner, row["datasource_id"])
+                if key not in owner_catalog:
+                    owner_catalog[key] = personal_scene_share_tables(row, row["share_owner"])
+                if table not in owner_catalog[key]:
+                    continue
+            tables, _, _ = candidates.setdefault(dataset_id, ([], row["share_table_count"], row["access_level"]))
+            tables.append(table.lower())
+    for dataset_id, (tables, count, level) in candidates.items():
+        if len(tables) == count:
+            acc.scene_shares[dataset_id] = level
+            if dataset_id not in acc.tables:
+                acc.share_only_datasets.add(dataset_id)
+            acc.tables.setdefault(dataset_id, set()).update(tables)
     return acc
 
 

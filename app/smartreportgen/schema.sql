@@ -146,6 +146,23 @@ CREATE TABLE IF NOT EXISTS report.report_share (
 ALTER TABLE report.report_share DROP CONSTRAINT IF EXISTS report_share_emp_no_fkey;
 CREATE INDEX IF NOT EXISTS report_share_employee_idx ON report.report_share (emp_no, report_id);
 
+-- 场景及模板的分享与原有表授权独立，删除员工或资源时自动清理。
+CREATE TABLE IF NOT EXISTS dataset.dataset_share (
+    dataset_id   bigint NOT NULL REFERENCES dataset.dataset(id) ON DELETE CASCADE,
+    emp_no       text NOT NULL REFERENCES permission.employee(emp_no) ON DELETE CASCADE,
+    access_level text NOT NULL CHECK (access_level IN ('view', 'edit')),
+    PRIMARY KEY (dataset_id, emp_no)
+);
+CREATE INDEX IF NOT EXISTS dataset_share_employee_idx ON dataset.dataset_share (emp_no, dataset_id);
+
+CREATE TABLE IF NOT EXISTS report_template.report_template_share (
+    template_id  bigint NOT NULL REFERENCES report_template.report_template(id) ON DELETE CASCADE,
+    emp_no       text NOT NULL REFERENCES permission.employee(emp_no) ON DELETE CASCADE,
+    access_level text NOT NULL CHECK (access_level IN ('view', 'edit')),
+    PRIMARY KEY (template_id, emp_no)
+);
+CREATE INDEX IF NOT EXISTS report_template_share_employee_idx ON report_template.report_template_share (emp_no, template_id);
+
 CREATE TABLE IF NOT EXISTS permission.table_grant (
     id           bigserial PRIMARY KEY,
     subject_type text NOT NULL CHECK (subject_type IN ('employee', 'role')),
@@ -201,6 +218,32 @@ CREATE TABLE IF NOT EXISTS report.report_version (
     PRIMARY KEY (report_id, version),
     FOREIGN KEY (report_id, base_version) REFERENCES report.report_version(report_id, version),
     CHECK (base_version < version)
+);
+
+-- 领取链接可由多名员工使用。数据库保留摘要用于核验，密文仅供分享管理者复制链接。
+CREATE TABLE IF NOT EXISTS permission.share_link (
+    id              uuid PRIMARY KEY,
+    token_hash      text NOT NULL UNIQUE,
+    token_cipher    text NOT NULL,
+    dataset_id      bigint REFERENCES dataset.dataset(id) ON DELETE CASCADE,
+    template_id     bigint REFERENCES report_template.report_template(id) ON DELETE CASCADE,
+    report_id       bigint,
+    report_version  bigint,
+    access_level    text NOT NULL CHECK (access_level IN ('view', 'edit')),
+    expires_at      timestamptz NOT NULL DEFAULT (clock_timestamp() + interval '24 hours'),
+    FOREIGN KEY (report_id, report_version) REFERENCES report.report_version(report_id, version) ON DELETE CASCADE,
+    CHECK (num_nonnulls(dataset_id, template_id, report_id) = 1),
+    CHECK ((report_id IS NULL) = (report_version IS NULL))
+);
+CREATE INDEX IF NOT EXISTS share_link_dataset_idx ON permission.share_link (dataset_id, expires_at) WHERE dataset_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS share_link_template_idx ON permission.share_link (template_id, expires_at) WHERE template_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS share_link_report_idx ON permission.share_link (report_id, expires_at) WHERE report_id IS NOT NULL;
+
+-- 同一员工重复打开链接时保留其现有授权，撤销或降级后的权限不能用同一链接恢复。
+CREATE TABLE IF NOT EXISTS permission.share_link_claim (
+    link_id uuid NOT NULL REFERENCES permission.share_link(id) ON DELETE CASCADE,
+    emp_no  text NOT NULL REFERENCES permission.employee(emp_no) ON DELETE CASCADE,
+    PRIMARY KEY (link_id, emp_no)
 );
 
 -- 内置脚本按内容哈希共享。升级镜像后，旧报告继续展开保存时使用的精确版本。
